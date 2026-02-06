@@ -397,17 +397,6 @@ Jobs can optionally deliver their output to a chat channel with `--deliver --to 
 
 ---
 
-## Docker
-
-```bash
-docker build -t kyber .
-docker run -v ~/.kyber:/root/.kyber -p 18790:18790 kyber gateway
-```
-
-The Docker image includes Node.js for the WhatsApp bridge.
-
----
-
 ## Project layout
 
 ```
