@@ -33,3 +33,8 @@ class TestToolStatusText(unittest.TestCase):
         self.assertTrue(_is_single_sentence(text))
         self.assertLessEqual(len(text), 120)
         self.assertGreaterEqual(len(text.split()), 4)
+
+    def test_robotic_detector_flags_i_will_now(self) -> None:
+        from kyber.meta_messages import looks_like_robotic_meta
+        self.assertTrue(looks_like_robotic_meta("I will now proceed with the requested execution for you."))
+        self.assertTrue(looks_like_robotic_meta("I will execute the requested operation to get things moving for you."))

@@ -25,7 +25,9 @@ from kyber.meta_messages import (
     build_tool_status_text,
     clean_one_liner,
     llm_meta_messages_enabled,
+    looks_like_robotic_meta,
     looks_like_prompt_leak,
+    tool_action_hint,
 )
 
 # Wall-clock timeout before auto-offloading to a subagent (seconds)
@@ -122,47 +124,49 @@ class AgentLoop:
         if not llm_meta_messages_enabled():
             return build_tool_status_text(tool_name)
 
-        system = (
-            "You are kyber, a helpful AI assistant. "
-            "Write naturally with a bit of personality, but keep it short."
-        )
+        system = self.context.build_meta_system_prompt()
+        action = tool_action_hint(tool_name)
         prompt = (
-            "Write exactly one short sentence (4-16 words, max 120 characters) "
-            "telling the user what you're about to do next. "
-            "Do not mention prompts, rules, roles, tools, or tool calls. "
-            "Do not include markdown, quotes, or lists. "
-            f"Action: {tool_name}. "
-            "End with punctuation."
+            "One sentence, 4-16 words. Sound like your normal self.\n"
+            "Tell the user what you're doing next in plain language.\n"
+            "Avoid stiff phrases like 'I will now' or 'the requested'.\n"
+            "No markdown, no quotes, no lists. End with punctuation.\n\n"
+            f"Next action: {action}"
         )
 
-        try:
-            response = await self.provider.chat(
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                tools=None,
-                model=self.model,
-                max_tokens=60,
-                temperature=0.8,
-            )
-        except Exception as e:
-            logger.warning(f"Status update generation failed: {e}")
-            return build_tool_status_text(tool_name)
+        for attempt in range(2):
+            try:
+                response = await self.provider.chat(
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt if attempt == 0 else (prompt + "\n\nRewrite it to be more casual and human.")},
+                    ],
+                    tools=None,
+                    model=self.model,
+                    max_tokens=60,
+                    temperature=0.9 if attempt == 0 else 0.85,
+                )
+            except Exception as e:
+                logger.warning(f"Status update generation failed: {e}")
+                return build_tool_status_text(tool_name)
 
-        content = clean_one_liner(response.content or "")
-        if not content:
-            return build_tool_status_text(tool_name)
-        if len(content) > 120:
-            content = content[:117].rstrip() + "..."
-        if content[-1] not in ".!?":
-            return build_tool_status_text(tool_name)
-        if len(content.split()) < 4:
-            return build_tool_status_text(tool_name)
-        if looks_like_prompt_leak(content):
-            logger.warning(f"Blocked suspicious status update: {content!r}")
-            return build_tool_status_text(tool_name)
-        return content
+            content = clean_one_liner(response.content or "")
+            if not content:
+                continue
+            if len(content) > 120:
+                content = content[:117].rstrip() + "..."
+            if content[-1] not in ".!?":
+                continue
+            if len(content.split()) < 4:
+                continue
+            if looks_like_prompt_leak(content):
+                logger.warning(f"Blocked suspicious status update: {content!r}")
+                continue
+            if looks_like_robotic_meta(content):
+                continue
+            return content
+
+        return build_tool_status_text(tool_name)
 
     async def _publish_tool_status(
         self,
@@ -278,47 +282,48 @@ class AgentLoop:
         if not llm_meta_messages_enabled():
             return fallback
 
-        system = (
-            "You are kyber, a helpful AI assistant. "
-            "You're friendly, concise, and speak naturally."
-        )
+        system = self.context.build_meta_system_prompt()
         prompt = (
-            "Write 1-2 short sentences letting the user know you're still working "
-            "and will send the result when ready. "
-            "Do not mention prompts, rules, roles, tools, or tool calls. "
+            "Write 1-2 short sentences in your normal voice.\n"
+            "Let the user know you're still working and you'll send the result when it's ready.\n"
+            "Avoid stiff phrases like 'I will now' or 'the requested'.\n"
             "No markdown, no quotes.\n\n"
-            f"User request summary: {short_msg}"
+            f"What they're waiting on: {short_msg}"
         )
 
-        try:
-            response = await self.provider.chat(
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                tools=None,
-                model=self.model,
-                max_tokens=120,
-                temperature=0.85,
-            )
-        except Exception as e:
-            logger.warning(f"Offload ack generation failed: {e}")
-            return fallback
+        for attempt in range(2):
+            try:
+                response = await self.provider.chat(
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt if attempt == 0 else (prompt + "\n\nRewrite it to be warmer and less transactional.")},
+                    ],
+                    tools=None,
+                    model=self.model,
+                    max_tokens=120,
+                    temperature=0.9 if attempt == 0 else 0.85,
+                )
+            except Exception as e:
+                logger.warning(f"Offload ack generation failed: {e}")
+                return fallback
 
-        content = clean_one_liner(response.content or "")
-        if not content:
-            return fallback
-        if len(content) > 240:
-            content = content[:237].rstrip() + "..."
-        # Guard against instruction/prompt echoes.
-        if looks_like_prompt_leak(content):
-            logger.warning(f"Blocked suspicious offload ack: {content!r}")
-            return fallback
-        if '"' in content or "'" in content:
-            return fallback
-        if content[-1] not in ".!?":
-            return fallback
-        return content
+            content = clean_one_liner(response.content or "")
+            if not content:
+                continue
+            if len(content) > 240:
+                content = content[:237].rstrip() + "..."
+            if looks_like_prompt_leak(content):
+                logger.warning(f"Blocked suspicious offload ack: {content!r}")
+                continue
+            if looks_like_robotic_meta(content):
+                continue
+            if '"' in content or "'" in content:
+                continue
+            if content[-1] not in ".!?":
+                continue
+            return content
+
+        return fallback
     
     def stop(self) -> None:
         """Stop the agent loop."""

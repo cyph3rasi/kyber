@@ -77,6 +77,55 @@ def clean_one_liner(text: str) -> str:
     return t.splitlines()[0].strip()
 
 
+def looks_like_robotic_meta(text: str) -> bool:
+    """
+    Catch overly-formal/robotic meta-updates like "I will now proceed...".
+
+    These are not leaks, but they sound bad in chat. Prefer falling back to
+    in-character templates or retrying once with a better prompt.
+    """
+    t = " ".join((text or "").split()).strip().lower()
+    if not t:
+        return True
+
+    needles = [
+        "i will now",
+        "i will",
+        "proceed with",
+        "the requested",
+        "requested execution",
+        "requested operation",
+        "execute the requested",
+        "run the requested",
+        "requested code",
+        "requested command",
+        "to provide the results",
+        "to get those results",
+        "to get the results",
+        "requested execution for you",
+        "requested operation to",
+    ]
+    return any(n in t for n in needles)
+
+
+def tool_action_hint(tool_name: str) -> str:
+    """Friendly, non-technical hint for the LLM about what's next."""
+    tool = (tool_name or "").strip()
+    mapping: dict[str, str] = {
+        "read_file": "check the file",
+        "list_dir": "scan the folder",
+        "write_file": "write the update",
+        "edit_file": "apply the edit",
+        "exec": "run a quick command",
+        "web_search": "look it up",
+        "web_fetch": "pull up that page",
+        "message": "send the message",
+        "spawn": "kick it off in the background",
+        "task_status": "check progress",
+    }
+    return mapping.get(tool, "keep going")
+
+
 def build_tool_status_text(tool_name: str) -> str:
     """Deterministic status update template (safe fallback)."""
     tool = (tool_name or "").strip()
@@ -97,6 +146,5 @@ def build_tool_status_text(tool_name: str) -> str:
 
 def build_offload_ack_fallback() -> str:
     return (
-        "Still working on that in the background. "
-        "Feel free to keep chatting, I'll send the result when it's ready."
+        "Still on it. Keep chatting if you want, and I'll drop the result as soon as it's ready."
     )

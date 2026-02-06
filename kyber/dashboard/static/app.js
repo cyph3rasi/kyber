@@ -14,7 +14,6 @@ const pageTitle = $('pageTitle');
 const pageDesc = $('pageDesc');
 const contentBody = $('contentBody');
 const saveBtn = $('saveBtn');
-const refreshBtn = $('refreshBtn');
 const restartGwBtn = $('restartGwBtn');
 const toast = $('toast');
 
@@ -402,8 +401,12 @@ function renderAgents(data) {
 function renderTools(data) {
   if (data.web) {
     if (data.web.search) {
-      const card = makeCard('Web Search');
+      const card = makeCard('Brave Web Search');
       renderFields(card.body, data.web.search, ['tools', 'web', 'search']);
+      // Rename the "Api Key" label to "Brave API Key"
+      card.body.querySelectorAll('.field-label').forEach((lbl) => {
+        if (lbl.textContent === 'Api Key') lbl.textContent = 'Brave API Key';
+      });
     }
   }
   if (data.exec) {
@@ -446,7 +449,6 @@ document.getElementById('sidebarNav').addEventListener('click', (e) => {
 });
 
 saveBtn.addEventListener('click', saveConfig);
-refreshBtn.addEventListener('click', loadConfig);
 
 restartGwBtn.addEventListener('click', async () => {
   restartGwBtn.disabled = true;

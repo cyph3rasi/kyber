@@ -68,6 +68,27 @@ Skills with available="false" need dependencies installed first - you can try in
 {skills_summary}""")
         
         return "\n\n---\n\n".join(parts)
+
+    def build_meta_system_prompt(self) -> str:
+        """
+        Build a minimal persona-only system prompt for user-visible meta messages.
+
+        We intentionally avoid including the full identity/tooling instructions
+        so these short status updates don't accidentally echo internal rules.
+        """
+        soul_path = self.workspace / "SOUL.md"
+        if soul_path.exists():
+            try:
+                soul = soul_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                soul = ""
+            if soul:
+                return (
+                    "Write in the assistant's normal voice as defined below.\n\n"
+                    f"{soul}\n\n"
+                    "Keep meta updates short, natural, and human."
+                )
+        return "You are a helpful assistant. Keep meta updates short, natural, and human."
     
     def _get_identity(self) -> str:
         """Get the core identity section."""
