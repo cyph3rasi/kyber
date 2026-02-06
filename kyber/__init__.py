@@ -2,5 +2,5 @@
 kyber - A lightweight AI agent framework
 """
 
-__version__ = "1.0.0"
+__version__ = "2026.2.6.1"
 __logo__ = "💎"

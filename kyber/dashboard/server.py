@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import platform
 import secrets
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,30 @@ from kyber.config.schema import Config
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 1 * 1024 * 1024  # 1 MB
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _restart_gateway_service() -> tuple[bool, str]:
+    """Restart the gateway service via the platform's service manager."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            plist = Path.home() / "Library" / "LaunchAgents" / "chat.kyber.gateway.plist"
+            if not plist.exists():
+                return False, "Gateway launchd plist not found"
+            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True, timeout=10)
+            subprocess.run(["launchctl", "load", str(plist)], capture_output=True, timeout=10, check=True)
+        elif system == "Linux":
+            subprocess.run(
+                ["systemctl", "--user", "restart", "kyber-gateway.service"],
+                capture_output=True, timeout=15, check=True,
+            )
+        else:
+            return False, f"Unsupported platform: {system}"
+    except subprocess.CalledProcessError as e:
+        return False, f"Service restart failed: {e.stderr.decode().strip() if e.stderr else str(e)}"
+    except Exception as e:
+        return False, str(e)
+    return True, "Gateway service restarted"
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -116,7 +142,19 @@ def create_dashboard_app(config: Config) -> FastAPI:
             config.dashboard.auth_token = current.dashboard.auth_token.strip() or secrets.token_urlsafe(32)
 
         save_config(config)
+
+        # Restart gateway so it picks up the new config
+        gw_ok, gw_msg = _restart_gateway_service()
+
         payload = convert_to_camel(config.model_dump())
+        payload["_gatewayRestarted"] = gw_ok
+        payload["_gatewayMessage"] = gw_msg
         return JSONResponse(payload)
+
+    @app.post("/api/restart-gateway", dependencies=[Depends(_require_token)])
+    async def restart_gateway() -> JSONResponse:
+        ok, msg = _restart_gateway_service()
+        status = 200 if ok else 502
+        return JSONResponse({"ok": ok, "message": msg}, status_code=status)
 
     return app

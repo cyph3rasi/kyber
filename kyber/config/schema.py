@@ -53,7 +53,7 @@ class ChannelsConfig(BaseModel):
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.kyber/workspace"
-    model: str = "google/gemini-2.5-flash-preview"
+    model: str = "google/gemini-3-flash-preview"
     provider: str = "openrouter"  # Default provider
     max_tokens: int = 8192
     temperature: float = 0.7

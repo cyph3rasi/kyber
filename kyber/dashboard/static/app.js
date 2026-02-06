@@ -15,6 +15,7 @@ const pageDesc = $('pageDesc');
 const contentBody = $('contentBody');
 const saveBtn = $('saveBtn');
 const refreshBtn = $('refreshBtn');
+const restartGwBtn = $('restartGwBtn');
 const toast = $('toast');
 
 let config = null;
@@ -148,8 +149,16 @@ async function saveConfig() {
   try {
     const res = await apiFetch(`${API}/config`, { method: 'PUT', body: JSON.stringify(payload) });
     config = await res.json();
+    const gwRestarted = config._gatewayRestarted;
+    const gwMessage = config._gatewayMessage;
+    delete config._gatewayRestarted;
+    delete config._gatewayMessage;
     savedAt.textContent = 'Saved ' + new Date().toLocaleTimeString();
-    showToast('Configuration saved', 'success');
+    if (gwRestarted) {
+      showToast('Saved — gateway restarted', 'success');
+    } else {
+      showToast('Saved — gateway restart failed: ' + (gwMessage || 'unknown'), 'error');
+    }
     markClean();
     renderSection();
   } catch {
@@ -438,6 +447,25 @@ document.getElementById('sidebarNav').addEventListener('click', (e) => {
 
 saveBtn.addEventListener('click', saveConfig);
 refreshBtn.addEventListener('click', loadConfig);
+
+restartGwBtn.addEventListener('click', async () => {
+  restartGwBtn.disabled = true;
+  restartGwBtn.textContent = 'Restarting…';
+  try {
+    const res = await apiFetch(`${API}/restart-gateway`, { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      showToast('Gateway restarted', 'success');
+    } else {
+      showToast('Restart failed: ' + data.message, 'error');
+    }
+  } catch {
+    showToast('Restart request failed', 'error');
+  } finally {
+    restartGwBtn.disabled = false;
+    restartGwBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2 2v5h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.05 10A6 6 0 1 0 4 4.5L2 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg> Restart Gateway';
+  }
+});
 
 tokenSubmit.addEventListener('click', async () => {
   const t = tokenInput.value.trim();
