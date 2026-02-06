@@ -1,0 +1,122 @@
+"""Kyber web dashboard server."""
+
+from __future__ import annotations
+
+import secrets
+from pathlib import Path
+from typing import Any
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_413_REQUEST_ENTITY_TOO_LARGE
+
+from kyber.config.loader import convert_keys, convert_to_camel, load_config, save_config
+from kyber.config.schema import Config
+
+STATIC_DIR = Path(__file__).parent / "static"
+MAX_BODY_BYTES = 1 * 1024 * 1024  # 1 MB
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers[
+            "Content-Security-Policy"
+        ] = (
+            "default-src 'self'; "
+            "img-src 'self' data:; "
+            "style-src 'self' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "script-src 'self'; "
+            "connect-src 'self'"
+        )
+        return response
+
+
+class BodyLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        if request.method in {"POST", "PUT", "PATCH"}:
+            length = request.headers.get("content-length")
+            if length:
+                try:
+                    if int(length) > MAX_BODY_BYTES:
+                        return JSONResponse(
+                            {"error": "Payload too large"},
+                            status_code=HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        )
+                except ValueError:
+                    pass
+        return await call_next(request)
+
+
+def _require_token(request: Request) -> None:
+    token = request.app.state.auth_token
+    if not token:
+        raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    provided = auth_header[len("Bearer "):].strip()
+    if not secrets.compare_digest(provided, token):
+        raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+
+def _ensure_auth_token(config: Config) -> str:
+    token = config.dashboard.auth_token.strip()
+    if not token:
+        token = secrets.token_urlsafe(32)
+        config.dashboard.auth_token = token
+        save_config(config)
+    return token
+
+
+def _build_allowed_hosts(config: Config) -> list[str]:
+    allowed = sorted(LOCAL_HOSTS | set(config.dashboard.allowed_hosts))
+    return allowed
+
+
+def create_dashboard_app(config: Config) -> FastAPI:
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    app.state.auth_token = _ensure_auth_token(config)
+    allowed_hosts = _build_allowed_hosts(config)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+    app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(BodyLimitMiddleware)
+
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/api/config", dependencies=[Depends(_require_token)])
+    async def get_config() -> JSONResponse:
+        config = load_config()
+        payload = convert_to_camel(config.model_dump())
+        return JSONResponse(payload)
+
+    @app.put("/api/config", dependencies=[Depends(_require_token)])
+    async def update_config(body: dict[str, Any]) -> JSONResponse:
+        data = convert_keys(body)
+        config = Config.model_validate(data)
+
+        # Ensure token is not emptied accidentally
+        if not config.dashboard.auth_token.strip():
+            current = load_config()
+            config.dashboard.auth_token = current.dashboard.auth_token.strip() or secrets.token_urlsafe(32)
+
+        save_config(config)
+        payload = convert_to_camel(config.model_dump())
+        return JSONResponse(payload)
+
+    return app
