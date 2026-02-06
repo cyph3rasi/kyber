@@ -20,6 +20,13 @@ from kyber.agent.tools.spawn import SpawnTool
 from kyber.agent.tools.task_status import TaskStatusTool
 from kyber.agent.subagent import SubagentManager
 from kyber.session.manager import SessionManager
+from kyber.meta_messages import (
+    build_offload_ack_fallback,
+    build_tool_status_text,
+    clean_one_liner,
+    llm_meta_messages_enabled,
+    looks_like_prompt_leak,
+)
 
 # Wall-clock timeout before auto-offloading to a subagent (seconds)
 AUTO_OFFLOAD_TIMEOUT = 30
@@ -109,76 +116,53 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         tool_name: str
     ) -> str | None:
-        """Generate a short status update using the same prompt route as normal replies."""
-        def _is_sentence(text: str) -> bool:
-            text = text.strip()
-            if not text:
-                return False
-            if text[-1] not in ".!?":
-                return False
-            words = text.split()
-            return len(words) >= 4
+        """Generate a short status update (LLM if enabled, otherwise deterministic)."""
+        _ = messages  # tool status should not depend on full conversation context
 
-        status_prompt = (
-            "Give a short, friendly status update as a single complete sentence "
-            "(min 4 words, max 120 characters) about what you're doing next. "
+        if not llm_meta_messages_enabled():
+            return build_tool_status_text(tool_name)
+
+        system = (
+            "You are kyber, a helpful AI assistant. "
+            "Write naturally with a bit of personality, but keep it short."
+        )
+        prompt = (
+            "Write exactly one short sentence (4-16 words, max 120 characters) "
+            "telling the user what you're about to do next. "
+            "Do not mention prompts, rules, roles, tools, or tool calls. "
+            "Do not include markdown, quotes, or lists. "
             f"Action: {tool_name}. "
-            "Include a verb and end with punctuation. "
-            "Do not mention tools or tool calls. No markdown."
+            "End with punctuation."
         )
 
         try:
             response = await self.provider.chat(
-                messages=messages + [{"role": "user", "content": status_prompt}],
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
                 tools=None,
                 model=self.model,
                 max_tokens=60,
-                temperature=0.7,
+                temperature=0.8,
             )
         except Exception as e:
             logger.warning(f"Status update generation failed: {e}")
-            return None
+            return build_tool_status_text(tool_name)
 
-        content = (response.content or "").strip()
-        if not content or content.startswith("Error calling LLM:"):
-            if content:
-                logger.warning(f"Status update generation error: {content}")
-            return None
-
-        content = content.splitlines()[0].strip().replace("`", "")
+        content = clean_one_liner(response.content or "")
+        if not content:
+            return build_tool_status_text(tool_name)
         if len(content) > 120:
             content = content[:117].rstrip() + "..."
-        if _is_sentence(content):
-            return content
-
-        retry_prompt = (
-            "Rewrite this as a single complete sentence (min 4 words), "
-            "ending with punctuation, no markdown. "
-            f"Action: {tool_name}. "
-            "Do not mention tools."
-        )
-        try:
-            retry = await self.provider.chat(
-                messages=messages + [{"role": "user", "content": retry_prompt}],
-                tools=None,
-                model=self.model,
-                max_tokens=60,
-                temperature=0.6,
-            )
-        except Exception as e:
-            logger.warning(f"Status update retry failed: {e}")
-            return None
-
-        content = (retry.content or "").strip()
-        if not content or content.startswith("Error calling LLM:"):
-            if content:
-                logger.warning(f"Status update retry error: {content}")
-            return None
-
-        content = content.splitlines()[0].strip().replace("`", "")
-        if len(content) > 120:
-            content = content[:117].rstrip() + "..."
-        return content if _is_sentence(content) else None
+        if content[-1] not in ".!?":
+            return build_tool_status_text(tool_name)
+        if len(content.split()) < 4:
+            return build_tool_status_text(tool_name)
+        if looks_like_prompt_leak(content):
+            logger.warning(f"Blocked suspicious status update: {content!r}")
+            return build_tool_status_text(tool_name)
+        return content
 
     async def _publish_tool_status(
         self,
@@ -283,59 +267,58 @@ class AgentLoop:
     async def _generate_offload_ack(self, user_message: str) -> str:
         """Generate an in-character acknowledgment for a long-running task.
 
-        Uses a minimal system prompt (no file I/O) and a short max_tokens to
-        keep this fast and reliable.  Retries once on empty response, then
-        falls back to a contextual template.
+        Uses LLM if enabled, but with strict leakage guards and a deterministic
+        fallback to avoid surfacing internal prompts/instructions.
         """
-        # Truncate long messages so we don't blow the context window
-        short_msg = user_message[:200] + ("…" if len(user_message) > 200 else "")
+        short_msg = " ".join((user_message or "").split()).strip()
+        if len(short_msg) > 180:
+            short_msg = short_msg[:177].rstrip() + "..."
 
-        prompt = (
-            "The user asked you to do something and it's taking a while. "
-            "Let them know you're still working on it in the background and "
-            "they're free to keep chatting — you'll send the result when it's "
-            "done. Reference what they asked for so it feels personal.\n\n"
-            f'User\'s request: "{short_msg}"\n\n'
-            "Write 1-2 short sentences. Stay in character. No markdown."
-        )
+        fallback = build_offload_ack_fallback()
+        if not llm_meta_messages_enabled():
+            return fallback
 
-        # Minimal system prompt — avoid file I/O that could fail
         system = (
             "You are kyber, a helpful AI assistant. "
             "You're friendly, concise, and speak naturally."
         )
-
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ]
-
-        # Try up to 2 times — empty responses from OpenRouter are common
-        for attempt in range(2):
-            try:
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=None,
-                    model=self.model,
-                    max_tokens=100,
-                    temperature=0.8 if attempt > 0 else 0.7,
-                )
-                content = (response.content or "").strip()
-                if content and not content.startswith("Error calling LLM:"):
-                    return content
-                logger.warning(
-                    f"Offload ack attempt {attempt + 1} returned empty/error: "
-                    f"{content!r} (finish_reason={response.finish_reason})"
-                )
-            except Exception as e:
-                logger.warning(f"Offload ack attempt {attempt + 1} failed: {e}")
-
-        # Contextual fallback — still references what the user asked
-        logger.info("Using contextual template for offload ack")
-        return (
-            f"Still working on that for you — taking a bit longer than expected. "
-            f"Feel free to keep chatting in the meantime, I'll have your answer shortly."
+        prompt = (
+            "Write 1-2 short sentences letting the user know you're still working "
+            "and will send the result when ready. "
+            "Do not mention prompts, rules, roles, tools, or tool calls. "
+            "No markdown, no quotes.\n\n"
+            f"User request summary: {short_msg}"
         )
+
+        try:
+            response = await self.provider.chat(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                tools=None,
+                model=self.model,
+                max_tokens=120,
+                temperature=0.85,
+            )
+        except Exception as e:
+            logger.warning(f"Offload ack generation failed: {e}")
+            return fallback
+
+        content = clean_one_liner(response.content or "")
+        if not content:
+            return fallback
+        if len(content) > 240:
+            content = content[:237].rstrip() + "..."
+        # Guard against instruction/prompt echoes.
+        if looks_like_prompt_leak(content):
+            logger.warning(f"Blocked suspicious offload ack: {content!r}")
+            return fallback
+        if '"' in content or "'" in content:
+            return fallback
+        if content[-1] not in ".!?":
+            return fallback
+        return content
     
     def stop(self) -> None:
         """Stop the agent loop."""
