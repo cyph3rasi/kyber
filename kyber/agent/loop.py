@@ -193,6 +193,39 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
     
+    async def _generate_fallback(self, user_message: str, tool_results: list[str]) -> str:
+        """Generate an in-character fallback when the LLM didn't produce a final response.
+        
+        Uses a lightweight LLM call with the persona prompt to summarize
+        what was done, rather than returning a canned message.
+        """
+        try:
+            meta_prompt = self.context.build_meta_system_prompt()
+            results_summary = "\n".join(r[:300] for r in tool_results[-3:])
+            fallback_messages = [
+                {"role": "system", "content": meta_prompt},
+                {"role": "user", "content": user_message},
+                {"role": "system", "content": (
+                    "You completed the user's request using tools. Here are the recent tool results:\n\n"
+                    f"{results_summary}\n\n"
+                    "Write a SHORT (1-2 sentence) in-character summary of what you did. "
+                    "Do NOT use tool calls. Just the message."
+                )},
+            ]
+            response = await self.provider.chat(
+                messages=fallback_messages,
+                tools=None,
+                model=self.model,
+                max_tokens=200,
+                temperature=0.7,
+            )
+            text = (response.content or "").strip()
+            if text and not text.startswith("Error"):
+                return text
+        except Exception:
+            pass
+        return "Done — let me know if you need anything else."
+    
     @staticmethod
     def _parse_slash_command(content: str) -> tuple[str | None, str]:
         """Parse a slash command from the message content.
@@ -434,12 +467,9 @@ class AgentLoop:
         # Fallback: if we still have no content, generate something useful
         if not final_content or not final_content.strip():
             if tool_calls_executed and last_tool_results:
-                # We ran tools but the LLM never summarized — build a minimal reply
+                # We ran tools but the LLM never summarized — generate in-character fallback
                 logger.warning("No final LLM content after tool calls; generating fallback")
-                final_content = (
-                    "I completed the requested actions. Let me know if you need "
-                    "anything else!"
-                )
+                final_content = await self._generate_fallback(msg.content, last_tool_results)
             else:
                 logger.error("Empty LLM response after all retries")
                 final_content = (
@@ -590,10 +620,7 @@ class AgentLoop:
         if not final_content or not final_content.strip():
             if tool_calls_executed and last_tool_results:
                 logger.warning("No final LLM content after tool calls (system); generating fallback")
-                final_content = (
-                    "I completed the requested actions. Let me know if you need "
-                    "anything else!"
-                )
+                final_content = await self._generate_fallback(msg.content, last_tool_results)
             else:
                 logger.error("Empty LLM response after all retries (system)")
                 final_content = (
