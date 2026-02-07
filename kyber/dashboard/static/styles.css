@@ -99,6 +99,7 @@ body {
   cursor: pointer;
   transition: all var(--transition);
   text-align: left;
+  text-decoration: none;
 }
 
 .nav-item:hover {

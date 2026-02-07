@@ -129,12 +129,60 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
 
+    # How long to wait for a response before sending an interim "still working" message
+    RESPONSE_TIMEOUT = 10.0  # seconds
+
     async def _handle_message(self, msg: InboundMessage) -> None:
-        """Handle a single message in its own task (fire-and-forget from run)."""
+        """Handle a single message in its own task (fire-and-forget from run).
+        
+        If processing takes longer than RESPONSE_TIMEOUT seconds, sends an
+        interim message so the user isn't left waiting in silence. The original
+        task keeps running and will deliver its response when done.
+        """
         try:
-            response = await self._process_message(msg)
-            if response:
+            process_task = asyncio.create_task(self._process_message(msg))
+            interim_sent = False
+
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.shield(process_task),
+                    timeout=self.RESPONSE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                # Processing is still running — send interim message, don't cancel
+                interim_sent = True
+                logger.info(
+                    f"Response timeout ({self.RESPONSE_TIMEOUT}s) for "
+                    f"{msg.channel}:{msg.sender_id}, sending interim message"
+                )
+
+                # Register as a tracked task so status queries work
+                task_label = msg.content[:60] + ("…" if len(msg.content) > 60 else "")
+                progress = self.subagents.register_task(
+                    task_id=f"msg-{id(process_task):x}"[:12],
+                    label=task_label,
+                    task=msg.content,
+                )
+
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="💎 Processing in background. You can continue chatting, or ask for status updates.",
+                ))
+
+                # Now wait for the original task to finish (no timeout)
+                response = await process_task
+
+                # Mark tracked task as done
+                self.subagents.complete_task(progress.task_id)
+
+            if response and not interim_sent:
+                # Normal fast path — send response directly
                 await self.bus.publish_outbound(response)
+            elif response and interim_sent:
+                # Task finished after interim — send the actual response
+                await self.bus.publish_outbound(response)
+
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             await self.bus.publish_outbound(OutboundMessage(
@@ -275,6 +323,7 @@ class AgentLoop:
         max_llm_error_retries = 3
         tool_calls_executed = False
         last_tool_results: list[str] = []
+        did_spawn = False
         
         while iteration < self.max_iterations:
             iteration += 1
@@ -334,14 +383,11 @@ class AgentLoop:
                 llm_error_retries = 0
                 empty_response_retries = 0
                 
-                # If the model called spawn, it's offloading to a subagent.
-                # Use the model's accompanying text as the immediate response.
+                # If the model called spawn, let the loop continue so the model
+                # sees the spawn tool result and can write a proper follow-up message.
                 spawned = any(tc.name == "spawn" for tc in response.tool_calls)
                 if spawned:
-                    final_content = (response.content or "").strip()
-                    if not final_content:
-                        final_content = "On it — I'll let you know when it's done."
-                    break
+                    did_spawn = True
             else:
                 # No tool calls — check for content
                 final_content = (response.content or "").strip()
