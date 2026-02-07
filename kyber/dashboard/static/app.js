@@ -59,7 +59,7 @@ const SECTIONS = {
   },
 };
 
-const BUILTIN_PROVIDERS = ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'gemini', 'zhipu'];
+const BUILTIN_PROVIDERS = ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'gemini'];
 
 // ── Helpers ──
 function showToast(msg, type = 'info') {
@@ -639,7 +639,7 @@ function renderProviders(data) {
 }
 
 function renderChannels(data) {
-  const channelNames = ['discord', 'telegram', 'whatsapp', 'feishu'];
+  const channelNames = ['discord', 'telegram', 'whatsapp'];
   for (const name of channelNames) {
     const ch = data[name];
     if (!ch) continue;

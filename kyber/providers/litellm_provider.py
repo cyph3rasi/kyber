@@ -56,8 +56,6 @@ class LiteLLMProvider(LLMProvider):
                 os.environ.setdefault("OPENAI_API_KEY", api_key)
             elif self.provider_name == "gemini" or "gemini" in default_model.lower():
                 os.environ.setdefault("GEMINI_API_KEY", api_key)
-            elif self.provider_name == "zhipu" or "glm" in default_model or "zhipu" in default_model or "zai" in default_model:
-                os.environ.setdefault("ZHIPUAI_API_KEY", api_key)
             elif self.provider_name == "groq" or "groq" in default_model:
                 os.environ.setdefault("GROQ_API_KEY", api_key)
         
@@ -98,15 +96,6 @@ class LiteLLMProvider(LLMProvider):
             # For OpenRouter, prefix model name if not already prefixed
             if self.is_openrouter and not model.startswith("openrouter/"):
                 model = f"openrouter/{model}"
-            
-            # For Zhipu/Z.ai, ensure prefix is present
-            # Handle cases like "glm-4.7-flash" -> "zai/glm-4.7-flash"
-            if ("glm" in model.lower() or "zhipu" in model.lower()) and not (
-                model.startswith("zhipu/") or 
-                model.startswith("zai/") or 
-                model.startswith("openrouter/")
-            ):
-                model = f"zai/{model}"
             
             # For Gemini, ensure gemini/ prefix if not already present.
             # Skip if routing via OpenRouter (openrouter/...) since that provider handles it.

@@ -150,6 +150,20 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
     
+    @staticmethod
+    def _parse_slash_command(content: str) -> tuple[str | None, str]:
+        """Parse a slash command from the message content.
+        
+        Returns:
+            (command, cleaned_content) — command is None if no slash command found.
+            The cleaned content has the /command stripped out.
+        """
+        stripped = content.strip()
+        # Check for /bg at the start (with optional space after)
+        if stripped.lower().startswith("/bg"):
+            rest = stripped[3:].lstrip()
+            return "bg", rest if rest else stripped[3:]
+        return None, content
     
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
@@ -165,6 +179,11 @@ class AgentLoop:
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
             return await self._process_system_message(msg)
+        
+        # Parse slash commands
+        slash_cmd, cleaned_content = self._parse_slash_command(msg.content)
+        if cleaned_content != msg.content:
+            msg.content = cleaned_content
         
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
         
@@ -186,6 +205,19 @@ class AgentLoop:
             current_message=msg.content,
             media=msg.media if msg.media else None,
         )
+        
+        # Inject slash command instructions
+        if slash_cmd == "bg":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "The user used the /bg command. You MUST use the `spawn` tool to "
+                    "handle this task in the background. Pass the user's message as the "
+                    "task description. Respond with a brief, natural acknowledgment that "
+                    "you've kicked off a background task and will report back when it's done. "
+                    "Do NOT attempt to do the work yourself — delegate it entirely via spawn."
+                ),
+            })
         
         # Agent loop
         iteration = 0

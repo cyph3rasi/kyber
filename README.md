@@ -13,8 +13,8 @@ One install command, pick your provider, and you're chatting. No bloat, no confi
 - 💎 Set up in under a minute — one command installs, configures, and runs
 - Never locks up — concurrent message handling means the bot keeps responding, even during long tasks
 - Background subagents — kick off complex work without blocking the conversation, with live progress
-- Works with the providers you already use (OpenRouter, Anthropic, OpenAI, Gemini, DeepSeek, Groq, Zhipu, or any OpenAI-compatible endpoint)
-- Chat where you already are — Discord, Telegram, WhatsApp, and Feishu out of the box
+- Works with the providers you already use (OpenRouter, Anthropic, OpenAI, Gemini, DeepSeek, Groq, or any OpenAI-compatible endpoint)
+- Chat where you already are — Discord, Telegram, and WhatsApp out of the box
 - Built-in tools — web search, shell commands, GitHub, file I/O, and an extensible skills system
 - Runs on anything — your laptop, a VPS, a Raspberry Pi. Optional system service keeps it always on
 - Secure local dashboard for config and monitoring
@@ -108,7 +108,7 @@ kyber gateway
 
 Kyber supports multiple LLM providers through LiteLLM. You can pin a specific provider so it won't fall back to another key when multiple are configured.
 
-Supported providers: `openrouter`, `openai`, `anthropic`, `deepseek`, `gemini`, `groq`, `zhipu`, plus any OpenAI-compatible endpoint via custom providers
+Supported providers: `openrouter`, `openai`, `anthropic`, `deepseek`, `gemini`, `groq`, plus any OpenAI-compatible endpoint via custom providers
 
 Example — using DeepSeek directly:
 
@@ -242,20 +242,6 @@ Then enable in config:
       "enabled": true,
       "bridgeUrl": "ws://localhost:3001",
       "allowFrom": ["YOUR_PHONE_NUMBER"]
-    }
-  }
-}
-```
-
-**Feishu/Lark:**
-
-```json
-{
-  "channels": {
-    "feishu": {
-      "enabled": true,
-      "appId": "YOUR_APP_ID",
-      "appSecret": "YOUR_APP_SECRET"
     }
   }
 }
@@ -406,7 +392,7 @@ kyber/
 ├── agent/          Core agent loop, context builder, subagent manager
 │   └── tools/      Built-in tools (filesystem, shell, web, message, spawn, task_status)
 ├── bus/            Message bus for routing between channels and agent
-├── channels/       Chat integrations (Discord, Telegram, WhatsApp, Feishu)
+├── channels/       Chat integrations (Discord, Telegram, WhatsApp)
 ├── cli/            Command-line interface
 ├── config/         Configuration schema and loader
 ├── cron/           Scheduled task service
@@ -442,7 +428,6 @@ All configuration lives in `~/.kyber/config.json`. The full schema:
     "deepseek":   { "apiKey": "", "model": "" },
     "gemini":     { "apiKey": "", "model": "" },
     "groq":       { "apiKey": "", "model": "" },
-    "zhipu":      { "apiKey": "", "model": "" },
     "custom": [
       {
         "name": "my-provider",
@@ -455,8 +440,7 @@ All configuration lives in `~/.kyber/config.json`. The full schema:
   "channels": {
     "discord":  { "enabled": false, "token": "", "allowFrom": [], "allowGuilds": [], "allowChannels": [], "requireMentionInGuilds": true },
     "telegram": { "enabled": false, "token": "", "allowFrom": [] },
-    "whatsapp": { "enabled": false, "bridgeUrl": "ws://localhost:3001", "allowFrom": [] },
-    "feishu":   { "enabled": false, "appId": "", "appSecret": "" }
+    "whatsapp": { "enabled": false, "bridgeUrl": "ws://localhost:3001", "allowFrom": [] }
   },
   "gateway": { "host": "0.0.0.0", "port": 18790 },
   "dashboard": { "host": "127.0.0.1", "port": 18890, "authToken": "" },

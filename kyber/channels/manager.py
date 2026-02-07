@@ -55,17 +55,6 @@ class ChannelManager:
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:
                 logger.warning(f"WhatsApp channel not available: {e}")
-        
-        # Feishu channel
-        if self.config.channels.feishu.enabled:
-            try:
-                from kyber.channels.feishu import FeishuChannel
-                self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus
-                )
-                logger.info("Feishu channel enabled")
-            except ImportError as e:
-                logger.warning(f"Feishu channel not available: {e}")
 
         # Discord channel
         if self.config.channels.discord.enabled:

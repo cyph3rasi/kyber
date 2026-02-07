@@ -20,16 +20,6 @@ class TelegramConfig(BaseModel):
     proxy: str | None = None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
 
 
-class FeishuConfig(BaseModel):
-    """Feishu/Lark channel configuration using WebSocket long connection."""
-    enabled: bool = False
-    app_id: str = ""  # App ID from Feishu Open Platform
-    app_secret: str = ""  # App Secret from Feishu Open Platform
-    encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
-    verification_token: str = ""  # Verification Token for event subscription (optional)
-    allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
-
-
 class DiscordConfig(BaseModel):
     """Discord channel configuration."""
     enabled: bool = False
@@ -46,7 +36,6 @@ class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
-    feishu: FeishuConfig = Field(default_factory=FeishuConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
 
 
@@ -86,13 +75,12 @@ class ProvidersConfig(BaseModel):
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
-    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     custom: list[CustomProviderConfig] = Field(default_factory=list)
 
 
 # Built-in provider names (order matters for fallback detection)
-BUILTIN_PROVIDERS = ["openrouter", "deepseek", "anthropic", "openai", "gemini", "zhipu", "groq"]
+BUILTIN_PROVIDERS = ["openrouter", "deepseek", "anthropic", "openai", "gemini", "groq"]
 
 
 class GatewayConfig(BaseModel):
@@ -189,14 +177,10 @@ class Config(BaseSettings):
             # Built-in overrides
             if preferred == "openrouter":
                 return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
-            if preferred == "zhipu":
-                return self.providers.zhipu.api_base
             return None
         # Fallback
         if self.providers.openrouter.api_key:
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
-        if self.providers.zhipu.api_key:
-            return self.providers.zhipu.api_base
         return None
 
     def get_provider_name(self) -> str | None:

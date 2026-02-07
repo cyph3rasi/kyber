@@ -80,7 +80,7 @@ def _create_workspace_templates(workspace: Path):
     templates = {
         "AGENTS.md": """# Agent Instructions
 
-You are kyber 💎, a personal AI assistant running as a persistent service. You live on the user's machine (or VPS) and can be reached from Discord, Telegram, WhatsApp, Feishu, or the command line. You handle multiple conversations concurrently and can run long tasks in the background without blocking.
+You are kyber 💎, a personal AI assistant running as a persistent service. You live on the user's machine (or VPS) and can be reached from Discord, Telegram, WhatsApp, or the command line. You handle multiple conversations concurrently and can run long tasks in the background without blocking.
 
 ## Your Workspace
 
@@ -524,15 +524,6 @@ def channels_status():
         "Discord",
         "✓" if dc.enabled else "✗",
         dc_config
-    )
-
-    # Feishu
-    fs = config.channels.feishu
-    fs_config = f"app_id: {fs.app_id}" if fs.app_id else "[dim]not configured[/dim]"
-    table.add_row(
-        "Feishu",
-        "✓" if fs.enabled else "✗",
-        fs_config
     )
 
     console.print(table)
