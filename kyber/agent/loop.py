@@ -165,6 +165,62 @@ class AgentLoop:
             return "bg", rest if rest else stripped[3:]
         return None, content
     
+    async def _handle_bg_command(self, msg: InboundMessage) -> OutboundMessage:
+        """Handle /bg — spawn a subagent directly without LLM round-trip."""
+        logger.info(f"/bg command from {msg.channel}:{msg.sender_id}")
+        
+        # Set spawn context
+        spawn_tool = self.tools.get("spawn")
+        if isinstance(spawn_tool, SpawnTool):
+            spawn_tool.set_context(msg.channel, msg.chat_id)
+        
+        task = msg.content.strip()
+        if not task:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="What do you want me to work on in the background? Use: /bg <task>",
+            )
+        
+        # Build full context (system prompt + history) so the subagent is a full clone
+        session = self.sessions.get_or_create(msg.session_key)
+        context_messages = self.context.build_messages(
+            history=session.get_history(),
+            current_message="",  # task will be appended by the subagent runner
+        )
+        # Remove the empty user message we just added (subagent adds its own)
+        if context_messages and context_messages[-1].get("role") == "user":
+            context_messages.pop()
+        
+        # Call spawn directly with full context
+        if isinstance(spawn_tool, SpawnTool):
+            result = await spawn_tool._manager.spawn(
+                task=task,
+                origin_channel=msg.channel,
+                origin_chat_id=msg.chat_id,
+                context_messages=context_messages,
+            )
+            logger.info(f"/bg spawned: {result}")
+        else:
+            logger.error("SpawnTool not available")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Background tasks aren't available right now.",
+            )
+        
+        # Save to session
+        session.add_message("user", f"/bg {task}")
+        ack = f"On it — working on that in the background. I'll report back when it's done."
+        session.add_message("assistant", ack)
+        self.sessions.save(session)
+        
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=ack,
+        )
+    
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a single inbound message.
@@ -184,6 +240,10 @@ class AgentLoop:
         slash_cmd, cleaned_content = self._parse_slash_command(msg.content)
         if cleaned_content != msg.content:
             msg.content = cleaned_content
+        
+        # /bg — force background execution via spawn, skip the LLM round-trip
+        if slash_cmd == "bg":
+            return await self._handle_bg_command(msg)
         
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
         
@@ -205,19 +265,6 @@ class AgentLoop:
             current_message=msg.content,
             media=msg.media if msg.media else None,
         )
-        
-        # Inject slash command instructions
-        if slash_cmd == "bg":
-            messages.append({
-                "role": "system",
-                "content": (
-                    "The user used the /bg command. You MUST use the `spawn` tool to "
-                    "handle this task in the background. Pass the user's message as the "
-                    "task description. Respond with a brief, natural acknowledgment that "
-                    "you've kicked off a background task and will report back when it's done. "
-                    "Do NOT attempt to do the work yourself — delegate it entirely via spawn."
-                ),
-            })
         
         # Agent loop
         iteration = 0

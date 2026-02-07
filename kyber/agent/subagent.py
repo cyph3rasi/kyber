@@ -14,7 +14,7 @@ from kyber.bus.events import InboundMessage
 from kyber.bus.queue import MessageBus
 from kyber.providers.base import LLMProvider
 from kyber.agent.tools.registry import ToolRegistry
-from kyber.agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
+from kyber.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from kyber.agent.tools.shell import ExecTool
 from kyber.agent.tools.web import WebSearchTool, WebFetchTool
 
@@ -32,6 +32,7 @@ class TaskProgress:
     actions_completed: list[str] = field(default_factory=list)
     started_at: datetime = field(default_factory=datetime.now)
     finished_at: datetime | None = None
+    result: str | None = None  # Final output from the subagent
 
     def to_summary(self) -> str:
         elapsed = (self.finished_at or datetime.now()) - self.started_at
@@ -41,8 +42,10 @@ class TaskProgress:
         lines = [
             f"Task [{self.task_id}]: {self.label}",
             f"Status: {self.status}",
-            f"Progress: step {self.iteration}/{self.max_iterations} ({time_str} elapsed)",
         ]
+        if self.finished_at:
+            lines.append(f"Finished at: {self.finished_at.strftime('%H:%M:%S')}")
+        lines.append(f"Progress: step {self.iteration}/{self.max_iterations} ({time_str} elapsed)")
         if self.current_action:
             lines.append(f"Currently doing: {self.current_action}")
         if self.actions_completed:
@@ -52,6 +55,10 @@ class TaskProgress:
         if self.task and self.status in ("starting", "running"):
             task_preview = self.task[:200] + ("…" if len(self.task) > 200 else "")
             lines.append(f"Original request: {task_preview}")
+        # Include result for finished tasks so the LLM can report on them
+        if self.result and self.status in ("completed", "failed"):
+            result_preview = self.result[:500] + ("…" if len(self.result) > 500 else "")
+            lines.append(f"Result: {result_preview}")
         return "\n".join(lines)
 
 
@@ -92,6 +99,7 @@ class SubagentManager:
         label: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
+        context_messages: list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -101,6 +109,8 @@ class SubagentManager:
             label: Optional human-readable label for the task.
             origin_channel: The channel to announce results to.
             origin_chat_id: The chat ID to announce results to.
+            context_messages: Optional pre-built messages (system prompt + history)
+                to give the subagent full conversation context.
         
         Returns:
             Status message indicating the subagent was started.
@@ -123,7 +133,7 @@ class SubagentManager:
         
         # Create background task
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin, context_messages)
         )
         self._running_tasks[task_id] = bg_task
         
@@ -149,6 +159,7 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        context_messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label}")
@@ -158,6 +169,7 @@ class SubagentManager:
             tools = ToolRegistry()
             tools.register(ReadFileTool())
             tools.register(WriteFileTool())
+            tools.register(EditFileTool())
             tools.register(ListDirTool())
             tools.register(ExecTool(
                 working_dir=str(self.workspace),
@@ -167,12 +179,34 @@ class SubagentManager:
             tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
             
-            # Build messages with subagent-specific prompt
-            system_prompt = self._build_subagent_prompt(task)
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
-            ]
+            if context_messages:
+                # Full context mode: use the main agent's system prompt + history,
+                # then inject a strong system-level override + the task as a user message.
+                # System messages carry more weight than user messages for instruction-following.
+                messages = list(context_messages)  # copy so we don't mutate the original
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "You have been dispatched as a subagent of kyber. "
+                        "The conversation above is context to help you understand the situation. "
+                        "Your only purpose and goal is to use your tools to complete the task below. "
+                        "All prior conversation is only for context to assist you — do NOT continue the conversation. "
+                        "You MUST call tools (write_file, exec, read_file, edit_file, etc.) to do the actual work. "
+                        "Do NOT just describe what you would do. Do it. "
+                        "When finished, provide a brief summary of what you actually did."
+                    ),
+                })
+                messages.append({
+                    "role": "user",
+                    "content": task,
+                })
+            else:
+                # Minimal mode (called via LLM spawn tool): use focused prompt
+                system_prompt = self._build_subagent_prompt(task)
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": task},
+                ]
             
             # Run agent loop (limited iterations)
             max_iterations = 15
@@ -240,6 +274,7 @@ class SubagentManager:
             if progress:
                 progress.status = "completed"
                 progress.finished_at = datetime.now()
+                progress.result = final_result
             
             logger.info(f"Subagent [{task_id}] completed successfully")
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
@@ -251,6 +286,7 @@ class SubagentManager:
             if progress:
                 progress.status = "failed"
                 progress.finished_at = datetime.now()
+                progress.result = error_msg
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
     
     async def _announce_result(
@@ -337,8 +373,8 @@ When you have completed the task, provide a clear summary of your findings or ac
                 parts.append(p.to_summary())
                 parts.append("")
 
-        # Show recently finished tasks
-        recent_finished = list(self._finished.values())[-5:]
+        # Show recently finished tasks (last 3 only to reduce noise)
+        recent_finished = list(self._finished.values())[-3:]
         if recent_finished:
             parts.append("=== Recently Finished ===")
             for p in recent_finished:
