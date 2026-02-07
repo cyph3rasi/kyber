@@ -39,16 +39,19 @@ class TaskProgress:
         time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
 
         lines = [
-            f"Task: {self.label}",
+            f"Task [{self.task_id}]: {self.label}",
             f"Status: {self.status}",
-            f"Progress: step {self.iteration}/{self.max_iterations}",
-            f"Elapsed: {time_str}",
+            f"Progress: step {self.iteration}/{self.max_iterations} ({time_str} elapsed)",
         ]
         if self.current_action:
-            lines.append(f"Current: {self.current_action}")
+            lines.append(f"Currently doing: {self.current_action}")
         if self.actions_completed:
             recent = self.actions_completed[-5:]
             lines.append(f"Recent actions: {', '.join(recent)}")
+        # Include the original task description so the LLM knows what this is about
+        if self.task and self.status in ("starting", "running"):
+            task_preview = self.task[:200] + ("…" if len(self.task) > 200 else "")
+            lines.append(f"Original request: {task_preview}")
         return "\n".join(lines)
 
 

@@ -23,6 +23,15 @@ class ContextBuilder:
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        self._task_status_fn: Any = None
+    
+    def set_task_status_provider(self, fn: Any) -> None:
+        """Set a callable that returns current active task status text.
+        
+        This is typically SubagentManager.get_all_status or similar.
+        Keeps ContextBuilder decoupled from the subagent module.
+        """
+        self._task_status_fn = fn
     
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """
@@ -67,7 +76,33 @@ Skills with available="false" need dependencies installed first - you can try in
 
 {skills_summary}""")
         
+        # Active background tasks — so the LLM knows what's in flight
+        task_status = self._get_active_task_context()
+        if task_status:
+            parts.append(task_status)
+        
         return "\n\n---\n\n".join(parts)
+
+    def _get_active_task_context(self) -> str | None:
+        """Build a context section describing currently running background tasks.
+        
+        Returns None if no tasks are active or no status provider is set.
+        """
+        if not self._task_status_fn:
+            return None
+        try:
+            status_text = self._task_status_fn()
+        except Exception:
+            return None
+        if not status_text or "No subagent tasks" in status_text:
+            return None
+        return (
+            "# Active Background Tasks\n\n"
+            "The following tasks are currently running in the background. "
+            "When the user asks about progress or what's happening, refer to these — "
+            "not to older completed tasks from the conversation history.\n\n"
+            f"{status_text}"
+        )
 
     def build_meta_system_prompt(self) -> str:
         """

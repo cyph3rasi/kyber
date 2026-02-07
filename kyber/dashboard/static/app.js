@@ -368,7 +368,7 @@ function renderArrayField(container, key, arr, path) {
 // ── Section-specific renderers ──
 
 function renderProviders(data) {
-  const providerNames = ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'gemini', 'zhipu', 'moonshot', 'vllm'];
+  const providerNames = ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'gemini', 'zhipu', 'vllm'];
   for (const name of providerNames) {
     const prov = data[name];
     if (!prov) continue;
