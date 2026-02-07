@@ -81,6 +81,7 @@ class ProvidersConfig(BaseModel):
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+    moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
 class GatewayConfig(BaseModel):
@@ -154,6 +155,7 @@ class Config(BaseSettings):
             self.providers.gemini.api_key or
             self.providers.zhipu.api_key or
             self.providers.groq.api_key or
+            self.providers.moonshot.api_key or
             self.providers.vllm.api_key or
             None
         )
@@ -165,6 +167,8 @@ class Config(BaseSettings):
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
         if preferred == "zhipu":
             return self.providers.zhipu.api_base
+        if preferred == "moonshot":
+            return self.providers.moonshot.api_base or "https://api.moonshot.cn/v1"
         if preferred == "vllm":
             return self.providers.vllm.api_base
         if preferred:
@@ -196,6 +200,8 @@ class Config(BaseSettings):
             return "zhipu"
         if self.providers.groq.api_key:
             return "groq"
+        if self.providers.moonshot.api_key:
+            return "moonshot"
         if self.providers.vllm.api_base or self.providers.vllm.api_key:
             return "vllm"
         return None
