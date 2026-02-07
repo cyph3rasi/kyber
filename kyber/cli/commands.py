@@ -258,7 +258,7 @@ def gateway(
     api_key = config.get_api_key()
     api_base = config.get_api_base()
     provider_name = (config.agents.defaults.provider or "").strip().lower() or config.get_provider_name()
-    model = config.agents.defaults.model
+    model = config.get_model()
     is_bedrock = model.startswith("bedrock/")
 
     if provider_name and not api_key and not is_bedrock:
@@ -274,8 +274,9 @@ def gateway(
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
-        default_model=config.agents.defaults.model,
+        default_model=model,
         provider_name=provider_name,
+        is_custom=config.is_custom_provider(),
     )
     
     # Create agent
@@ -283,7 +284,7 @@ def gateway(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         brave_api_key=config.tools.web.search.api_key or None,
         search_max_results=config.tools.web.search.max_results,
@@ -377,7 +378,7 @@ def agent(
     api_key = config.get_api_key()
     api_base = config.get_api_base()
     provider_name = (config.agents.defaults.provider or "").strip().lower() or config.get_provider_name()
-    model = config.agents.defaults.model
+    model = config.get_model()
     is_bedrock = model.startswith("bedrock/")
 
     if provider_name and not api_key and not is_bedrock:
@@ -393,8 +394,9 @@ def agent(
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
-        default_model=config.agents.defaults.model,
+        default_model=model,
         provider_name=provider_name,
+        is_custom=config.is_custom_provider(),
     )
     
     agent_loop = AgentLoop(
@@ -789,21 +791,26 @@ def status():
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
     if config_path.exists():
-        console.print(f"Model: {config.agents.defaults.model}")
+        console.print(f"Provider: {config.get_provider_name() or 'not set'}")
+        console.print(f"Model: {config.get_model()}")
         
         # Check API keys
         has_openrouter = bool(config.providers.openrouter.api_key)
         has_anthropic = bool(config.providers.anthropic.api_key)
         has_openai = bool(config.providers.openai.api_key)
         has_gemini = bool(config.providers.gemini.api_key)
-        has_vllm = bool(config.providers.vllm.api_base)
         
         console.print(f"OpenRouter API: {'[green]✓[/green]' if has_openrouter else '[dim]not set[/dim]'}")
         console.print(f"Anthropic API: {'[green]✓[/green]' if has_anthropic else '[dim]not set[/dim]'}")
         console.print(f"OpenAI API: {'[green]✓[/green]' if has_openai else '[dim]not set[/dim]'}")
         console.print(f"Gemini API: {'[green]✓[/green]' if has_gemini else '[dim]not set[/dim]'}")
-        vllm_status = f"[green]✓ {config.providers.vllm.api_base}[/green]" if has_vllm else "[dim]not set[/dim]"
-        console.print(f"vLLM/Local: {vllm_status}")
+        
+        customs = config.providers.custom
+        if customs:
+            for cp in customs:
+                name = cp.name or "unnamed"
+                has = bool(cp.api_key)
+                console.print(f"{name} (custom): {'[green]✓[/green]' if has else '[dim]not set[/dim]'}")
 
 
 if __name__ == "__main__":

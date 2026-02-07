@@ -13,7 +13,7 @@ One install command, pick your provider, and you're chatting. No bloat, no confi
 - 💎 Set up in under a minute — one command installs, configures, and runs
 - Never locks up — concurrent message handling means the bot keeps responding, even during long tasks
 - Background subagents — kick off complex work without blocking the conversation, with live progress
-- Works with the providers you already use (OpenRouter, Anthropic, OpenAI, Gemini, DeepSeek, Groq, Zhipu, vLLM)
+- Works with the providers you already use (OpenRouter, Anthropic, OpenAI, Gemini, DeepSeek, Groq, Zhipu, or any OpenAI-compatible endpoint)
 - Chat where you already are — Discord, Telegram, WhatsApp, and Feishu out of the box
 - Built-in tools — web search, shell commands, GitHub, file I/O, and an extensible skills system
 - Runs on anything — your laptop, a VPS, a Raspberry Pi. Optional system service keeps it always on
@@ -70,13 +70,13 @@ Edit `~/.kyber/config.json`:
 {
   "providers": {
     "openrouter": {
-      "apiKey": "sk-or-v1-xxx"
+      "apiKey": "sk-or-v1-xxx",
+      "model": "anthropic/claude-sonnet-4-20250514"
     }
   },
   "agents": {
     "defaults": {
-      "provider": "openrouter",
-      "model": "anthropic/claude-sonnet-4-20250514"
+      "provider": "openrouter"
     }
   }
 }
@@ -108,7 +108,7 @@ kyber gateway
 
 Kyber supports multiple LLM providers through LiteLLM. You can pin a specific provider so it won't fall back to another key when multiple are configured.
 
-Supported providers: `openrouter`, `openai`, `anthropic`, `deepseek`, `gemini`, `groq`, `zhipu`, `vllm`
+Supported providers: `openrouter`, `openai`, `anthropic`, `deepseek`, `gemini`, `groq`, `zhipu`, plus any OpenAI-compatible endpoint via custom providers
 
 Example — using DeepSeek directly:
 
@@ -116,31 +116,33 @@ Example — using DeepSeek directly:
 {
   "agents": {
     "defaults": {
-      "provider": "deepseek",
-      "model": "deepseek-chat"
+      "provider": "deepseek"
     }
   },
   "providers": {
-    "deepseek": { "apiKey": "sk-xxx" }
+    "deepseek": { "apiKey": "sk-xxx", "model": "deepseek-chat" }
   }
 }
 ```
 
-Example — using a local vLLM endpoint:
+Example — using a local/self-hosted endpoint (Ollama, vLLM, etc.) as a custom provider:
 
 ```json
 {
   "agents": {
     "defaults": {
-      "provider": "vllm",
-      "model": "meta-llama/Llama-3-8b"
+      "provider": "my-local"
     }
   },
   "providers": {
-    "vllm": {
-      "apiKey": "none",
-      "apiBase": "http://localhost:8000/v1"
-    }
+    "custom": [
+      {
+        "name": "my-local",
+        "apiBase": "http://localhost:11434/v1",
+        "apiKey": "not-needed",
+        "model": "llama3"
+      }
+    ]
   }
 }
 ```
@@ -185,7 +187,7 @@ You can also find the token in `~/.kyber/config.json` under `dashboard.authToken
 | `--port` | Port (default: `18890`) |
 | `--show-token` | Print the full auth token on startup |
 
-The dashboard UI has a sidebar with sections for Providers, Agent, Channels, Tools, Gateway, Dashboard settings, and a Raw JSON editor. Changes are saved directly to `~/.kyber/config.json` — restart running services after saving to apply.
+The dashboard UI has a sidebar with sections for Providers, Agent, Channels, Tools, Gateway, Dashboard settings, and a Raw JSON editor. Each provider card shows an API key field and a model dropdown that fetches available models directly from the provider's API. Custom OpenAI-compatible providers can be added from the Providers page. The Agent tab has a provider dropdown that shows only providers with a key configured. The topbar includes Restart Gateway and Restart Dashboard buttons for quick service restarts. Changes are saved directly to `~/.kyber/config.json` and the gateway is automatically restarted on save.
 
 ---
 
@@ -427,7 +429,6 @@ All configuration lives in `~/.kyber/config.json`. The full schema:
   "agents": {
     "defaults": {
       "workspace": "~/.kyber/workspace",
-      "model": "anthropic/claude-sonnet-4-20250514",
       "provider": "",
       "maxTokens": 8192,
       "temperature": 0.7,
@@ -435,14 +436,21 @@ All configuration lives in `~/.kyber/config.json`. The full schema:
     }
   },
   "providers": {
-    "openrouter": { "apiKey": "", "apiBase": null },
-    "anthropic":  { "apiKey": "" },
-    "openai":     { "apiKey": "" },
-    "deepseek":   { "apiKey": "" },
-    "gemini":     { "apiKey": "" },
-    "groq":       { "apiKey": "" },
-    "zhipu":      { "apiKey": "" },
-    "vllm":       { "apiKey": "", "apiBase": null }
+    "openrouter": { "apiKey": "", "apiBase": null, "model": "" },
+    "anthropic":  { "apiKey": "", "model": "" },
+    "openai":     { "apiKey": "", "model": "" },
+    "deepseek":   { "apiKey": "", "model": "" },
+    "gemini":     { "apiKey": "", "model": "" },
+    "groq":       { "apiKey": "", "model": "" },
+    "zhipu":      { "apiKey": "", "model": "" },
+    "custom": [
+      {
+        "name": "my-provider",
+        "apiBase": "https://your-endpoint.com/v1",
+        "apiKey": "",
+        "model": ""
+      }
+    ]
   },
   "channels": {
     "discord":  { "enabled": false, "token": "", "allowFrom": [], "allowGuilds": [], "allowChannels": [], "requireMentionInGuilds": true },
@@ -451,7 +459,7 @@ All configuration lives in `~/.kyber/config.json`. The full schema:
     "feishu":   { "enabled": false, "appId": "", "appSecret": "" }
   },
   "gateway": { "host": "0.0.0.0", "port": 18790 },
-  "dashboard": { "enabled": false, "host": "127.0.0.1", "port": 18890, "authToken": "" },
+  "dashboard": { "host": "127.0.0.1", "port": 18890, "authToken": "" },
   "tools": {
     "web": { "search": { "apiKey": "", "maxResults": 5 } },
     "exec": { "timeout": 60, "restrictToWorkspace": false }

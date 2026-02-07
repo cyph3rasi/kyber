@@ -301,6 +301,32 @@ body {
   letter-spacing: 0.05em;
 }
 
+.field-input select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
+  cursor: pointer;
+}
+
+.field-input select:focus {
+  border-color: var(--text-tertiary);
+}
+
+.model-hint {
+  font-size: 13px;
+  color: var(--text-tertiary);
+  padding: 8px 0;
+  font-style: italic;
+}
+
+.model-hint.error-text {
+  color: var(--red);
+  font-style: normal;
+}
+
 .field-input input[type="number"] {
   font-family: var(--mono);
   font-size: 13px;

@@ -1,6 +1,6 @@
 [project]
 name = "kyber-chat"
-version = "2026.2.6.9"
+dynamic = ["version"]
 description = "A lightweight personal AI assistant framework"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -50,6 +50,9 @@ kyber = "kyber.cli.commands:app"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "kyber/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kyber"]

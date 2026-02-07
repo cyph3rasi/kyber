@@ -53,8 +53,7 @@ class ChannelsConfig(BaseModel):
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.kyber/workspace"
-    model: str = "google/gemini-3-flash-preview"
-    provider: str = "openrouter"  # Default provider
+    provider: str = "openrouter"  # Which provider to use (references a key in providers or custom name)
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 20
@@ -69,6 +68,15 @@ class ProviderConfig(BaseModel):
     """LLM provider configuration."""
     api_key: str = ""
     api_base: str | None = None
+    model: str = ""  # Selected model for this provider
+
+
+class CustomProviderConfig(BaseModel):
+    """Custom OpenAI-compatible provider configuration."""
+    name: str = ""
+    api_base: str = ""
+    api_key: str = ""
+    model: str = ""  # Selected model for this provider
 
 
 class ProvidersConfig(BaseModel):
@@ -79,8 +87,12 @@ class ProvidersConfig(BaseModel):
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
-    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+    custom: list[CustomProviderConfig] = Field(default_factory=list)
+
+
+# Built-in provider names (order matters for fallback detection)
+BUILTIN_PROVIDERS = ["openrouter", "deepseek", "anthropic", "openai", "gemini", "zhipu", "groq"]
 
 
 class GatewayConfig(BaseModel):
@@ -98,7 +110,6 @@ class WebSearchConfig(BaseModel):
 class WebToolsConfig(BaseModel):
     """Web tools configuration."""
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
-
 
 
 class DashboardConfig(BaseModel):
@@ -139,67 +150,96 @@ class Config(BaseSettings):
         """Return the explicitly configured provider, if any."""
         value = (self.agents.defaults.provider or "").strip().lower()
         return value or None
-    
+
+    def _find_custom_provider(self, name: str) -> CustomProviderConfig | None:
+        """Find a custom provider by name."""
+        for cp in self.providers.custom:
+            if cp.name.strip().lower() == name:
+                return cp
+        return None
+
     def get_api_key(self) -> str | None:
-        """Get API key in priority order, unless a provider is explicitly set."""
+        """Get API key for the active provider."""
         preferred = self._preferred_provider()
         if preferred:
+            # Check built-in providers first
             provider = getattr(self.providers, preferred, None)
-            return provider.api_key if provider else None
-        return (
-            self.providers.openrouter.api_key or
-            self.providers.deepseek.api_key or
-            self.providers.anthropic.api_key or
-            self.providers.openai.api_key or
-            self.providers.gemini.api_key or
-            self.providers.zhipu.api_key or
-            self.providers.groq.api_key or
-            self.providers.vllm.api_key or
-            None
-        )
+            if provider and isinstance(provider, ProviderConfig):
+                return provider.api_key or None
+            # Check custom providers
+            cp = self._find_custom_provider(preferred)
+            if cp:
+                return cp.api_key or None
+            return None
+        # Fallback: first built-in with a key
+        for name in BUILTIN_PROVIDERS:
+            prov = getattr(self.providers, name)
+            if prov.api_key:
+                return prov.api_key
+        return None
     
     def get_api_base(self) -> str | None:
-        """Get API base URL if using OpenRouter, Zhipu or vLLM."""
+        """Get API base URL for the active provider."""
         preferred = self._preferred_provider()
-        if preferred == "openrouter":
-            return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
-        if preferred == "zhipu":
-            return self.providers.zhipu.api_base
-        if preferred == "vllm":
-            return self.providers.vllm.api_base
         if preferred:
+            # Check custom providers
+            cp = self._find_custom_provider(preferred)
+            if cp:
+                return cp.api_base or None
+            # Built-in overrides
+            if preferred == "openrouter":
+                return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
+            if preferred == "zhipu":
+                return self.providers.zhipu.api_base
             return None
+        # Fallback
         if self.providers.openrouter.api_key:
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
         if self.providers.zhipu.api_key:
             return self.providers.zhipu.api_base
-        if self.providers.vllm.api_base:
-            return self.providers.vllm.api_base
         return None
 
     def get_provider_name(self) -> str | None:
-        """Return the selected provider name based on configured keys."""
+        """Return the selected provider name."""
         preferred = self._preferred_provider()
         if preferred:
-            return preferred if hasattr(self.providers, preferred) else None
-        if self.providers.openrouter.api_key:
-            return "openrouter"
-        if self.providers.deepseek.api_key:
-            return "deepseek"
-        if self.providers.anthropic.api_key:
-            return "anthropic"
-        if self.providers.openai.api_key:
-            return "openai"
-        if self.providers.gemini.api_key:
-            return "gemini"
-        if self.providers.zhipu.api_key:
-            return "zhipu"
-        if self.providers.groq.api_key:
-            return "groq"
-        if self.providers.vllm.api_base or self.providers.vllm.api_key:
-            return "vllm"
+            if hasattr(self.providers, preferred):
+                return preferred
+            if self._find_custom_provider(preferred):
+                return preferred
+            return None
+        for name in BUILTIN_PROVIDERS:
+            prov = getattr(self.providers, name)
+            if prov.api_key:
+                return name
         return None
-    
+
+    def get_model(self) -> str:
+        """Get the model from the active provider's config."""
+        preferred = self._preferred_provider()
+        if preferred:
+            # Check built-in
+            provider = getattr(self.providers, preferred, None)
+            if provider and isinstance(provider, ProviderConfig) and provider.model:
+                return provider.model
+            # Check custom
+            cp = self._find_custom_provider(preferred)
+            if cp and cp.model:
+                return cp.model
+        # Fallback: first built-in with a key and model set
+        for name in BUILTIN_PROVIDERS:
+            prov = getattr(self.providers, name)
+            if prov.api_key and prov.model:
+                return prov.model
+        return "openrouter/google/gemini-3-flash-preview"
+
+    def is_custom_provider(self) -> bool:
+        """Check if the active provider is a custom one."""
+        preferred = self._preferred_provider()
+        if not preferred:
+            return False
+        return self._find_custom_provider(preferred) is not None
+
     class Config:
         env_prefix = "KYBER_"
         env_nested_delimiter = "__"
