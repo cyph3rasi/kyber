@@ -135,50 +135,22 @@ class AgentLoop:
             interim_sent = False
 
             async def _on_first_tool_call() -> None:
-                """Send an in-character interim message when the agent starts real work."""
+                """Fire-and-forget an interim message via a separate LLM call.
+
+                This runs in its own asyncio task so the main agent loop is
+                never blocked — it keeps executing tools while the interim
+                "second agent" generates and delivers the acknowledgment.
+                """
                 nonlocal interim_sent
                 if interim_sent or msg.channel == "system":
                     return
                 interim_sent = True
 
-                # Generate an in-character interim using a lightweight LLM call
-                try:
-                    meta_prompt = self.context.build_meta_system_prompt()
-                    interim_messages = [
-                        {"role": "system", "content": meta_prompt},
-                        {"role": "user", "content": msg.content},
-                        {"role": "system", "content": (
-                            "The assistant has started working on this request in the background. "
-                            "Write a SHORT (1 sentence) in-character acknowledgment that: "
-                            "1) briefly references what the user asked for, "
-                            "2) lets them know you're working on it in the background, "
-                            "3) tells them they can keep chatting or ask for status updates. "
-                            "Start with a natural tone. Do NOT use tool calls. Just the message."
-                        )},
-                    ]
-                    interim_response = await self.provider.chat(
-                        messages=interim_messages,
-                        tools=None,
-                        model=self.model,
-                        max_tokens=150,
-                        temperature=0.7,
-                    )
-                    interim_text = (interim_response.content or "").strip()
-                    if not interim_text or "error" in interim_text.lower()[:20]:
-                        logger.warning(f"Interim LLM returned empty/error: {interim_text!r}")
-                        interim_text = ""
-                except Exception as exc:
-                    logger.warning(f"Interim LLM call failed: {exc}")
-                    interim_text = ""
-
-                if not interim_text:
-                    interim_text = "Processing in background. You can continue chatting, or ask for status updates."
-
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=interim_text,
-                ))
+                # Spawn the interim generation as a detached task so the
+                # main agent continues working immediately.
+                asyncio.create_task(
+                    self._send_interim_message(msg)
+                )
 
             response = await self._process_message(msg, on_first_tool_call=_on_first_tool_call)
             if response:
@@ -197,6 +169,51 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+
+    async def _send_interim_message(self, msg: InboundMessage) -> None:
+        """Generate and send an interim acknowledgment in a separate task.
+
+        This acts as a "second agent" — a lightweight, independent LLM call
+        that runs concurrently with the main agent loop so the user gets a
+        quick acknowledgment without blocking the real work.
+        """
+        try:
+            meta_prompt = self.context.build_meta_system_prompt()
+            interim_messages = [
+                {"role": "system", "content": meta_prompt},
+                {"role": "user", "content": msg.content},
+                {"role": "system", "content": (
+                    "The assistant has started working on this request in the background. "
+                    "Write a SHORT (1 sentence) in-character acknowledgment that: "
+                    "1) briefly references what the user asked for, "
+                    "2) lets them know you're working on it in the background, "
+                    "3) tells them they can keep chatting or ask for status updates. "
+                    "Start with a natural tone. Do NOT use tool calls. Just the message."
+                )},
+            ]
+            interim_response = await self.provider.chat(
+                messages=interim_messages,
+                tools=None,
+                model=self.model,
+                max_tokens=150,
+                temperature=0.7,
+            )
+            interim_text = (interim_response.content or "").strip()
+            if not interim_text or "error" in interim_text.lower()[:20]:
+                logger.warning(f"Interim LLM returned empty/error: {interim_text!r}")
+                interim_text = ""
+        except Exception as exc:
+            logger.warning(f"Interim LLM call failed: {exc}")
+            interim_text = ""
+
+        if not interim_text:
+            interim_text = "Processing in background. You can continue chatting, or ask for status updates."
+
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=interim_text,
+        ))
     
     async def _generate_fallback(self, user_message: str, tool_results: list[str]) -> str:
         """Generate an in-character fallback when the LLM didn't produce a final response.
