@@ -58,27 +58,39 @@ def _restart_gateway_service() -> tuple[bool, str]:
 
 
 def _restart_dashboard_service() -> tuple[bool, str]:
-    """Restart the dashboard service via the platform's service manager."""
+    """Restart the dashboard service via the platform's service manager.
+    
+    On macOS, uses a detached shell to unload/load the plist so the
+    dashboard process can survive long enough to send the HTTP response.
+    """
     system = platform.system()
     try:
         if system == "Darwin":
             plist = Path.home() / "Library" / "LaunchAgents" / "chat.kyber.dashboard.plist"
             if not plist.exists():
                 return False, "Dashboard launchd plist not found"
-            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True, timeout=10)
-            subprocess.run(["launchctl", "load", str(plist)], capture_output=True, timeout=10, check=True)
+            # Run unload+load in a detached shell with a small delay so the
+            # HTTP response can be sent before the process is killed.
+            subprocess.Popen(
+                f'sleep 1 && launchctl unload "{plist}" && launchctl load "{plist}"',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
         elif system == "Linux":
-            subprocess.run(
-                ["systemctl", "--user", "restart", "kyber-dashboard.service"],
-                capture_output=True, timeout=15, check=True,
+            subprocess.Popen(
+                "sleep 1 && systemctl --user restart kyber-dashboard.service",
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
         else:
             return False, f"Unsupported platform: {system}"
-    except subprocess.CalledProcessError as e:
-        return False, f"Service restart failed: {e.stderr.decode().strip() if e.stderr else str(e)}"
     except Exception as e:
         return False, str(e)
-    return True, "Dashboard service restarted"
+    return True, "Dashboard service restarting..."
 
 
 async def _fetch_models_openai_compat(api_base: str, api_key: str) -> list[str]:

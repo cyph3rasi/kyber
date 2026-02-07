@@ -129,59 +129,33 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
 
-    # How long to wait for a response before sending an interim "still working" message
-    RESPONSE_TIMEOUT = 10.0  # seconds
-
     async def _handle_message(self, msg: InboundMessage) -> None:
-        """Handle a single message in its own task (fire-and-forget from run).
-        
-        If processing takes longer than RESPONSE_TIMEOUT seconds, sends an
-        interim message so the user isn't left waiting in silence. The original
-        task keeps running and will deliver its response when done.
-        """
+        """Handle a single message in its own task (fire-and-forget from run)."""
         try:
-            process_task = asyncio.create_task(self._process_message(msg))
             interim_sent = False
 
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.shield(process_task),
-                    timeout=self.RESPONSE_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                # Processing is still running — send interim message, don't cancel
+            async def _on_first_tool_call() -> None:
+                """Send interim message when the agent starts doing real work."""
+                nonlocal interim_sent
+                if interim_sent or msg.channel == "system":
+                    return
                 interim_sent = True
-                logger.info(
-                    f"Response timeout ({self.RESPONSE_TIMEOUT}s) for "
-                    f"{msg.channel}:{msg.sender_id}, sending interim message"
-                )
-
-                # Register as a tracked task so status queries work
-                task_label = msg.content[:60] + ("…" if len(msg.content) > 60 else "")
-                progress = self.subagents.register_task(
-                    task_id=f"msg-{id(process_task):x}"[:12],
-                    label=task_label,
-                    task=msg.content,
-                )
-
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
                     content="💎 Processing in background. You can continue chatting, or ask for status updates.",
                 ))
 
-                # Now wait for the original task to finish (no timeout)
-                response = await process_task
-
-                # Mark tracked task as done
-                self.subagents.complete_task(progress.task_id)
-
-            if response and not interim_sent:
-                # Normal fast path — send response directly
+            response = await self._process_message(msg, on_first_tool_call=_on_first_tool_call)
+            if response:
                 await self.bus.publish_outbound(response)
-            elif response and interim_sent:
-                # Task finished after interim — send the actual response
-                await self.bus.publish_outbound(response)
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Sorry, I encountered an error: {str(e)}",
+            ))
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
@@ -269,12 +243,18 @@ class AgentLoop:
             content=ack,
         )
     
-    async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
+    async def _process_message(
+        self,
+        msg: InboundMessage,
+        on_first_tool_call: Any | None = None,
+    ) -> OutboundMessage | None:
         """
         Process a single inbound message.
         
         Args:
             msg: The inbound message to process.
+            on_first_tool_call: Optional async callback fired once when the first
+                tool execution begins. Used to send interim "processing" messages.
         
         Returns:
             The response message, or None if no response needed.
@@ -370,6 +350,15 @@ class AgentLoop:
                 
                 # Execute tools
                 last_tool_results.clear()
+                # Fire interim callback on first "real" tool call (skip meta-tools
+                # like task_status/spawn which aren't doing actual work)
+                if not tool_calls_executed and on_first_tool_call:
+                    has_real_tool = any(
+                        tc.name not in ("task_status", "spawn")
+                        for tc in response.tool_calls
+                    )
+                    if has_real_tool:
+                        await on_first_tool_call()
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")

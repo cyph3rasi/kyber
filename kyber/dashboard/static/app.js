@@ -805,8 +805,8 @@ restartDashBtn.addEventListener('click', async () => {
     const data = await res.json();
     if (data.ok) {
       showToast('Dashboard restarting — page will reload', 'success');
-      // Give the service a moment to restart, then reload
-      setTimeout(() => location.reload(), 3000);
+      // Give the service time to restart (1s delay + unload/load), then reload
+      setTimeout(() => location.reload(), 4000);
     } else {
       showToast('Restart failed: ' + data.message, 'error');
     }
