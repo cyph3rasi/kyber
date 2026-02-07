@@ -135,28 +135,49 @@ class AgentLoop:
             interim_sent = False
 
             async def _on_first_tool_call() -> None:
-                """Send interim message when the agent starts doing real work."""
+                """Send an in-character interim message when the agent starts real work."""
                 nonlocal interim_sent
                 if interim_sent or msg.channel == "system":
                     return
                 interim_sent = True
+
+                # Generate an in-character interim using a lightweight LLM call
+                try:
+                    meta_prompt = self.context.build_meta_system_prompt()
+                    interim_messages = [
+                        {"role": "system", "content": meta_prompt},
+                        {"role": "user", "content": msg.content},
+                        {"role": "system", "content": (
+                            "The assistant has started working on this request in the background. "
+                            "Write a SHORT (1 sentence) in-character acknowledgment that: "
+                            "1) briefly references what the user asked for, "
+                            "2) lets them know you're working on it in the background, "
+                            "3) tells them they can keep chatting or ask for status updates. "
+                            "Start with a natural tone. Do NOT use tool calls. Just the message."
+                        )},
+                    ]
+                    interim_response = await self.provider.chat(
+                        messages=interim_messages,
+                        tools=None,
+                        model=self.model,
+                        max_tokens=150,
+                        temperature=0.7,
+                    )
+                    interim_text = (interim_response.content or "").strip()
+                    if not interim_text or interim_text.startswith("Error"):
+                        interim_text = "Processing in background. You can continue chatting, or ask for status updates."
+                except Exception:
+                    interim_text = "Processing in background. You can continue chatting, or ask for status updates."
+
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
-                    content="💎 Processing in background. You can continue chatting, or ask for status updates.",
+                    content=interim_text,
                 ))
 
             response = await self._process_message(msg, on_first_tool_call=_on_first_tool_call)
             if response:
                 await self.bus.publish_outbound(response)
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=f"Sorry, I encountered an error: {str(e)}",
-            ))
-
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             await self.bus.publish_outbound(OutboundMessage(
