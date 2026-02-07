@@ -164,9 +164,14 @@ class AgentLoop:
                         temperature=0.7,
                     )
                     interim_text = (interim_response.content or "").strip()
-                    if not interim_text or interim_text.startswith("Error"):
-                        interim_text = "Processing in background. You can continue chatting, or ask for status updates."
-                except Exception:
+                    if not interim_text or "error" in interim_text.lower()[:20]:
+                        logger.warning(f"Interim LLM returned empty/error: {interim_text!r}")
+                        interim_text = ""
+                except Exception as exc:
+                    logger.warning(f"Interim LLM call failed: {exc}")
+                    interim_text = ""
+
+                if not interim_text:
                     interim_text = "Processing in background. You can continue chatting, or ask for status updates."
 
                 await self.bus.publish_outbound(OutboundMessage(
@@ -226,77 +231,6 @@ class AgentLoop:
             pass
         return "Done — let me know if you need anything else."
     
-    @staticmethod
-    def _parse_slash_command(content: str) -> tuple[str | None, str]:
-        """Parse a slash command from the message content.
-        
-        Returns:
-            (command, cleaned_content) — command is None if no slash command found.
-            The cleaned content has the /command stripped out.
-        """
-        stripped = content.strip()
-        # Check for /bg at the start (with optional space after)
-        if stripped.lower().startswith("/bg"):
-            rest = stripped[3:].lstrip()
-            return "bg", rest if rest else stripped[3:]
-        return None, content
-    
-    async def _handle_bg_command(self, msg: InboundMessage) -> OutboundMessage:
-        """Handle /bg — spawn a subagent directly without LLM round-trip."""
-        logger.info(f"/bg command from {msg.channel}:{msg.sender_id}")
-        
-        # Set spawn context
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(msg.channel, msg.chat_id)
-        
-        task = msg.content.strip()
-        if not task:
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="What do you want me to work on in the background? Use: /bg <task>",
-            )
-        
-        # Build full context (system prompt + history) so the subagent is a full clone
-        session = self.sessions.get_or_create(msg.session_key)
-        context_messages = self.context.build_messages(
-            history=session.get_history(),
-            current_message="",  # task will be appended by the subagent runner
-        )
-        # Remove the empty user message we just added (subagent adds its own)
-        if context_messages and context_messages[-1].get("role") == "user":
-            context_messages.pop()
-        
-        # Call spawn directly with full context
-        if isinstance(spawn_tool, SpawnTool):
-            result = await spawn_tool._manager.spawn(
-                task=task,
-                origin_channel=msg.channel,
-                origin_chat_id=msg.chat_id,
-                context_messages=context_messages,
-            )
-            logger.info(f"/bg spawned: {result}")
-        else:
-            logger.error("SpawnTool not available")
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="Background tasks aren't available right now.",
-            )
-        
-        # Save to session
-        session.add_message("user", f"/bg {task}")
-        ack = f"On it — working on that in the background. I'll report back when it's done."
-        session.add_message("assistant", ack)
-        self.sessions.save(session)
-        
-        return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            content=ack,
-        )
-    
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -317,15 +251,6 @@ class AgentLoop:
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
             return await self._process_system_message(msg)
-        
-        # Parse slash commands
-        slash_cmd, cleaned_content = self._parse_slash_command(msg.content)
-        if cleaned_content != msg.content:
-            msg.content = cleaned_content
-        
-        # /bg — force background execution via spawn, skip the LLM round-trip
-        if slash_cmd == "bg":
-            return await self._handle_bg_command(msg)
         
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
         
