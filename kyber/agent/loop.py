@@ -20,16 +20,6 @@ from kyber.agent.tools.spawn import SpawnTool
 from kyber.agent.tools.task_status import TaskStatusTool
 from kyber.agent.subagent import SubagentManager
 from kyber.session.manager import SessionManager
-from kyber.meta_messages import (
-    build_offload_ack_fallback,
-    clean_one_liner,
-    llm_meta_messages_enabled,
-    looks_like_prompt_leak,
-    looks_like_robotic_meta,
-)
-
-# Wall-clock timeout before auto-offloading to a subagent (seconds)
-AUTO_OFFLOAD_TIMEOUT = 30
 
 
 class AgentLoop:
@@ -142,11 +132,7 @@ class AgentLoop:
     async def _handle_message(self, msg: InboundMessage) -> None:
         """Handle a single message in its own task (fire-and-forget from run)."""
         try:
-            # System messages (subagent results) are never offloaded
-            if msg.channel == "system":
-                response = await self._process_message(msg)
-            else:
-                response = await self._process_with_timeout(msg)
+            response = await self._process_message(msg)
             if response:
                 await self.bus.publish_outbound(response)
         except Exception as e:
@@ -157,109 +143,13 @@ class AgentLoop:
                 content=f"Sorry, I encountered an error: {str(e)}",
             ))
 
-    async def _process_with_timeout(self, msg: InboundMessage) -> OutboundMessage | None:
-        """
-        Process a user message with a wall-clock timeout for acknowledgment.
 
-        The work always runs to completion. If it takes longer than
-        AUTO_OFFLOAD_TIMEOUT seconds, we register it as a tracked task,
-        send the user an in-character heads-up, and let it keep running.
-        The user can check progress via the task_status tool at any time.
-        """
-        process_task = asyncio.create_task(self._process_message(msg))
-        task_id: str | None = None
-
-        try:
-            return await asyncio.wait_for(
-                asyncio.shield(process_task),
-                timeout=AUTO_OFFLOAD_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            # Register as a tracked task so task_status can report on it
-            import uuid
-            task_id = str(uuid.uuid4())[:8]
-            label = msg.content[:40] + ("…" if len(msg.content) > 40 else "")
-            self.subagents.register_task(task_id, label, msg.content)
-
-            logger.info(
-                f"Message from {msg.channel}:{msg.sender_id} still processing "
-                f"after {AUTO_OFFLOAD_TIMEOUT}s — registered as task {task_id}"
-            )
-            ack = await self._generate_offload_ack(msg.content)
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=ack,
-            ))
-
-            # Let the original task finish
-            try:
-                result = await process_task
-            finally:
-                self.subagents.complete_task(task_id)
-            return result
-
-    async def _generate_offload_ack(self, user_message: str) -> str:
-        """Generate an in-character acknowledgment for a long-running task.
-
-        Uses LLM if enabled, but with strict leakage guards and a deterministic
-        fallback to avoid surfacing internal prompts/instructions.
-        """
-        short_msg = " ".join((user_message or "").split()).strip()
-        if len(short_msg) > 180:
-            short_msg = short_msg[:177].rstrip() + "..."
-
-        fallback = build_offload_ack_fallback()
-        if not llm_meta_messages_enabled():
-            return fallback
-
-        system = self.context.build_meta_system_prompt()
-        prompt = (
-            "Write 1-2 short sentences in your normal voice.\n"
-            "Let the user know you're still working and you'll send the result when it's ready.\n"
-            "Avoid stiff phrases like 'I will now' or 'the requested'.\n"
-            "No markdown, no quotes.\n\n"
-            f"What they're waiting on: {short_msg}"
-        )
-
-        for attempt in range(2):
-            try:
-                response = await self.provider.chat(
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt if attempt == 0 else (prompt + "\n\nRewrite it to be warmer and less transactional.")},
-                    ],
-                    tools=None,
-                    model=self.model,
-                    max_tokens=120,
-                    temperature=0.9 if attempt == 0 else 0.85,
-                )
-            except Exception as e:
-                logger.warning(f"Offload ack generation failed: {e}")
-                return fallback
-
-            content = clean_one_liner(response.content or "")
-            if not content:
-                continue
-            if len(content) > 240:
-                content = content[:237].rstrip() + "..."
-            if looks_like_prompt_leak(content):
-                logger.warning(f"Blocked suspicious offload ack: {content!r}")
-                continue
-            if looks_like_robotic_meta(content):
-                continue
-            if '"' in content or "'" in content:
-                continue
-            if content[-1] not in ".!?":
-                continue
-            return content
-
-        return fallback
     
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+    
     
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
@@ -364,6 +254,15 @@ class AgentLoop:
                 # Reset error counters after successful tool execution
                 llm_error_retries = 0
                 empty_response_retries = 0
+                
+                # If the model called spawn, it's offloading to a subagent.
+                # Use the model's accompanying text as the immediate response.
+                spawned = any(tc.name == "spawn" for tc in response.tool_calls)
+                if spawned:
+                    final_content = (response.content or "").strip()
+                    if not final_content:
+                        final_content = "On it — I'll let you know when it's done."
+                    break
             else:
                 # No tool calls — check for content
                 final_content = (response.content or "").strip()

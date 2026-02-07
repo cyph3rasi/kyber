@@ -34,7 +34,10 @@ class SpawnTool(Tool):
     def description(self) -> str:
         return (
             "Spawn a subagent to handle a task in the background. "
-            "Use this for complex or time-consuming tasks that can run independently. "
+            "Use this BEFORE doing any tool calls when a request will require multiple steps "
+            "(file creation, code projects, system admin, research, installations, etc.). "
+            "Your text response alongside this tool call will be sent to the user immediately "
+            "as an acknowledgment, so include a brief natural message about what you're going to do. "
             "The subagent will complete the task and report back when done."
         )
     

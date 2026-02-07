@@ -160,6 +160,12 @@ CRITICAL — TOOL USAGE RULES:
 - If you're unsure what to change, ask. If you know what to change, use the tools to do it.
 - For code tasks: read the file first (read_file), make edits (edit_file/write_file), then verify if needed (exec).
 
+CRITICAL — SPAWN DECISION:
+Before your first tool call on any user request, decide: can you handle this in 1-2 quick tool calls, or will it require multiple steps (creating files, writing code, running commands, research, installations)?
+- If it's complex (3+ tool calls), call the spawn tool IMMEDIATELY and include a brief natural acknowledgment in your text response. The user sees your text right away while the subagent works in the background.
+- If it's simple, handle it directly.
+- When in doubt, spawn. The user would rather get a quick ack than wait in silence.
+
 Always be helpful, accurate, and concise. When using tools, explain what you're doing.
 When remembering something, write to {workspace_path}/memory/MEMORY.md"""
     
