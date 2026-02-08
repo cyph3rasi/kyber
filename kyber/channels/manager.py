@@ -1,6 +1,8 @@
 """Channel manager for coordinating chat channels."""
 
 import asyncio
+import random
+from datetime import datetime, timedelta
 from typing import Any
 
 from loguru import logger
@@ -8,6 +10,7 @@ from loguru import logger
 from kyber.bus.events import OutboundMessage
 from kyber.bus.queue import MessageBus
 from kyber.channels.base import BaseChannel
+from kyber.channels.errors import PermanentDeliveryError, TemporaryDeliveryError
 from kyber.config.schema import Config
 
 
@@ -108,27 +111,83 @@ class ChannelManager:
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
         logger.info("Outbound dispatcher started")
-        
+
+        # Pending retries: (retry_at, attempts, message, last_error)
+        pending: list[tuple[datetime, int, OutboundMessage, str]] = []
+
+        def _schedule_retry(msg: OutboundMessage, attempts: int, err: Exception) -> None:
+            # Exponential backoff with jitter; cap at 5 minutes.
+            delay_s = min(300.0, float(2 ** min(8, max(0, attempts - 1))))
+            delay_s = delay_s * (0.8 + random.random() * 0.4)  # +/-20%
+            retry_at = datetime.now() + timedelta(seconds=delay_s)
+            pending.append((retry_at, attempts, msg, str(err)))
+
+        async def _try_send(msg: OutboundMessage, attempts: int = 1) -> None:
+            channel = self.channels.get(msg.channel)
+            if not channel:
+                raise PermanentDeliveryError(f"Unknown channel: {msg.channel}")
+            try:
+                await asyncio.wait_for(channel.send(msg), timeout=30.0)
+            except asyncio.TimeoutError:
+                raise TemporaryDeliveryError(
+                    f"Send to {msg.channel}:{msg.chat_id} timed out after 30s"
+                )
+            logger.info(f"Delivered to {msg.channel}:{msg.chat_id} (attempt {attempts})")
+
         while True:
             try:
-                msg = await asyncio.wait_for(
-                    self.bus.consume_outbound(),
-                    timeout=1.0
-                )
-                
-                channel = self.channels.get(msg.channel)
-                if channel:
-                    try:
-                        await channel.send(msg)
-                    except Exception as e:
-                        logger.error(f"Error sending to {msg.channel}: {e}")
-                else:
-                    logger.warning(f"Unknown channel: {msg.channel}")
-                    
+                now = datetime.now()
+                # Prefer due retries first so completions aren't lost.
+                msg: OutboundMessage | None = None
+                attempts = 1
+                last_err = ""
+
+                if pending:
+                    pending.sort(key=lambda x: x[0])
+                    retry_at, attempts, msg, last_err = pending[0]
+                    if retry_at <= now:
+                        pending.pop(0)
+                    else:
+                        msg = None
+
+                timeout = 1.0
+                if pending:
+                    pending.sort(key=lambda x: x[0])
+                    timeout = min(timeout, max(0.0, (pending[0][0] - now).total_seconds()))
+
+                if msg is None:
+                    msg = await asyncio.wait_for(self.bus.consume_outbound(), timeout=timeout)
+                    attempts = 1
+                    last_err = ""
+
+                try:
+                    await _try_send(msg, attempts=attempts)
+                except PermanentDeliveryError as e:
+                    logger.error(f"Permanent outbound delivery failure to {msg.channel}:{msg.chat_id}: {e}")
+                except TemporaryDeliveryError as e:
+                    logger.error(
+                        f"Temporary outbound delivery failure to {msg.channel}:{msg.chat_id} "
+                        f"(attempt {attempts}): {e}"
+                    )
+                    _schedule_retry(msg, attempts + 1, e)
+                except Exception as e:
+                    # Treat unknown exceptions as transient by default; channels can
+                    # raise PermanentDeliveryError to prevent pointless retries.
+                    logger.error(
+                        f"Error sending to {msg.channel}:{msg.chat_id} "
+                        f"(attempt {attempts}): {e}"
+                    )
+                    _schedule_retry(msg, attempts + 1, e)
+
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
+            except Exception as e:
+                # CRITICAL: Never let the dispatch loop die. If it crashes,
+                # ALL subsequent outbound messages are lost forever.
+                logger.error(f"Unexpected error in outbound dispatcher (recovering): {e}")
+                await asyncio.sleep(0.5)
     
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

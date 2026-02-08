@@ -32,6 +32,18 @@ class SkillsLoader:
         self.workspace_skills = workspace / "skills"
         self.managed_skills = MANAGED_SKILLS_DIR
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+
+        # Fresh installs may not have created these directories yet. Create them
+        # eagerly so "skills" is a visible concept out of the box.
+        try:
+            self.workspace_skills.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # Best-effort: if workspace is read-only, we still allow builtin/managed.
+            pass
+        try:
+            self.managed_skills.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
     
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """

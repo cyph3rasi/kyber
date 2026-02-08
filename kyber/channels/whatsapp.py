@@ -74,10 +74,11 @@ class WhatsAppChannel(BaseChannel):
     
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WhatsApp."""
+        from kyber.channels.errors import TemporaryDeliveryError
+
         if not self._ws or not self._connected:
-            logger.warning("WhatsApp bridge not connected")
-            return
-        
+            raise TemporaryDeliveryError("WhatsApp bridge not connected")
+
         try:
             payload = {
                 "type": "send",
@@ -86,7 +87,7 @@ class WhatsAppChannel(BaseChannel):
             }
             await self._ws.send(json.dumps(payload))
         except Exception as e:
-            logger.error(f"Error sending WhatsApp message: {e}")
+            raise TemporaryDeliveryError(f"WhatsApp send failed: {e}") from e
     
     async def _handle_bridge_message(self, raw: str) -> None:
         """Handle a message from the bridge."""

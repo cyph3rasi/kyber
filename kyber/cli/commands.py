@@ -147,6 +147,20 @@ This file stores important information that should persist across sessions.
 """)
         console.print("  [dim]Created memory/MEMORY.md[/dim]")
 
+    # Create skills directory scaffold
+    skills_dir = workspace / "skills"
+    skills_dir.mkdir(exist_ok=True)
+    skills_readme = skills_dir / "README.md"
+    if not skills_readme.exists():
+        skills_readme.write_text(
+            "# Skills\n\n"
+            "Drop custom skills here as folders containing a `SKILL.md`.\n\n"
+            "Example:\n"
+            "- `skills/my-skill/SKILL.md`\n\n"
+            "Kyber also supports managed skills in `~/.kyber/skills/<skill>/SKILL.md`.\n"
+        )
+        console.print("  [dim]Created skills/README.md[/dim]")
+
 
 # ============================================================================
 # Gateway / Server
@@ -155,65 +169,124 @@ This file stores important information that should persist across sessions.
 
 @app.command()
 def gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    port: int | None = typer.Option(None, "--port", "-p", help="Gateway port (defaults to config.gateway.port)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the kyber gateway."""
     from kyber.config.loader import load_config, get_data_dir
+    from kyber.config.loader import save_config
     from kyber.bus.queue import MessageBus
     from kyber.providers.litellm_provider import LiteLLMProvider
-    from kyber.agent.loop import AgentLoop
+    from kyber.agent.orchestrator import Orchestrator
     from kyber.channels.manager import ChannelManager
     from kyber.cron.service import CronService
     from kyber.cron.types import CronJob
     from kyber.heartbeat.service import HeartbeatService
+    from kyber.gateway.api import create_gateway_app
     
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
     
-    console.print(f"{__logo__} Starting kyber gateway on port {port}...")
-    
     config = load_config()
+    # Default port comes from config so dashboard proxy and gateway stay in sync.
+    if port is None:
+        port = int(config.gateway.port)
+    elif int(config.gateway.port) != int(port):
+        config.gateway.port = int(port)
+        save_config(config)
+
+    console.print(f"{__logo__} Starting kyber gateway on port {port}...")
+
+    # Ensure dashboard auth token exists (used for gateway task API auth).
+    if not (config.dashboard.auth_token or "").strip():
+        import secrets
+        config.dashboard.auth_token = secrets.token_urlsafe(32)
+        save_config(config)
+
+    # Capture ERROR logs for the dashboard Debug tab.
+    from kyber.logging.error_store import init_error_store
+    init_error_store(get_data_dir() / "logs" / "gateway-errors.jsonl")
+
+    # Ensure workspace scaffold exists even if user didn't run `kyber onboard`.
+    workspace = config.workspace_path
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "memory").mkdir(exist_ok=True)
+    (workspace / "skills").mkdir(exist_ok=True)
     
     # Create components
     bus = MessageBus()
     
-    # Create provider (supports OpenRouter, Anthropic, OpenAI, Bedrock)
-    api_key = config.get_api_key()
-    api_base = config.get_api_base()
-    provider_name = (config.agents.defaults.provider or "").strip().lower() or config.get_provider_name()
-    model = config.get_model()
-    is_bedrock = model.startswith("bedrock/")
+    # Create chat provider (for conversational replies)
+    chat_details = config.get_chat_provider_details()
+    chat_api_key = chat_details.get("api_key")
+    chat_api_base = chat_details.get("api_base")
+    chat_provider_name = chat_details.get("provider_name") or config.get_provider_name()
+    chat_model = config.get_chat_model()
+    chat_is_bedrock = chat_model.startswith("bedrock/")
 
-    if provider_name and not api_key and not is_bedrock:
-        console.print(f"[red]Error: No API key configured for provider {provider_name}.[/red]")
-        console.print(f"Set one in ~/.kyber/config.json under providers.{provider_name}.apiKey")
+    if chat_provider_name and not chat_api_key and not chat_is_bedrock:
+        console.print(f"[red]Error: No API key configured for chat provider {chat_provider_name}.[/red]")
+        console.print(f"Set one in ~/.kyber/config.json under providers.{chat_provider_name}.apiKey")
         raise typer.Exit(1)
 
-    if not api_key and not is_bedrock:
+    if not chat_api_key and not chat_is_bedrock:
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.kyber/config.json under providers.openrouter.apiKey")
         raise typer.Exit(1)
     
-    provider = LiteLLMProvider(
-        api_key=api_key,
-        api_base=api_base,
-        default_model=model,
-        provider_name=provider_name,
-        is_custom=config.is_custom_provider(),
+    chat_provider = LiteLLMProvider(
+        api_key=chat_api_key,
+        api_base=chat_api_base,
+        default_model=chat_model,
+        provider_name=chat_provider_name,
+        is_custom=chat_details.get("is_custom", False),
     )
+
+    # Create task provider (for background workers)
+    task_details = config.get_task_provider_details()
+    task_provider_name = task_details.get("provider_name") or chat_provider_name
+    task_api_key = task_details.get("api_key")
+    task_api_base = task_details.get("api_base")
+    task_model = config.get_task_model()
+    task_is_bedrock = task_model.startswith("bedrock/")
+
+    # Only create a separate task provider if it differs from chat
+    if (task_provider_name == chat_provider_name
+        and task_api_key == chat_api_key
+        and task_api_base == chat_api_base):
+        task_provider = chat_provider
+    else:
+        if task_provider_name and not task_api_key and not task_is_bedrock:
+            console.print(f"[red]Error: No API key configured for task provider {task_provider_name}.[/red]")
+            console.print(f"Set one in ~/.kyber/config.json under providers.{task_provider_name}.apiKey")
+            raise typer.Exit(1)
+        task_provider = LiteLLMProvider(
+            api_key=task_api_key,
+            api_base=task_api_base,
+            default_model=task_model,
+            provider_name=task_provider_name,
+            is_custom=task_details.get("is_custom", False),
+        )
+    
+    # Load persona from SOUL.md
+    soul_path = workspace / "SOUL.md"
+    persona = ""
+    if soul_path.exists():
+        persona = soul_path.read_text(encoding="utf-8")
     
     # Create agent
-    agent = AgentLoop(
+    agent = Orchestrator(
         bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
+        provider=chat_provider,
+        workspace=workspace,
+        persona_prompt=persona,
+        model=chat_model,
         brave_api_key=config.tools.web.search.api_key or None,
-        search_max_results=config.tools.web.search.max_results,
-        exec_config=config.tools.exec,
+        background_progress_updates=getattr(config.agents.defaults, "background_progress_updates", True),
+        task_history_path=get_data_dir() / "tasks" / "history.jsonl",
+        task_provider=task_provider,
+        task_model=task_model,
     )
     
     # Create cron service
@@ -234,7 +307,8 @@ def gateway(
         return response
     
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
-    cron = CronService(cron_store_path, on_job=on_cron_job)
+    user_tz = config.agents.defaults.timezone or None
+    cron = CronService(cron_store_path, on_job=on_cron_job, timezone=user_tz)
     
     # Create heartbeat service
     async def on_heartbeat(prompt: str) -> str:
@@ -261,14 +335,28 @@ def gateway(
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
     
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
-    
+
     async def run():
         try:
+            # Start local gateway API for dashboard task management.
+            import uvicorn
+            api_app = create_gateway_app(agent, config.dashboard.auth_token)
+            api_config = uvicorn.Config(
+                api_app,
+                host=config.gateway.host,
+                port=port,
+                log_level="warning",
+                access_log=False,
+            )
+            api_server = uvicorn.Server(api_config)
+            api_task = asyncio.create_task(api_server.serve())
+
             await cron.start()
             await heartbeat.start()
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
+                api_task,
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
@@ -296,46 +384,85 @@ def agent(
     from kyber.config.loader import load_config
     from kyber.bus.queue import MessageBus
     from kyber.providers.litellm_provider import LiteLLMProvider
-    from kyber.agent.loop import AgentLoop
+    from kyber.agent.orchestrator import Orchestrator
     
     config = load_config()
     
     api_key = config.get_api_key()
     api_base = config.get_api_base()
     provider_name = (config.agents.defaults.provider or "").strip().lower() or config.get_provider_name()
-    model = config.get_model()
-    is_bedrock = model.startswith("bedrock/")
 
-    if provider_name and not api_key and not is_bedrock:
-        console.print(f"[red]Error: No API key configured for provider {provider_name}.[/red]")
-        console.print(f"Set one in ~/.kyber/config.json under providers.{provider_name}.apiKey")
+    # Chat provider
+    chat_details = config.get_chat_provider_details()
+    chat_api_key = chat_details.get("api_key") or api_key
+    chat_api_base = chat_details.get("api_base") or api_base
+    chat_provider_name = chat_details.get("provider_name") or provider_name
+    chat_model = config.get_chat_model()
+    chat_is_bedrock = chat_model.startswith("bedrock/")
+
+    if chat_provider_name and not chat_api_key and not chat_is_bedrock:
+        console.print(f"[red]Error: No API key configured for provider {chat_provider_name}.[/red]")
+        console.print(f"Set one in ~/.kyber/config.json under providers.{chat_provider_name}.apiKey")
         raise typer.Exit(1)
 
-    if not api_key and not is_bedrock:
+    if not chat_api_key and not chat_is_bedrock:
         console.print("[red]Error: No API key configured.[/red]")
         raise typer.Exit(1)
 
     bus = MessageBus()
-    provider = LiteLLMProvider(
-        api_key=api_key,
-        api_base=api_base,
-        default_model=model,
-        provider_name=provider_name,
-        is_custom=config.is_custom_provider(),
+    chat_provider = LiteLLMProvider(
+        api_key=chat_api_key,
+        api_base=chat_api_base,
+        default_model=chat_model,
+        provider_name=chat_provider_name,
+        is_custom=chat_details.get("is_custom", False),
     )
+
+    # Task provider
+    task_details = config.get_task_provider_details()
+    task_provider_name = task_details.get("provider_name") or chat_provider_name
+    task_api_key = task_details.get("api_key")
+    task_model = config.get_task_model()
+
+    if (task_provider_name == chat_provider_name
+        and task_api_key == chat_api_key
+        and task_details.get("api_base") == chat_api_base):
+        task_provider = chat_provider
+    else:
+        task_is_bedrock = task_model.startswith("bedrock/")
+        if task_provider_name and not task_api_key and not task_is_bedrock:
+            console.print(f"[red]Error: No API key configured for task provider {task_provider_name}.[/red]")
+            raise typer.Exit(1)
+        task_provider = LiteLLMProvider(
+            api_key=task_api_key,
+            api_base=task_details.get("api_base"),
+            default_model=task_model,
+            provider_name=task_provider_name,
+            is_custom=task_details.get("is_custom", False),
+        )
     
-    agent_loop = AgentLoop(
+    # Load persona from SOUL.md
+    soul_path = config.workspace_path / "SOUL.md"
+    persona = ""
+    if soul_path.exists():
+        persona = soul_path.read_text(encoding="utf-8")
+    
+    # Create agent
+    agent_instance = Orchestrator(
         bus=bus,
-        provider=provider,
+        provider=chat_provider,
         workspace=config.workspace_path,
+        persona_prompt=persona,
+        model=chat_model,
         brave_api_key=config.tools.web.search.api_key or None,
-        exec_config=config.tools.exec,
+        task_provider=task_provider,
+        task_model=task_model,
     )
     
     if message:
         # Single message mode
         async def run_once():
-            response = await agent_loop.process_direct(message, session_id)
+            response = await agent_instance.process_direct(message, session_id)
             console.print(f"\n{__logo__} {response}")
         
         asyncio.run(run_once())
@@ -350,7 +477,7 @@ def agent(
                     if not user_input.strip():
                         continue
                     
-                    response = await agent_loop.process_direct(user_input, session_id)
+                    response = await agent_instance.process_direct(user_input, session_id)
                     console.print(f"\n{__logo__} {response}\n")
                 except KeyboardInterrupt:
                     console.print("\nGoodbye!")
@@ -373,6 +500,8 @@ def dashboard(
 
     from kyber.config.loader import load_config, save_config
     from kyber.dashboard.server import create_dashboard_app
+    from kyber.config.loader import get_data_dir
+    from kyber.logging.error_store import init_error_store
 
     config = load_config()
     dash = config.dashboard
@@ -393,6 +522,8 @@ def dashboard(
         raise typer.Exit(1)
 
     app = create_dashboard_app(config)
+    # Capture dashboard process errors too (separate file).
+    init_error_store(get_data_dir() / "logs" / "dashboard-errors.jsonl")
     url = f"http://{dash.host}:{dash.port}"
     console.print(f"{__logo__} Kyber dashboard running at {url}")
     if show_token:
@@ -401,7 +532,8 @@ def dashboard(
         masked = dash.auth_token[:6] + "…" + dash.auth_token[-4:]
         console.print(f"  Token: [dim]{masked}[/dim]  (run with --show-token to reveal)")
     console.print(f"  Open:  {url}")
-    uvicorn.run(app, host=dash.host, port=dash.port, log_level="info")
+    # Dashboard is chatty when polling; keep access logs off by default.
+    uvicorn.run(app, host=dash.host, port=dash.port, log_level="warning", access_log=False)
 
 
 # ============================================================================
@@ -411,6 +543,94 @@ def dashboard(
 
 channels_app = typer.Typer(help="Manage channels")
 app.add_typer(channels_app, name="channels")
+
+skills_app = typer.Typer(help="Manage skills (skills.sh compatible)")
+app.add_typer(skills_app, name="skills")
+
+
+@skills_app.command("list")
+def skills_list():
+    """List skills from workspace, managed (~/.kyber/skills), and builtin."""
+    from kyber.config.loader import load_config
+    from kyber.agent.skills import SkillsLoader
+
+    cfg = load_config()
+    loader = SkillsLoader(cfg.workspace_path)
+    skills = loader.list_skills(filter_unavailable=False)
+    if not skills:
+        console.print("No skills found.")
+        return
+
+    table = Table(title="Skills")
+    table.add_column("Name", style="cyan")
+    table.add_column("Source", style="green")
+    table.add_column("Path", style="dim")
+    for s in skills:
+        table.add_row(s.get("name", ""), s.get("source", ""), s.get("path", ""))
+    console.print(table)
+
+
+@skills_app.command("add")
+def skills_add(
+    source: str = typer.Argument(..., help="owner/repo or GitHub URL"),
+    skill: str | None = typer.Option(None, "--skill", help="Only install a specific skill directory name"),
+    replace: bool = typer.Option(False, "--replace", help="Replace existing skill dirs if present"),
+):
+    """Install skills into ~/.kyber/skills by cloning a repo and copying SKILL.md directories."""
+    from kyber.skillhub.manager import install_from_source
+
+    res = install_from_source(source, skill=skill, replace=replace)
+    installed = res.get("installed") or []
+    if installed:
+        console.print(f"[green]✓[/green] Installed: {', '.join(installed)}")
+    else:
+        console.print("[yellow]Nothing installed[/yellow] (already present?)")
+
+
+@skills_app.command("remove")
+def skills_remove(name: str = typer.Argument(..., help="Skill directory name under ~/.kyber/skills")):
+    """Remove a managed skill from ~/.kyber/skills."""
+    from kyber.skillhub.manager import remove_skill
+
+    remove_skill(name)
+    console.print(f"[green]✓[/green] Removed: {name}")
+
+
+@skills_app.command("update-all")
+def skills_update_all():
+    """Update all managed skill sources recorded in the manifest."""
+    from kyber.skillhub.manager import update_all
+
+    res = update_all(replace=True)
+    updated = res.get("updated") or []
+    ok = [u for u in updated if not u.get("error")]
+    bad = [u for u in updated if u.get("error")]
+    console.print(f"[green]✓[/green] Updated sources: {len(ok)}")
+    if bad:
+        console.print(f"[red]✗[/red] Failed sources: {len(bad)}")
+        for u in bad:
+            console.print(f"  - {u.get('source')}: {u.get('error')}")
+
+
+@skills_app.command("search")
+def skills_search(query: str = typer.Argument(..., help="Search skills.sh")):
+    """Search skills.sh and print top results."""
+    import asyncio
+
+    from kyber.skillhub.skills_sh import search_skills_sh
+
+    results = asyncio.run(search_skills_sh(query, limit=10))
+    if not results:
+        console.print("No results.")
+        return
+    table = Table(title=f"skills.sh results for: {query}")
+    table.add_column("Name", style="cyan")
+    table.add_column("Source", style="green")
+    table.add_column("Installs", style="yellow", justify="right")
+    table.add_column("ID", style="dim")
+    for r in results:
+        table.add_row(r.get("name", ""), r.get("source", ""), str(r.get("installs", 0)), r.get("id", ""))
+    console.print(table)
 
 
 @channels_app.command("status")
@@ -708,7 +928,10 @@ def status():
 
     if config_path.exists():
         console.print(f"Provider: {config.get_provider_name() or 'not set'}")
-        console.print(f"Model: {config.get_model()}")
+        chat_prov = config.get_chat_provider_name()
+        task_prov = config.get_task_provider_name()
+        console.print(f"Chat: {chat_prov or 'default'} / {config.get_chat_model()}")
+        console.print(f"Tasks: {task_prov or 'default'} / {config.get_task_model()}")
         
         # Check API keys
         has_openrouter = bool(config.providers.openrouter.api_key)

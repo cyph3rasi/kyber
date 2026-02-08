@@ -32,29 +32,28 @@ def looks_like_prompt_leak(text: str) -> bool:
         return True
 
     # Common prompt/instruction markers.
+    # IMPORTANT: These must be specific enough to avoid false-positives on
+    # normal conversational output. Overly broad needles (e.g. "rules",
+    # "markdown", "instructions") cause voice generation to reject valid
+    # messages and exhaust retries, leading to dropped updates/completions.
     needles = [
         "system prompt",
         "system message",
         "developer message",
-        "role:",
+        "role: system",
+        "role: assistant",
+        "role: user",
+        "role: tool",
         "assistant:",
-        "user:",
-        "tool:",
-        "tools:",
         "tool call",
         "tool_calls",
-        "do not",
-        "don't",
-        "rules",
-        "instructions",
         "no markdown",
-        "markdown",
         "no emojis",
-        "no code",
+        "no code blocks",
         "just the response",
         "just a brief update",
-        "begin",
-        "end",
+        "begin_patch",
+        "end_patch",
         "```",
         "<instructions>",
         "</instructions>",
@@ -63,8 +62,29 @@ def looks_like_prompt_leak(text: str) -> bool:
     if any(n in lower for n in needles):
         return True
 
-    # If it contains lots of quotes/brackets, it's often copying prompt text.
-    if t.count('"') >= 2 or t.count("'") >= 4:
+    # High-signal instruction leaks that show up in background/meta messages.
+    # Keep this list tight: false positives here are expensive because they can
+    # suppress normal conversational phrasing (e.g., "don't worry").
+    high_signal = [
+        "no more tool calls",
+        "do not use any more tools",
+        "do not use any tools",
+        "do not call any tools",
+        "tools are disabled",
+        "stay in character",  # often part of meta-instructions rather than user content
+        "as you finish",
+        "tell the user exactly what to do next",
+        "if you used a virtual environment",
+        "use the apply_patch tool",
+        "use apply_patch",
+    ]
+    if any(n in lower for n in high_signal):
+        return True
+
+    # If it contains many quotes/brackets, it's often copying prompt text.
+    # Threshold must be high enough to allow legitimate structured output
+    # (task results with quoted strings, JSON snippets, etc.).
+    if t.count('"') >= 20 or t.count("'") >= 20:
         return True
 
     return False
@@ -90,7 +110,7 @@ def looks_like_robotic_meta(text: str) -> bool:
 
     needles = [
         "i will now",
-        "i will",
+        "i will proceed",
         "proceed with",
         "the requested",
         "requested execution",
@@ -142,6 +162,43 @@ def build_tool_status_text(tool_name: str) -> str:
         "task_status": "Checking on progress now.",
     }
     return mapping.get(tool, "On it, working on that now.")
+
+
+def describe_tool_action(tool_name: str, tense: str = "present") -> str:
+    """Human description of what a tool *does*, avoiding internal tool names."""
+    tool = (tool_name or "").strip()
+    tense = (tense or "present").strip().lower()
+    is_past = tense in {"past", "done", "completed"}
+
+    present: dict[str, str] = {
+        "read_file": "reading a file",
+        "list_dir": "looking through a folder",
+        "write_file": "writing a file",
+        "edit_file": "editing a file",
+        "exec": "running a shell command",
+        "web_search": "searching the web",
+        "web_fetch": "opening a web page",
+        "message": "sending a message",
+        "spawn": "kicking work off",
+        "task_status": "checking status",
+    }
+
+    past: dict[str, str] = {
+        "read_file": "read a file",
+        "list_dir": "looked through a folder",
+        "write_file": "wrote a file",
+        "edit_file": "edited a file",
+        "exec": "ran a shell command",
+        "web_search": "searched the web",
+        "web_fetch": "opened a web page",
+        "message": "sent a message",
+        "spawn": "kicked work off",
+        "task_status": "checked status",
+    }
+
+    if is_past:
+        return past.get(tool, "made progress")
+    return present.get(tool, "making progress")
 
 
 def build_offload_ack_fallback() -> str:

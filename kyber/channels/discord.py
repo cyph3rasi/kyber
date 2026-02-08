@@ -9,6 +9,7 @@ from loguru import logger
 from kyber.bus.events import OutboundMessage
 from kyber.bus.queue import MessageBus
 from kyber.channels.base import BaseChannel
+from kyber.channels.errors import PermanentDeliveryError, TemporaryDeliveryError
 from kyber.config.schema import DiscordConfig
 
 try:
@@ -94,39 +95,62 @@ class DiscordChannel(BaseChannel):
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Discord."""
         if not self._client:
-            logger.warning("Discord client not initialized")
-            return
-        
+            raise TemporaryDeliveryError("Discord client not initialized")
+
         if not self._ready.is_set():
-            logger.warning("Discord client not ready yet")
-            return
-        
+            raise TemporaryDeliveryError("Discord client not ready yet")
+
         try:
             channel_id = int(msg.chat_id)
         except ValueError:
-            logger.error(f"Invalid Discord channel id: {msg.chat_id}")
-            return
+            raise PermanentDeliveryError(f"Invalid Discord channel id: {msg.chat_id}")
 
-        # Stop typing indicator for this channel when we send a response
-        self._stop_typing(channel_id)
-        
+        # For direct responses: stop typing, we're done.
+        # For background updates (progress/completion): Discord will cancel
+        # the typing indicator when we send, so we need to re-trigger it
+        # if the main response is still being processed.
+        is_still_typing = channel_id in self._typing_tasks
+        if not msg.is_background:
+            self._stop_typing(channel_id)
+
         try:
             channel = self._client.get_channel(channel_id)
             if channel is None:
                 channel = await self._client.fetch_channel(channel_id)
             if channel is None:
-                logger.error(f"Discord channel not found: {channel_id}")
-                return
-            
+                raise PermanentDeliveryError(f"Discord channel not found: {channel_id}")
+
             allowed_mentions = discord.AllowedMentions.none()
             chunks = [chunk for chunk in self._split_message(msg.content) if chunk.strip()]
             if not chunks:
-                logger.warning("Skipping empty Discord message")
-                return
+                raise PermanentDeliveryError("Empty Discord message content")
             for chunk in chunks:
                 await channel.send(chunk, allowed_mentions=allowed_mentions)
+
+            # Re-trigger typing if this was a background message and the
+            # main response is still being processed.
+            if msg.is_background and is_still_typing and channel_id in self._typing_tasks:
+                # The send above killed Discord's typing state. Poke the
+                # typing loop so it re-sends the indicator immediately.
+                task = self._typing_tasks.get(channel_id)
+                if task and not task.done():
+                    # Cancel and restart the typing loop so it fires now
+                    # instead of waiting for the next 7s tick.
+                    task.cancel()
+                    self._typing_tasks.pop(channel_id, None)
+                    self._start_typing(channel_id, channel, _restart=True)
+        except (PermanentDeliveryError, TemporaryDeliveryError):
+            raise
         except Exception as e:
-            logger.error(f"Error sending Discord message: {e}")
+            # Classify common discord.py errors so the dispatcher can retry smartly.
+            if DISCORD_AVAILABLE and discord is not None:
+                if isinstance(e, discord.Forbidden):
+                    raise PermanentDeliveryError(f"Discord forbidden: {e}") from e
+                if isinstance(e, discord.NotFound):
+                    raise PermanentDeliveryError(f"Discord not found: {e}") from e
+                if isinstance(e, discord.HTTPException):
+                    raise TemporaryDeliveryError(f"Discord HTTP error: {e}") from e
+            raise TemporaryDeliveryError(f"Discord send failed: {e}") from e
     
     async def _on_message(self, message: "discord.Message") -> None:
         """Handle incoming messages from Discord."""
@@ -226,15 +250,16 @@ class DiscordChannel(BaseChannel):
         # If not resolved, avoid extra fetches for safety
         return False
 
-    def _start_typing(self, channel_id: int, channel: "discord.abc.Messageable") -> None:
+    def _start_typing(self, channel_id: int, channel: "discord.abc.Messageable", _restart: bool = False) -> None:
         """Start typing indicator for a channel (ref-counted)."""
         if not self.config.typing_indicator:
             return
-        
-        self._typing_counts[channel_id] = self._typing_counts.get(channel_id, 0) + 1
+
+        if not _restart:
+            self._typing_counts[channel_id] = self._typing_counts.get(channel_id, 0) + 1
         if channel_id in self._typing_tasks:
             return
-        
+
         async def _typing_loop():
             try:
                 # Trigger typing periodically while processing
@@ -245,7 +270,7 @@ class DiscordChannel(BaseChannel):
                 pass
             except Exception as e:
                 logger.debug(f"Typing indicator error: {e}")
-        
+
         self._typing_tasks[channel_id] = asyncio.create_task(_typing_loop())
 
     def _stop_typing(self, channel_id: int) -> None:

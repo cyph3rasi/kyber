@@ -153,13 +153,17 @@ class TelegramChannel(BaseChannel):
     
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
+        from kyber.channels.errors import PermanentDeliveryError, TemporaryDeliveryError
+
         if not self._app:
-            logger.warning("Telegram bot not running")
-            return
-        
+            raise TemporaryDeliveryError("Telegram bot not running")
+
         try:
-            # chat_id should be the Telegram chat ID (integer)
             chat_id = int(msg.chat_id)
+        except ValueError:
+            raise PermanentDeliveryError(f"Invalid Telegram chat_id: {msg.chat_id}")
+
+        try:
             # Convert markdown to Telegram HTML
             html_content = _markdown_to_telegram_html(msg.content)
             await self._app.bot.send_message(
@@ -167,18 +171,20 @@ class TelegramChannel(BaseChannel):
                 text=html_content,
                 parse_mode="HTML"
             )
-        except ValueError:
-            logger.error(f"Invalid chat_id: {msg.chat_id}")
         except Exception as e:
             # Fallback to plain text if HTML parsing fails
             logger.warning(f"HTML parse failed, falling back to plain text: {e}")
             try:
                 await self._app.bot.send_message(
-                    chat_id=int(msg.chat_id),
+                    chat_id=chat_id,
                     text=msg.content
                 )
             except Exception as e2:
-                logger.error(f"Error sending Telegram message: {e2}")
+                # Classify the error so the dispatcher can retry appropriately.
+                err_str = str(e2).lower()
+                if "chat not found" in err_str or "bot was blocked" in err_str or "forbidden" in err_str:
+                    raise PermanentDeliveryError(f"Telegram send failed: {e2}") from e2
+                raise TemporaryDeliveryError(f"Telegram send failed: {e2}") from e2
     
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""

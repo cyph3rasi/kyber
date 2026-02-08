@@ -264,13 +264,14 @@ Kyber handles long-running tasks without blocking the conversation. Every incomi
 **How it works:**
 
 - Each message runs in its own async task
-- If a task takes longer than 30 seconds, the bot sends an acknowledgment and keeps working in the background
+- When the agent starts using tools, it sends an in-character acknowledgment so you know it's working
+- For complex tasks (3+ tool calls), the agent spawns a **subagent** — a lightweight background worker that handles the task independently
 - The user can ask for status updates at any time — the bot has a `task_status` tool that returns live progress instantly
-- Subagents can also be spawned explicitly by the LLM for tasks it wants to run in parallel
+- Each spawned task gets a reference code (e.g. `⚡a3f1b2c4`) you can use to ask about specific tasks
 
 **Status tracking:**
 
-All long-running tasks (both auto-promoted and explicitly spawned subagents) are tracked with:
+All background tasks are tracked with:
 - Current step and total steps
 - Elapsed time
 - What tool is currently running

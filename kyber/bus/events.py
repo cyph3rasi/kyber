@@ -33,5 +33,8 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # If True, this is a background update (progress, completion) that
+    # should not cancel the typing indicator for the main response.
+    is_background: bool = False
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import platform
 import secrets
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,16 @@ from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_413_REQUEST_ENTITY_TOO_
 
 from kyber.config.loader import convert_keys, convert_to_camel, load_config, save_config
 from kyber.config.schema import Config
+from kyber.skillhub.manager import (
+    install_from_source,
+    remove_skill,
+    list_managed_installs,
+    update_all,
+    preview_source,
+    fetch_skill_md,
+)
+from kyber.skillhub.skills_sh import search_skills_sh
+from kyber.agent.skills import SkillsLoader
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 1 * 1024 * 1024  # 1 MB
@@ -258,6 +269,152 @@ def create_dashboard_app(config: Config) -> FastAPI:
         config = load_config()
         payload = convert_to_camel(config.model_dump())
         return JSONResponse(payload)
+
+    def _gateway_base() -> str:
+        cfg = load_config()
+        # Always talk to localhost; gateway binds based on its own config.
+        return f"http://127.0.0.1:{cfg.gateway.port}"
+
+    async def _proxy_gateway(request: Request, method: str, path: str, json_body: Any | None = None) -> JSONResponse:
+        token = request.app.state.auth_token
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        url = _gateway_base() + path
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.request(method, url, headers=headers, json=json_body)
+        # Pass through status and body
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"error": resp.text}
+        return JSONResponse(data, status_code=resp.status_code)
+
+    @app.get("/api/tasks", dependencies=[Depends(_require_token)])
+    async def get_tasks(request: Request) -> JSONResponse:
+        return await _proxy_gateway(request, "GET", "/tasks")
+
+    @app.post("/api/tasks/{ref}/cancel", dependencies=[Depends(_require_token)])
+    async def cancel_task(request: Request, ref: str) -> JSONResponse:
+        return await _proxy_gateway(request, "POST", f"/tasks/{ref}/cancel")
+
+    @app.post("/api/tasks/{ref}/progress-updates", dependencies=[Depends(_require_token)])
+    async def toggle_task_progress_updates(request: Request, ref: str, body: dict[str, Any]) -> JSONResponse:
+        return await _proxy_gateway(request, "POST", f"/tasks/{ref}/progress-updates", json_body=body)
+
+    @app.post("/api/tasks/{ref}/redeliver", dependencies=[Depends(_require_token)])
+    async def redeliver_task(request: Request, ref: str) -> JSONResponse:
+        return await _proxy_gateway(request, "POST", f"/tasks/{ref}/redeliver")
+
+    @app.get("/api/errors", dependencies=[Depends(_require_token)])
+    async def get_errors(request: Request, limit: int = 200) -> JSONResponse:
+        return await _proxy_gateway(request, "GET", f"/errors?limit={int(limit)}")
+
+    @app.post("/api/errors/clear", dependencies=[Depends(_require_token)])
+    async def clear_errors(request: Request) -> JSONResponse:
+        return await _proxy_gateway(request, "POST", "/errors/clear")
+
+    @app.get("/api/skills", dependencies=[Depends(_require_token)])
+    async def get_skills() -> JSONResponse:
+        cfg = load_config()
+        loader = SkillsLoader(cfg.workspace_path)
+        skills = loader.list_skills(filter_unavailable=False)
+        manifest = list_managed_installs()
+        return JSONResponse({"skills": skills, "managed": manifest.get("installed", {})})
+
+    @app.get("/api/skills/search", dependencies=[Depends(_require_token)])
+    async def search_skills(q: str, limit: int = 10) -> JSONResponse:
+        results = await search_skills_sh(q, limit=limit)
+        return JSONResponse({"results": results})
+
+    @app.post("/api/skills/install", dependencies=[Depends(_require_token)])
+    async def install_skill(body: dict[str, Any]) -> JSONResponse:
+        source = str(body.get("source", "") or "").strip()
+        skill = (str(body.get("skill", "") or "").strip() or None)
+        replace = bool(body.get("replace", False))
+        if not source:
+            raise HTTPException(status_code=400, detail="source is required")
+        try:
+            res = install_from_source(source, skill=skill, replace=replace)
+            return JSONResponse(res)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/remove/{name}", dependencies=[Depends(_require_token)])
+    async def remove_skill_api(name: str) -> JSONResponse:
+        try:
+            res = remove_skill(name)
+            return JSONResponse(res)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/update-all", dependencies=[Depends(_require_token)])
+    async def update_all_skills(body: dict[str, Any] | None = None) -> JSONResponse:
+        replace = True
+        if body and "replace" in body:
+            replace = bool(body.get("replace"))
+        res = update_all(replace=replace)
+        return JSONResponse(res)
+
+    @app.post("/api/skills/preview", dependencies=[Depends(_require_token)])
+    async def preview_skill(body: dict[str, Any]) -> JSONResponse:
+        source = str(body.get("source", "") or "").strip()
+        if not source:
+            raise HTTPException(status_code=400, detail="source is required")
+
+        # Simple in-memory TTL cache (per dashboard process).
+        cache: dict[str, tuple[float, dict[str, Any]]] = getattr(app.state, "skill_preview_cache", None)
+        if cache is None:
+            cache = {}
+            app.state.skill_preview_cache = cache
+        now = time.time()
+
+        key = f"preview:{source}"
+        if key in cache:
+            ts, payload = cache[key]
+            if now - ts < 60.0:
+                return JSONResponse(payload)
+            cache.pop(key, None)
+
+        try:
+            res = preview_source(source)
+            cache[key] = (now, res)
+            # Keep cache bounded
+            if len(cache) > 40:
+                # Drop an arbitrary entry
+                cache.pop(next(iter(cache.keys())), None)
+            return JSONResponse(res)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/skillmd", dependencies=[Depends(_require_token)])
+    async def skill_md(body: dict[str, Any]) -> JSONResponse:
+        source = str(body.get("source", "") or "").strip()
+        skill = str(body.get("skill", "") or "").strip()
+        if not source:
+            raise HTTPException(status_code=400, detail="source is required")
+        if not skill:
+            raise HTTPException(status_code=400, detail="skill is required")
+
+        cache: dict[str, tuple[float, dict[str, Any]]] = getattr(app.state, "skill_md_cache", None)
+        if cache is None:
+            cache = {}
+            app.state.skill_md_cache = cache
+        now = time.time()
+
+        key = f"skillmd:{source}:{skill}"
+        if key in cache:
+            ts, payload = cache[key]
+            if now - ts < 120.0:
+                return JSONResponse(payload)
+            cache.pop(key, None)
+
+        try:
+            res = fetch_skill_md(source, skill)
+            cache[key] = (now, res)
+            if len(cache) > 40:
+                cache.pop(next(iter(cache.keys())), None)
+            return JSONResponse(res)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.put("/api/config", dependencies=[Depends(_require_token)])
     async def update_config(body: dict[str, Any]) -> JSONResponse:

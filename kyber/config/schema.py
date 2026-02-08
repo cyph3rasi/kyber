@@ -27,7 +27,7 @@ class DiscordConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
     allow_guilds: list[str] = Field(default_factory=list)  # Allowed guild IDs (servers)
     allow_channels: list[str] = Field(default_factory=list)  # Allowed channel IDs
-    require_mention_in_guilds: bool = True  # Only respond in guilds when mentioned/replied
+    require_mention_in_guilds: bool = False  # Only respond in guilds when mentioned/replied
     max_attachment_mb: int = 20  # Max attachment size to download
     typing_indicator: bool = True  # Show "typing" while processing
 
@@ -43,9 +43,14 @@ class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.kyber/workspace"
     provider: str = "openrouter"  # Which provider to use (references a key in providers or custom name)
+    chat_provider: str = ""  # Provider for conversational replies (empty = use default provider)
+    task_provider: str = ""  # Provider for background workers/tasks (empty = use default provider)
     max_tokens: int = 8192
     temperature: float = 0.7
-    max_tool_iterations: int = 20
+    timezone: str = ""  # User timezone (e.g. "America/New_York"). Empty = system local time.
+    # Background outbound messages (progress pings + completion notifications).
+    # If false, tasks still run, but users only see updates when they ask for status.
+    background_progress_updates: bool = True
 
 
 class AgentsConfig(BaseModel):
@@ -57,7 +62,9 @@ class ProviderConfig(BaseModel):
     """LLM provider configuration."""
     api_key: str = ""
     api_base: str | None = None
-    model: str = ""  # Selected model for this provider
+    model: str = ""  # Selected model for this provider (legacy / fallback)
+    chat_model: str = ""  # Model used for conversational replies
+    task_model: str = ""  # Model used for background workers/tasks
 
 
 class CustomProviderConfig(BaseModel):
@@ -65,7 +72,9 @@ class CustomProviderConfig(BaseModel):
     name: str = ""
     api_base: str = ""
     api_key: str = ""
-    model: str = ""  # Selected model for this provider
+    model: str = ""  # Selected model for this provider (legacy / fallback)
+    chat_model: str = ""  # Model used for conversational replies
+    task_model: str = ""  # Model used for background workers/tasks
 
 
 class ProvidersConfig(BaseModel):
@@ -131,8 +140,9 @@ class Config(BaseSettings):
     
     @property
     def workspace_path(self) -> Path:
-        """Get expanded workspace path."""
-        return Path(self.agents.defaults.workspace).expanduser()
+        """Get expanded workspace path (ensured to exist)."""
+        from kyber.utils.helpers import ensure_dir
+        return ensure_dir(Path(self.agents.defaults.workspace).expanduser())
 
     def _preferred_provider(self) -> str | None:
         """Return the explicitly configured provider, if any."""
@@ -223,6 +233,118 @@ class Config(BaseSettings):
         if not preferred:
             return False
         return self._find_custom_provider(preferred) is not None
+
+    # ── Role-based provider/model resolution ──
+
+    def _resolve_provider_details(self, provider_name: str) -> dict:
+        """Resolve api_key, api_base, is_custom, and provider_name for a given provider."""
+        name = provider_name.strip().lower()
+        if not name:
+            return {}
+        # Check custom providers
+        cp = self._find_custom_provider(name)
+        if cp:
+            return {
+                "provider_name": name,
+                "api_key": cp.api_key or None,
+                "api_base": cp.api_base or None,
+                "is_custom": True,
+            }
+        # Check built-in
+        prov = getattr(self.providers, name, None)
+        if prov and isinstance(prov, ProviderConfig):
+            api_base = prov.api_base
+            if name == "openrouter":
+                api_base = api_base or "https://openrouter.ai/api/v1"
+            return {
+                "provider_name": name,
+                "api_key": prov.api_key or None,
+                "api_base": api_base,
+                "is_custom": False,
+            }
+        return {}
+
+    def _get_model_for_role(self, provider_name: str, role: str) -> str:
+        """Get the model for a specific role (chat or task) from a provider.
+
+        Falls back: role-specific model → legacy ``model`` field → empty string.
+        """
+        name = provider_name.strip().lower()
+        if not name:
+            return ""
+        cp = self._find_custom_provider(name)
+        if cp:
+            if role == "chat":
+                return cp.chat_model or cp.model or ""
+            return cp.task_model or cp.model or ""
+        prov = getattr(self.providers, name, None)
+        if prov and isinstance(prov, ProviderConfig):
+            if role == "chat":
+                return prov.chat_model or prov.model or ""
+            return prov.task_model or prov.model or ""
+        return ""
+
+    def get_chat_provider_name(self) -> str | None:
+        """Return the provider name to use for chat (conversational) responses."""
+        explicit = (self.agents.defaults.chat_provider or "").strip().lower()
+        return explicit or self.get_provider_name()
+
+    def get_task_provider_name(self) -> str | None:
+        """Return the provider name to use for background tasks/workers."""
+        explicit = (self.agents.defaults.task_provider or "").strip().lower()
+        return explicit or self.get_provider_name()
+
+    def get_chat_model(self) -> str:
+        """Get the model to use for chat responses."""
+        prov = self.get_chat_provider_name()
+        if prov:
+            m = self._get_model_for_role(prov, "chat")
+            if m:
+                return m
+        return self.get_model()
+
+    def get_task_model(self) -> str:
+        """Get the model to use for background tasks/workers."""
+        prov = self.get_task_provider_name()
+        if prov:
+            m = self._get_model_for_role(prov, "task")
+            if m:
+                return m
+        return self.get_model()
+
+    def get_chat_provider_details(self) -> dict:
+        """Get full provider details (api_key, api_base, etc.) for chat."""
+        prov = self.get_chat_provider_name()
+        if prov:
+            details = self._resolve_provider_details(prov)
+            if details:
+                details["model"] = self.get_chat_model()
+                return details
+        # Fallback to default
+        return {
+            "provider_name": self.get_provider_name(),
+            "api_key": self.get_api_key(),
+            "api_base": self.get_api_base(),
+            "is_custom": self.is_custom_provider(),
+            "model": self.get_model(),
+        }
+
+    def get_task_provider_details(self) -> dict:
+        """Get full provider details (api_key, api_base, etc.) for tasks."""
+        prov = self.get_task_provider_name()
+        if prov:
+            details = self._resolve_provider_details(prov)
+            if details:
+                details["model"] = self.get_task_model()
+                return details
+        # Fallback to default
+        return {
+            "provider_name": self.get_provider_name(),
+            "api_key": self.get_api_key(),
+            "api_base": self.get_api_base(),
+            "is_custom": self.is_custom_provider(),
+            "model": self.get_model(),
+        }
 
     class Config:
         env_prefix = "KYBER_"

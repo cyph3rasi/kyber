@@ -70,6 +70,7 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
+        tool_choice: Any | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> LLMResponse:
@@ -97,20 +98,48 @@ class LiteLLMProvider(LLMProvider):
             if self.is_openrouter and not model.startswith("openrouter/"):
                 model = f"openrouter/{model}"
             
+            # For DeepSeek, ensure deepseek/ prefix.
+            if (
+                self.provider_name == "deepseek"
+                and not model.startswith("deepseek/")
+                and not model.startswith("openrouter/")
+            ):
+                model = f"deepseek/{model}"
+
+            # For Groq, ensure groq/ prefix.
+            if (
+                self.provider_name == "groq"
+                and not model.startswith("groq/")
+                and not model.startswith("openrouter/")
+            ):
+                model = f"groq/{model}"
+
+            # For Anthropic, ensure anthropic/ prefix.
+            if (
+                self.provider_name == "anthropic"
+                and not model.startswith("anthropic/")
+                and not model.startswith("openrouter/")
+            ):
+                model = f"anthropic/{model}"
+
             # For Gemini, ensure gemini/ prefix if not already present.
             # Skip if routing via OpenRouter (openrouter/...) since that provider handles it.
             if (
-                "gemini" in model.lower()
+                (self.provider_name == "gemini" or "gemini" in model.lower())
                 and not model.startswith("gemini/")
                 and not model.startswith("openrouter/")
             ):
                 model = f"gemini/{model}"
         
+        # Sanitize messages for provider compatibility
+        sanitized_messages = self._sanitize_messages(messages)
+        
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": sanitized_messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "timeout": 120,  # seconds — generous enough for reasoning models; callers add their own tighter timeouts
         }
         
         # Pass api_base directly for custom endpoints
@@ -119,7 +148,7 @@ class LiteLLMProvider(LLMProvider):
         
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = tool_choice or "auto"
         
         last_error: Exception | None = None
         for attempt in range(3):
@@ -153,7 +182,17 @@ class LiteLLMProvider(LLMProvider):
                     import asyncio
                     await asyncio.sleep(wait)
                     continue
-                # Non-transient or final attempt — return error as content
+                # Non-transient or final attempt — log debug info and return error
+                sys_msg = next((m for m in sanitized_messages if m.get("role") == "system"), None)
+                sys_len = len(sys_msg["content"]) if sys_msg and sys_msg.get("content") else 0
+                roles = [m.get("role", "?") for m in sanitized_messages]
+                logger.error(
+                    f"LLM request failed (non-transient) | model={model} | "
+                    f"messages={len(sanitized_messages)} | roles={roles} | "
+                    f"system_prompt_chars={sys_len} | "
+                    f"tools={len(tools) if tools else 0} | "
+                    f"error={error_str}"
+                )
                 return LLMResponse(
                     content=f"Error calling LLM: {error_str}",
                     finish_reason="error",
@@ -163,6 +202,54 @@ class LiteLLMProvider(LLMProvider):
             content=f"Error calling LLM: {str(last_error)}",
             finish_reason="error",
         )
+
+    def _normalize_content(self, content: Any) -> str | None:
+        """
+        Normalize provider message.content into a string.
+
+        Some providers/models return content as:
+        - None (tool-calls-only turns)
+        - [] (empty content blocks)
+        - list of blocks (e.g., Anthropic-style [{"type":"text","text":"..."}])
+        - dict blocks
+        """
+        if content is None:
+            return None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if item is None:
+                    continue
+                if isinstance(item, str):
+                    if item.strip():
+                        parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    # Common block shapes: {"type":"text","text":"..."} or {"text":"..."}
+                    txt = item.get("text") or item.get("content")
+                    if isinstance(txt, str) and txt.strip():
+                        parts.append(txt)
+                        continue
+                    # If there are nested structures, fall back to a compact str().
+                    s = str(item).strip()
+                    if s:
+                        parts.append(s)
+                    continue
+                s = str(item).strip()
+                if s:
+                    parts.append(s)
+            out = "\n".join(parts).strip()
+            return out or None
+        if isinstance(content, dict):
+            txt = content.get("text") or content.get("content")
+            if isinstance(txt, str):
+                return txt
+            s = str(content).strip()
+            return s or None
+        s = str(content).strip()
+        return s or None
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
@@ -204,12 +291,65 @@ class LiteLLMProvider(LLMProvider):
                 "total_tokens": response.usage.total_tokens,
             }
         
+        content = self._normalize_content(getattr(message, "content", None))
+        # Some wrappers expose "text" instead of "content".
+        if not content:
+            content = self._normalize_content(getattr(message, "text", None))
+
         return LLMResponse(
-            content=message.content,
+            content=content,
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
         )
+    
+    def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Sanitize messages for provider compatibility.
+        
+        Some providers (e.g., DeepSeek, certain OpenAI-compatible endpoints) 
+        reject messages with certain fields or structures. This method ensures
+        all messages conform to a compatible format.
+        """
+        sanitized = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            tool_calls = msg.get("tool_calls")
+            
+            # Skip messages without a role
+            if not role:
+                logger.debug("Skipping message without role")
+                continue
+            
+            # Skip empty messages (no content and no tool_calls)
+            if not content and not tool_calls and role != "tool":
+                logger.debug(f"Skipping empty {role} message")
+                continue
+            
+            clean = {"role": role}
+            
+            if role == "tool":
+                # Tool result messages - must have tool_call_id
+                if not msg.get("tool_call_id"):
+                    logger.debug("Skipping tool message without tool_call_id")
+                    continue
+                clean["tool_call_id"] = msg["tool_call_id"]
+                clean["content"] = content or ""
+                # Note: Some providers don't support 'name' field on tool messages
+                # We include it if present since most do support it
+                if msg.get("name"):
+                    clean["name"] = msg["name"]
+            elif role == "assistant" and tool_calls:
+                # Assistant message with tool calls
+                clean["content"] = content or ""
+                clean["tool_calls"] = tool_calls
+            else:
+                # Regular message (system, user, or assistant without tool_calls)
+                clean["content"] = content or ""
+            
+            sanitized.append(clean)
+        
+        return sanitized
     
     def get_default_model(self) -> str:
         """Get the default model."""

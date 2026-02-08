@@ -16,7 +16,7 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
+def _compute_next_run(schedule: CronSchedule, now_ms: int, tz_name: str | None = None) -> int | None:
     """Compute next run time in ms."""
     if schedule.kind == "at":
         return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
@@ -30,8 +30,26 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     if schedule.kind == "cron" and schedule.expr:
         try:
             from croniter import croniter
-            cron = croniter(schedule.expr, time.time())
-            next_time = cron.get_next()
+            from datetime import datetime, timezone
+
+            # Use per-job tz, then global user tz, then system local time
+            effective_tz = schedule.tz or tz_name
+            if effective_tz:
+                try:
+                    import zoneinfo
+                    tz = zoneinfo.ZoneInfo(effective_tz)
+                except Exception:
+                    tz = None
+            else:
+                tz = None
+
+            if tz:
+                now_dt = datetime.now(tz)
+            else:
+                now_dt = datetime.now()
+
+            cron = croniter(schedule.expr, now_dt)
+            next_time = cron.get_next(float)
             return int(next_time * 1000)
         except Exception:
             return None
@@ -45,10 +63,12 @@ class CronService:
     def __init__(
         self,
         store_path: Path,
-        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None
+        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
+        timezone: str | None = None,
     ):
         self.store_path = store_path
         self.on_job = on_job  # Callback to execute job, returns response text
+        self.timezone = timezone  # Global user timezone for cron expressions
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
@@ -167,7 +187,7 @@ class CronService:
         now = _now_ms()
         for job in self._store.jobs:
             if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+                job.state.next_run_at_ms = _compute_next_run(job.schedule, now, self.timezone)
     
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -244,7 +264,7 @@ class CronService:
                 job.state.next_run_at_ms = None
         else:
             # Compute next run
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms(), self.timezone)
     
     # ========== Public API ==========
     
@@ -280,7 +300,7 @@ class CronService:
                 channel=channel,
                 to=to,
             ),
-            state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
+            state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now, self.timezone)),
             created_at_ms=now,
             updated_at_ms=now,
             delete_after_run=delete_after_run,
@@ -315,7 +335,7 @@ class CronService:
                 job.enabled = enabled
                 job.updated_at_ms = _now_ms()
                 if enabled:
-                    job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+                    job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms(), self.timezone)
                 else:
                     job.state.next_run_at_ms = None
                 self._save_store()
