@@ -1,6 +1,7 @@
 """CLI commands for kyber."""
 
 import asyncio
+import platform
 from pathlib import Path
 
 import typer
@@ -969,6 +970,321 @@ def status():
                 name = cp.name or "unnamed"
                 has = bool(cp.api_key)
                 console.print(f"{name} (custom): {'[green]✓[/green]' if has else '[dim]not set[/dim]'}")
+
+
+# ============================================================================
+# Restart Commands
+# ============================================================================
+
+restart_app = typer.Typer(help="Restart kyber services")
+app.add_typer(restart_app, name="restart")
+
+
+@restart_app.command("gateway")
+def restart_gateway():
+    """Restart the kyber gateway service."""
+    from kyber.dashboard.server import _restart_gateway_service
+
+    console.print(f"{__logo__} Restarting gateway...")
+    ok, msg = _restart_gateway_service()
+    if ok:
+        console.print(f"[green]✓[/green] {msg}")
+    else:
+        console.print(f"[red]✗[/red] {msg}")
+        raise typer.Exit(1)
+
+
+@restart_app.command("dashboard")
+def restart_dashboard():
+    """Restart the kyber dashboard service."""
+    from kyber.dashboard.server import _restart_dashboard_service
+
+    console.print(f"{__logo__} Restarting dashboard...")
+    ok, msg = _restart_dashboard_service()
+    if ok:
+        console.print(f"[green]✓[/green] {msg}")
+    else:
+        console.print(f"[red]✗[/red] {msg}")
+        raise typer.Exit(1)
+
+
+# ============================================================================
+# ClamAV Setup
+# ============================================================================
+
+
+@app.command("setup-clamav")
+def setup_clamav():
+    """Install and configure ClamAV for malware scanning."""
+    import shutil
+    import subprocess as sp
+
+    system = platform.system()
+
+    # Check if already installed
+    if shutil.which("clamscan"):
+        console.print(f"[green]✓[/green] ClamAV is already installed: {shutil.which('clamscan')}")
+
+        # Verify freshclam config is valid (fix if needed)
+        _ensure_freshclam_config(system)
+
+        # Offer to update signatures
+        if typer.confirm("Update virus signature database now?", default=True):
+            _run_freshclam()
+        return
+
+    console.print(f"{__logo__} Setting up ClamAV malware scanner...\n")
+
+    if system == "Darwin":
+        if not shutil.which("brew"):
+            console.print("[red]✗[/red] Homebrew not found. Install it from https://brew.sh then re-run this command.")
+            raise typer.Exit(1)
+
+        console.print("[cyan]Installing ClamAV via Homebrew...[/cyan]")
+        result = sp.run(["brew", "install", "clamav"], capture_output=True, text=True)
+        if result.returncode != 0:
+            console.print(f"[red]✗[/red] brew install failed:\n{result.stderr}")
+            raise typer.Exit(1)
+        console.print("[green]✓[/green] ClamAV installed")
+
+        # Configure freshclam
+        prefix_result = sp.run(["brew", "--prefix"], capture_output=True, text=True)
+        brew_prefix = prefix_result.stdout.strip() or "/usr/local"
+        conf_dir = Path(brew_prefix) / "etc" / "clamav"
+        db_dir = Path(brew_prefix) / "share" / "clamav"
+        sample = conf_dir / "freshclam.conf.sample"
+        conf = conf_dir / "freshclam.conf"
+
+        console.print("[cyan]Configuring freshclam...[/cyan]")
+
+        # Ensure the database directory exists
+        db_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build config: start from sample (or existing broken conf), then
+        # - comment out the "Example" directive (required)
+        # - ensure DatabaseDirectory points to the Homebrew share path
+        source = conf if conf.exists() else sample
+        if not source.exists():
+            console.print(f"[red]✗[/red] Neither {sample} nor {conf} found — ClamAV may not have installed correctly.")
+            raise typer.Exit(1)
+
+        lines = source.read_text().splitlines()
+        db_dir_set = False
+        new_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped == "Example":
+                new_lines.append("# Example")
+                continue
+            # Replace any existing DatabaseDirectory with the correct path
+            if stripped.startswith("DatabaseDirectory") and not stripped.startswith("#"):
+                new_lines.append(f"DatabaseDirectory {db_dir}")
+                db_dir_set = True
+                continue
+            # Uncomment a commented-out DatabaseDirectory and set it
+            if stripped.startswith("#") and "DatabaseDirectory" in stripped and not db_dir_set:
+                new_lines.append(f"DatabaseDirectory {db_dir}")
+                db_dir_set = True
+                continue
+            new_lines.append(line)
+
+        # If DatabaseDirectory was never in the file, add it
+        if not db_dir_set:
+            new_lines.append(f"DatabaseDirectory {db_dir}")
+
+        conf.write_text("\n".join(new_lines) + "\n")
+        console.print(f"[green]✓[/green] Configured {conf}")
+        console.print(f"[green]✓[/green] Database directory: {db_dir}")
+
+    elif system == "Linux":
+        # Detect package manager
+        if shutil.which("apt"):
+            console.print("[cyan]Installing ClamAV via apt...[/cyan]")
+            result = sp.run(["sudo", "apt", "install", "-y", "clamav"], capture_output=True, text=True)
+        elif shutil.which("dnf"):
+            console.print("[cyan]Installing ClamAV via dnf...[/cyan]")
+            result = sp.run(["sudo", "dnf", "install", "-y", "clamav", "clamav-update"], capture_output=True, text=True)
+        elif shutil.which("zypper"):
+            console.print("[cyan]Installing ClamAV via zypper...[/cyan]")
+            result = sp.run(["sudo", "zypper", "install", "-y", "clamav"], capture_output=True, text=True)
+        elif shutil.which("pacman"):
+            console.print("[cyan]Installing ClamAV via pacman...[/cyan]")
+            result = sp.run(["sudo", "pacman", "-S", "--noconfirm", "clamav"], capture_output=True, text=True)
+        else:
+            console.print("[red]✗[/red] No supported package manager found (apt, dnf, zypper, pacman).")
+            console.print("Install ClamAV manually: https://docs.clamav.net/manual/Installing/Packages.html")
+            raise typer.Exit(1)
+
+        if result.returncode != 0:
+            console.print(f"[red]✗[/red] Install failed:\n{result.stderr}")
+            raise typer.Exit(1)
+        console.print("[green]✓[/green] ClamAV installed")
+
+        # Linux packages usually come pre-configured, but verify the
+        # freshclam config has the Example line commented out.
+        for conf_path in [Path("/etc/clamav/freshclam.conf"), Path("/etc/freshclam.conf")]:
+            if conf_path.exists():
+                lines = conf_path.read_text().splitlines()
+                if any(line.strip() == "Example" for line in lines):
+                    console.print(f"[cyan]Fixing {conf_path}...[/cyan]")
+                    fixed = [("# Example" if line.strip() == "Example" else line) for line in lines]
+                    sp.run(
+                        ["sudo", "tee", str(conf_path)],
+                        input="\n".join(fixed) + "\n",
+                        capture_output=True, text=True,
+                    )
+                    console.print(f"[green]✓[/green] Configured {conf_path}")
+                break
+
+    else:
+        console.print(f"[red]✗[/red] Unsupported platform: {system}")
+        console.print("Install ClamAV manually: https://docs.clamav.net/manual/Installing/Packages.html")
+        raise typer.Exit(1)
+
+    # Update virus signatures
+    _run_freshclam()
+
+    console.print(f"\n{__logo__} ClamAV is ready! The security scan will now include malware detection.")
+
+
+def _ensure_freshclam_config(system: str):
+    """Ensure freshclam.conf is properly configured for the platform."""
+    import shutil
+    import subprocess as sp
+
+    if system == "Darwin":
+        prefix_result = sp.run(["brew", "--prefix"], capture_output=True, text=True)
+        brew_prefix = prefix_result.stdout.strip() or "/usr/local"
+        conf = Path(brew_prefix) / "etc" / "clamav" / "freshclam.conf"
+        sample = Path(brew_prefix) / "etc" / "clamav" / "freshclam.conf.sample"
+        db_dir = Path(brew_prefix) / "share" / "clamav"
+
+        source = conf if conf.exists() else sample
+        if not source.exists():
+            return  # Nothing to fix
+
+        db_dir.mkdir(parents=True, exist_ok=True)
+
+        lines = source.read_text().splitlines()
+        needs_fix = any(line.strip() == "Example" for line in lines)
+        has_correct_db = any(
+            line.strip() == f"DatabaseDirectory {db_dir}"
+            for line in lines
+            if not line.strip().startswith("#")
+        )
+
+        if not needs_fix and has_correct_db:
+            return
+
+        console.print("[cyan]Fixing freshclam config...[/cyan]")
+        db_dir_set = False
+        new_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped == "Example":
+                new_lines.append("# Example")
+                continue
+            if stripped.startswith("DatabaseDirectory") and not stripped.startswith("#"):
+                new_lines.append(f"DatabaseDirectory {db_dir}")
+                db_dir_set = True
+                continue
+            if stripped.startswith("#") and "DatabaseDirectory" in stripped and not db_dir_set:
+                new_lines.append(f"DatabaseDirectory {db_dir}")
+                db_dir_set = True
+                continue
+            new_lines.append(line)
+        if not db_dir_set:
+            new_lines.append(f"DatabaseDirectory {db_dir}")
+        conf.write_text("\n".join(new_lines) + "\n")
+        console.print(f"[green]✓[/green] Fixed {conf}")
+
+    elif system == "Linux":
+        for conf_path in [Path("/etc/clamav/freshclam.conf"), Path("/etc/freshclam.conf")]:
+            if conf_path.exists():
+                lines = conf_path.read_text().splitlines()
+                if any(line.strip() == "Example" for line in lines):
+                    console.print(f"[cyan]Fixing {conf_path}...[/cyan]")
+                    fixed = [("# Example" if line.strip() == "Example" else line) for line in lines]
+                    sp.run(
+                        ["sudo", "tee", str(conf_path)],
+                        input="\n".join(fixed) + "\n",
+                        capture_output=True, text=True,
+                    )
+                    console.print(f"[green]✓[/green] Fixed {conf_path}")
+                break
+
+
+def _run_freshclam():
+    """Run freshclam to update virus signature database."""
+    import shutil
+    import subprocess as sp
+
+    freshclam = shutil.which("freshclam")
+    if not freshclam:
+        console.print("[yellow]⚠  freshclam not found — virus signatures not updated[/yellow]")
+        return
+
+    console.print("[cyan]Updating virus signature database (this may take a minute)...[/cyan]")
+    # Run freshclam with output visible so the user can see download progress.
+    # Try without sudo first (works on macOS / user installs).
+    result = sp.run([freshclam, "--stdout"], capture_output=True, text=True, timeout=300)
+    if result.returncode != 0 and "Can't create" in (result.stderr or ""):
+        # Permission issue — retry with sudo on Linux
+        result = sp.run(["sudo", freshclam, "--stdout"], capture_output=True, text=True, timeout=300)
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    output = stdout or stderr
+
+    if result.returncode == 0:
+        # Show what freshclam actually did
+        if "up to date" in output.lower():
+            console.print("[green]✓[/green] Virus signatures already up to date")
+        else:
+            console.print("[green]✓[/green] Virus signatures updated")
+        # Print summary lines (download info, signature counts)
+        for line in output.splitlines():
+            line = line.strip()
+            if any(kw in line.lower() for kw in ["downloading", "updated", "signatures", "main.c", "daily.c", "bytecode.c"]):
+                console.print(f"  [dim]{line}[/dim]")
+    else:
+        console.print(f"[yellow]⚠  freshclam returned warnings:[/yellow]\n{output[:500]}")
+
+    # Verify databases actually exist
+    db_paths = _find_clamav_db_dir()
+    if db_paths:
+        db_files = [f.name for f in db_paths.iterdir() if f.suffix in (".cvd", ".cld")]
+        if db_files:
+            console.print(f"  [dim]Database files: {', '.join(sorted(db_files))}[/dim]")
+        else:
+            console.print("[yellow]⚠  No signature database files found — scans will not work[/yellow]")
+            console.print(f"  Checked: {db_paths}")
+    else:
+        console.print("[yellow]⚠  Could not locate ClamAV database directory[/yellow]")
+
+
+def _find_clamav_db_dir() -> Path | None:
+    """Locate the ClamAV signature database directory."""
+    import subprocess as sp
+
+    system = platform.system()
+    candidates: list[Path] = []
+
+    if system == "Darwin":
+        prefix_result = sp.run(["brew", "--prefix"], capture_output=True, text=True)
+        brew_prefix = prefix_result.stdout.strip() or "/usr/local"
+        candidates.append(Path(brew_prefix) / "share" / "clamav")
+
+    candidates.extend([
+        Path("/var/lib/clamav"),
+        Path("/usr/local/share/clamav"),
+        Path("/opt/homebrew/share/clamav"),
+    ])
+
+    for p in candidates:
+        if p.is_dir():
+            return p
+    return None
 
 
 if __name__ == "__main__":

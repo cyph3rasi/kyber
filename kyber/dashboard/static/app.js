@@ -982,8 +982,11 @@ function fmtWhen(iso) {
 
 async function fetchTasks() {
   const res = await apiFetch(`${API}/tasks`);
-  const data = await res.json();
-  return data;
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Tasks request failed (${res.status})`);
+  }
+  return await res.json();
 }
 
 function renderTasks() {
@@ -2249,13 +2252,22 @@ function categoryLabel(cat) {
     docker: 'Docker & Containers',
     git: 'Git Security',
     kyber: 'Kyber Config',
+    malware: 'Malware Scan',
   };
   return labels[cat] || cat;
 }
 
+// ── Security scan state (hoisted outside renderSecurity so it persists across tab switches) ──
+let _secPollTimer = null;
+let _secScanRunning = false;
+let _secScanTriggeredAt = 0;
+let _secNeedsRefresh = false;  // set when scan finishes while on another tab
+
+function _secStopPolling() {
+  if (_secPollTimer) { clearInterval(_secPollTimer); _secPollTimer = null; }
+}
+
 function renderSecurity() {
-  let securityPollTimer = null;
-  let scanIsRunning = false;
 
   // Top controls
   const topRow = document.createElement('div');
@@ -2276,9 +2288,9 @@ function renderSecurity() {
   topRow.appendChild(leftControls);
   contentBody.appendChild(topRow);
 
-  // In-progress banner (hidden by default)
+  // In-progress banner (hidden by default, shown if scan is active)
   const progressBanner = document.createElement('div');
-  progressBanner.className = 'security-progress hidden';
+  progressBanner.className = _secScanRunning ? 'security-progress' : 'security-progress hidden';
   progressBanner.innerHTML = `
     <div class="security-progress-inner">
       <div class="security-progress-spinner"></div>
@@ -2291,6 +2303,13 @@ function renderSecurity() {
   `;
   contentBody.appendChild(progressBanner);
 
+  // If a scan is already running, restore button state
+  if (_secScanRunning) {
+    scanBtn.disabled = true;
+    scanBtn.textContent = '⏳ Scan Running…';
+    scanBtn.classList.add('btn-disabled');
+  }
+
   // Main container
   const container = document.createElement('div');
   container.id = 'securityContainer';
@@ -2298,7 +2317,6 @@ function renderSecurity() {
 
   // ── Scan status detection ──
 
-  let scanTriggeredAt = 0; // timestamp when scan was triggered
   const SCAN_GRACE_MS = 90000; // 90s grace before hiding banner if no task found
 
   function _isScanTask(t) {
@@ -2306,9 +2324,16 @@ function renderSecurity() {
     return desc.includes('security scan') || desc.includes('security-scan') || desc.includes('security audit');
   }
 
+  let _checkingStatus = false; // guard against overlapping polls
+
   async function checkScanStatus() {
+    if (_checkingStatus) return _secScanRunning;
+    _checkingStatus = true;
     try {
       const res = await apiFetch(`${API}/tasks`);
+      if (!res.ok) {
+        return _secScanRunning;
+      }
       const data = await res.json();
       const active = (data.active || []).filter(_isScanTask);
       if (active.length > 0) {
@@ -2316,15 +2341,15 @@ function renderSecurity() {
         showScanRunning(task);
         return true;
       }
-    } catch (_) { /* ignore */ }
+    } catch (_) {
+      return _secScanRunning;
+    } finally {
+      _checkingStatus = false;
+    }
 
-    // No active scan task found — but if we just triggered one, the
-    // orchestrator may still be processing (LLM thinking before spawning).
-    // Don't hide the banner until the grace period expires.
-    if (scanIsRunning) {
-      const elapsed = Date.now() - scanTriggeredAt;
-      if (scanTriggeredAt && elapsed < SCAN_GRACE_MS) {
-        // Still within grace period — update the detail text
+    if (_secScanRunning) {
+      const elapsed = Date.now() - _secScanTriggeredAt;
+      if (_secScanTriggeredAt && elapsed < SCAN_GRACE_MS) {
         const detail = document.getElementById('secScanDetail');
         if (detail) detail.textContent = 'Waiting for agent to start scan…';
         const elapsedEl = document.getElementById('secScanElapsed');
@@ -2332,17 +2357,33 @@ function renderSecurity() {
           const s = Math.floor(elapsed / 1000);
           elapsedEl.textContent = `${s}s`;
         }
-        return true; // keep polling, don't hide
+        return true;
       }
       hideScanRunning();
-      // Scan finished (or grace expired) — auto-refresh reports
-      doRender({});
+      _secStopPolling();
+      // Auto-refresh reports — only if security tab is active (DOM is live).
+      if (activeSection === 'security') {
+        try {
+          const data = await fetchSecurityReports();
+          renderReport(data);
+          if (data && data.latest) {
+            showToast('Security scan complete — report updated', 'success');
+          } else {
+            showToast('Scan finished but no report was generated. The agent may have run out of steps. Try running again.', 'error');
+          }
+        } catch (_) {
+          showToast('Scan finished but failed to load results', 'error');
+        }
+      } else {
+        _secNeedsRefresh = true;
+        showToast('Security scan complete — switch to Security Center to view results', 'success');
+      }
     }
     return false;
   }
 
   function showScanRunning(task) {
-    scanIsRunning = true;
+    _secScanRunning = true;
     scanBtn.disabled = true;
     scanBtn.textContent = '⏳ Scan Running…';
     scanBtn.classList.add('btn-disabled');
@@ -2364,7 +2405,8 @@ function renderSecurity() {
   }
 
   function hideScanRunning() {
-    scanIsRunning = false;
+    _secScanRunning = false;
+    _secScanTriggeredAt = 0;
     scanBtn.disabled = false;
     scanBtn.textContent = '🛡️ Run Scan Now';
     scanBtn.classList.remove('btn-disabled');
@@ -2372,27 +2414,9 @@ function renderSecurity() {
   }
 
   function startPolling() {
-    if (securityPollTimer) return;
-    securityPollTimer = setInterval(() => checkScanStatus(), 3000);
+    if (_secPollTimer) return;
+    _secPollTimer = setInterval(() => checkScanStatus(), 3000);
   }
-
-  function stopPolling() {
-    if (securityPollTimer) {
-      clearInterval(securityPollTimer);
-      securityPollTimer = null;
-    }
-  }
-
-  // Clean up polling when leaving the section
-  const origSwitch = switchSection;
-  const _secCleanup = () => { stopPolling(); };
-  // Patch: stop polling when navigating away
-  const navBtns = document.querySelectorAll('.nav-item[data-section]');
-  navBtns.forEach(btn => {
-    btn.addEventListener('click', () => {
-      if (btn.dataset.section !== 'security') _secCleanup();
-    });
-  });
 
   function renderEmpty() {
     container.innerHTML = `
@@ -2487,14 +2511,142 @@ function renderSecurity() {
     catCard.appendChild(catBody);
     container.appendChild(catCard);
 
-    // Findings list
-    if (findings.length > 0) {
+    // Malware Scan card (dedicated, between categories and findings)
+    const malCat = categories.malware;
+    const malFindings = findings.filter(f => f.category === 'malware');
+    const malCard = document.createElement('div');
+    malCard.className = 'card';
+    malCard.style.marginTop = '16px';
+
+    const malHeader = document.createElement('div');
+    malHeader.className = 'card-header';
+    malHeader.innerHTML = '<span class="card-title">🦠 Malware Scan</span>';
+    malCard.appendChild(malHeader);
+
+    const malBody = document.createElement('div');
+    malBody.className = 'card-body';
+
+    if (!malCat) {
+      // Category not present in report at all — scan predates malware feature or agent didn't run it
+      malBody.innerHTML = `
+        <div class="malware-status malware-status-skip">
+          <div class="malware-status-icon">❓</div>
+          <div class="malware-status-info">
+            <div class="malware-status-title">Malware Scan Not Run</div>
+            <div class="malware-status-desc">
+              This scan did not include a malware check. Run a new scan to include ClamAV malware detection.
+            </div>
+            <div class="malware-status-action">
+              If ClamAV is not installed, run <code>kyber setup-clamav</code> first.
+            </div>
+          </div>
+        </div>
+      `;
+    } else if (!malCat.checked) {
+      // Category exists but was skipped — ClamAV not installed
+      const notInstalled = malFindings.find(f => f.id === 'MAL-000');
+      malBody.innerHTML = `
+        <div class="malware-status malware-status-skip">
+          <div class="malware-status-icon">⚠️</div>
+          <div class="malware-status-info">
+            <div class="malware-status-title">ClamAV Not Installed</div>
+            <div class="malware-status-desc">
+              Malware scanning is disabled. ClamAV is a free, open-source antivirus engine maintained by Cisco Talos
+              with over 3.6 million threat signatures.
+            </div>
+            <div class="malware-status-action">
+              Run <code>kyber setup-clamav</code> to install and configure ClamAV automatically.
+              Future scans will include full-system malware detection.
+            </div>
+          </div>
+        </div>
+      `;
+    } else if (malCat.status === 'skip') {
+      // Explicitly skipped (e.g. clamscan not found during scan)
+      malBody.innerHTML = `
+        <div class="malware-status malware-status-skip">
+          <div class="malware-status-icon">⚠️</div>
+          <div class="malware-status-info">
+            <div class="malware-status-title">Malware Scan Skipped</div>
+            <div class="malware-status-desc">
+              ClamAV was not available during this scan. Install it to enable malware detection.
+            </div>
+            <div class="malware-status-action">
+              Run <code>kyber setup-clamav</code> to install and configure ClamAV automatically.
+            </div>
+          </div>
+        </div>
+      `;
+    } else if (malCat.finding_count === 0 && malCat.status === 'pass') {
+      // Clean scan
+      malBody.innerHTML = `
+        <div class="malware-status malware-status-clean">
+          <div class="malware-status-icon">✅</div>
+          <div class="malware-status-info">
+            <div class="malware-status-title">No Threats Detected</div>
+            <div class="malware-status-desc">
+              ClamAV performed a full system scan and found no malware, trojans, viruses, or other threats.
+              Threat signatures were updated before scanning.
+            </div>
+          </div>
+        </div>
+      `;
+    } else {
+      // Threats found
+      const threatCount = malCat.finding_count;
+      malBody.innerHTML = `
+        <div class="malware-status malware-status-threat">
+          <div class="malware-status-icon">🚨</div>
+          <div class="malware-status-info">
+            <div class="malware-status-title">${threatCount} Threat${threatCount !== 1 ? 's' : ''} Detected</div>
+            <div class="malware-status-desc">
+              ClamAV detected potentially malicious files on your system. Review the findings below and take action immediately.
+            </div>
+          </div>
+        </div>
+      `;
+      // Show malware findings inline in this card
+      if (malFindings.length > 0) {
+        const malList = document.createElement('div');
+        malList.className = 'malware-findings';
+        for (const f of malFindings) {
+          const row = document.createElement('details');
+          row.className = 'security-finding';
+          const sum = document.createElement('summary');
+          sum.className = 'security-finding-summary';
+          sum.innerHTML = `
+            <span class="security-finding-sev" style="background:${severityColor(f.severity)}">${f.severity.toUpperCase()}</span>
+            <span class="security-finding-id">${f.id || ''}</span>
+            <span class="security-finding-title">${f.title}</span>
+            <svg class="security-finding-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          `;
+          row.appendChild(sum);
+          const body = document.createElement('div');
+          body.className = 'security-finding-body';
+          body.innerHTML = `
+            <p>${f.description || ''}</p>
+            ${f.remediation ? `<div class="security-finding-fix"><strong>Fix:</strong> ${f.remediation}</div>` : ''}
+            ${f.evidence ? `<pre class="security-finding-evidence">${f.evidence}</pre>` : ''}
+          `;
+          row.appendChild(body);
+          malList.appendChild(row);
+        }
+        malBody.appendChild(malList);
+      }
+    }
+
+    malCard.appendChild(malBody);
+    container.appendChild(malCard);
+
+    // Findings list (exclude malware findings since they're shown in the dedicated card)
+    const nonMalwareFindings = findings.filter(f => f.category !== 'malware');
+    if (nonMalwareFindings.length > 0) {
       const findCard = document.createElement('div');
       findCard.className = 'card';
       findCard.style.marginTop = '16px';
       const findHeader = document.createElement('div');
       findHeader.className = 'card-header';
-      findHeader.innerHTML = `<span class="card-title">Findings (${findings.length})</span>`;
+      findHeader.innerHTML = `<span class="card-title">Findings (${nonMalwareFindings.length})</span>`;
       findCard.appendChild(findHeader);
       const findBody = document.createElement('div');
       findBody.className = 'card-body';
@@ -2502,7 +2654,7 @@ function renderSecurity() {
 
       // Sort: critical first, then high, medium, low
       const sevOrder = { critical: 0, high: 1, medium: 2, low: 3 };
-      const sorted = [...findings].sort((a, b) => (sevOrder[a.severity] ?? 9) - (sevOrder[b.severity] ?? 9));
+      const sorted = [...nonMalwareFindings].sort((a, b) => (sevOrder[a.severity] ?? 9) - (sevOrder[b.severity] ?? 9));
 
       for (const f of sorted) {
         const row = document.createElement('details');
@@ -2584,6 +2736,7 @@ function renderSecurity() {
   }
 
   async function doRender(opts = {}) {
+    _secNeedsRefresh = false;  // clear the flag since we're rendering now
     if (opts.showLoading) container.innerHTML = '<div class="empty-state">Loading security reports…</div>';
     try {
       const data = await fetchSecurityReports();
@@ -2591,22 +2744,24 @@ function renderSecurity() {
     } catch (e) {
       container.innerHTML = '<div class="empty-state">Failed to load security reports.</div>';
     }
-    // Always check if a scan is currently running
-    const running = await checkScanStatus();
-    if (running) startPolling();
+    // Check if a scan is currently running
+    try {
+      const running = await checkScanStatus();
+      if (running) startPolling();
+      else _secStopPolling();
+    } catch (_) { /* ignore */ }
   }
 
   scanBtn.addEventListener('click', async () => {
-    if (scanIsRunning) return; // guard against double-click
+    if (_secScanRunning) return;
     scanBtn.disabled = true;
     scanBtn.textContent = '⏳ Triggering…';
     scanBtn.classList.add('btn-disabled');
     try {
       await triggerSecurityScan();
       showToast('Security scan triggered — the agent is working on it', 'success');
-      // Start polling immediately so the banner appears once the task registers
-      scanIsRunning = true;
-      scanTriggeredAt = Date.now();
+      _secScanRunning = true;
+      _secScanTriggeredAt = Date.now();
       progressBanner.classList.remove('hidden');
       document.getElementById('secScanDetail').textContent = 'Waiting for agent to start scan…';
       document.getElementById('secScanElapsed').textContent = '0s';

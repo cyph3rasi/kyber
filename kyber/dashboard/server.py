@@ -661,14 +661,7 @@ def create_dashboard_app(config: Config) -> FastAPI:
 
     @app.post("/api/security/scan", dependencies=[Depends(_require_token)])
     async def trigger_security_scan(request: Request) -> JSONResponse:
-        """Trigger an immediate security scan via the gateway agent."""
-        scan_message = (
-            "Perform a full security scan of this environment now. "
-            "Use the security-scan skill instructions. "
-            "Check all categories: network, ssh, permissions, secrets, software, "
-            "processes, firewall, docker, git, and kyber config. "
-            "Write the structured JSON report to ~/.kyber/security/reports/."
-        )
-        return await _proxy_gateway(request, "POST", "/agent/turn", json_body={"message": scan_message})
+        """Trigger an immediate security scan via the gateway's direct spawn endpoint."""
+        return await _proxy_gateway(request, "POST", "/security/scan")
 
     return app

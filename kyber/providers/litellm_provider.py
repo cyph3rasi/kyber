@@ -146,6 +146,13 @@ class LiteLLMProvider(LLMProvider):
         if self.api_base:
             kwargs["api_base"] = self.api_base
         
+        # Brand OpenRouter requests so they show as Kyber on the leaderboard
+        if self.is_openrouter:
+            kwargs["extra_headers"] = {
+                "HTTP-Referer": "https://kyber.chat",
+                "X-Title": "Kyber",
+            }
+        
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"

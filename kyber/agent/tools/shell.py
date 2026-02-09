@@ -60,11 +60,25 @@ class ExecTool(Tool):
             "required": ["command"]
         }
     
+    # Commands that need extended timeouts (e.g. virus scanners, large builds).
+    # Maps a regex pattern to a timeout in seconds (0 = no limit).
+    EXTENDED_TIMEOUT_COMMANDS: dict[str, int] = {
+        r"\bclamscan\b": 0,       # No limit — scan duration depends on disk size
+        r"\bfreshclam\b": 300,    # 5 minutes — signature download
+    }
+
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
+
+        # Check if this command needs an extended timeout
+        timeout = self.timeout
+        for pattern, ext_timeout in self.EXTENDED_TIMEOUT_COMMANDS.items():
+            if re.search(pattern, command):
+                timeout = max(timeout, ext_timeout)
+                break
         
         try:
             process = await asyncio.create_subprocess_shell(
@@ -75,13 +89,17 @@ class ExecTool(Tool):
             )
             
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout
-                )
+                if timeout > 0:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=timeout
+                    )
+                else:
+                    # No timeout — let the command run to completion
+                    stdout, stderr = await process.communicate()
             except asyncio.TimeoutError:
                 process.kill()
-                return f"Error: Command timed out after {self.timeout} seconds"
+                return f"Error: Command timed out after {timeout} seconds"
             
             output_parts = []
             

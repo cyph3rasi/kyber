@@ -974,6 +974,70 @@ body {
   color: var(--text-tertiary);
 }
 
+/* Malware Scan card */
+.malware-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 4px 0;
+}
+
+.malware-status-icon {
+  font-size: 28px;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.malware-status-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.malware-status-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.malware-status-clean .malware-status-title {
+  color: var(--green);
+}
+
+.malware-status-threat .malware-status-title {
+  color: var(--red);
+}
+
+.malware-status-skip .malware-status-title {
+  color: var(--amber);
+}
+
+.malware-status-desc {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+
+.malware-status-action {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+.malware-status-action code {
+  background: var(--bg-tertiary);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.malware-findings {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
 /* Findings */
 .security-finding {
   border-bottom: 1px solid var(--border);

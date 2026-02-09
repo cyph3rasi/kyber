@@ -730,6 +730,11 @@ class Orchestrator:
                 
                 # Send progress update to each origin
                 for origin_key, tasks in by_origin.items():
+                    # Dashboard-originated tasks don't need chat progress updates —
+                    # the dashboard polls /tasks for live status already.
+                    if origin_key == "dashboard:dashboard":
+                        continue
+
                     # Check if we should send (avoid spamming)
                     last_update = self._last_progress_update.get(origin_key)
                     if last_update:

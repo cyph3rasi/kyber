@@ -1,7 +1,7 @@
 ---
 name: security-scan
 description: "Perform comprehensive security audits of the user's environment and write structured reports for the Security Center dashboard."
-metadata: {"kyber":{"emoji":"🛡️","requires":{"bins":["curl"]},"always":false}}
+metadata: {"kyber":{"emoji":"🛡️","requires":{"bins":["curl"]},"optional_bins":["clamscan","freshclam"],"always":false}}
 ---
 
 # Security Scan
@@ -118,6 +118,76 @@ cat ~/.kyber/config.json 2>/dev/null | python3 -c "import sys,json; c=json.load(
 cat ~/.kyber/config.json 2>/dev/null | python3 -c "import sys,json; c=json.load(sys.stdin); t=c.get('dashboard',{}).get('auth_token',''); print('Dashboard token length:', len(t))" 2>/dev/null
 ```
 
+### 11. Malware Scan (ClamAV)
+
+First, check if ClamAV is installed:
+
+```bash
+which clamscan 2>/dev/null
+```
+
+**If `clamscan` is NOT found**, skip the malware scan and add this finding to the report:
+
+```json
+{
+  "id": "MAL-000",
+  "category": "malware",
+  "severity": "medium",
+  "title": "ClamAV not installed — malware scanning disabled",
+  "description": "ClamAV is a free, open-source antivirus engine that detects trojans, viruses, malware, and other threats. Without it, kyber cannot scan your system for malicious files. ClamAV is maintained by Cisco Talos and is the industry standard for open-source malware detection on Linux and macOS.",
+  "remediation": "Run `kyber setup-clamav` to automatically install and configure ClamAV for your platform. This will install the scanner, configure the signature database, and download the latest threat definitions. Once installed, future security scans will automatically include malware detection.",
+  "evidence": "clamscan binary not found in PATH"
+}
+```
+
+Set the `malware` category to `"status": "skip"` with a note that ClamAV is not installed.
+
+**If `clamscan` IS found**, proceed with the malware scan:
+
+#### Step 1: Update threat database before scanning
+
+Always update signatures before scanning to catch the latest threats:
+
+```bash
+# Try without sudo first (works on macOS), fall back to sudo on Linux
+freshclam 2>&1 || sudo freshclam 2>&1
+```
+
+If freshclam fails, note it in the report but continue with the scan using existing signatures.
+
+#### Step 2: Run full system scan
+
+Run a thorough scan of the entire home directory and common system locations:
+
+```bash
+clamscan -r --infected ~/ 2>&1
+```
+
+This recursively scans the entire home directory — all user files, downloads, projects, configs, and application data.
+
+The `--infected` flag means only infected files are printed. The exit code tells you the result:
+- Exit 0: No threats found
+- Exit 1: Threats found (infected files listed in output)
+- Exit 2: Errors occurred during scan
+
+#### Step 3: Record findings
+
+For each infected file found, create a finding:
+
+```json
+{
+  "id": "MAL-001",
+  "category": "malware",
+  "severity": "critical",
+  "title": "Malware detected: <threat_name>",
+  "description": "ClamAV detected <threat_name> in <file_path>. This file should be quarantined or removed immediately.",
+  "remediation": "Delete or quarantine the infected file. If it's a downloaded file, re-download from a trusted source. Run a full scan with `clamscan -r ~/` to check for additional infections.",
+  "evidence": "<clamscan output line>"
+}
+```
+
+If no threats are found, set the `malware` category to `"status": "pass"` with `"finding_count": 0`.
+
 ## Report Format
 
 After completing all checks, write the report as JSON to `~/.kyber/security/reports/`. The filename must be `report_<ISO_TIMESTAMP>.json`.
@@ -163,7 +233,8 @@ Then use `write_file` to write the JSON report:
     "firewall": {"checked": true, "finding_count": 1, "status": "warn"},
     "docker": {"checked": false, "finding_count": 0, "status": "skip"},
     "git": {"checked": true, "finding_count": 1, "status": "warn"},
-    "kyber": {"checked": true, "finding_count": 1, "status": "pass"}
+    "kyber": {"checked": true, "finding_count": 1, "status": "pass"},
+    "malware": {"checked": true, "finding_count": 0, "status": "pass"}
   },
   "notes": "Your environment is in decent shape overall. The main concern is Redis being exposed on all interfaces — that should be locked down immediately. A few .env files have overly permissive permissions. Consider running `chmod 600` on any files containing API keys or secrets. Your SSH config looks solid, but you have one authorized_keys entry I don't recognize — worth double-checking. Firewall is enabled which is great. No suspicious processes detected."
 }
@@ -173,7 +244,7 @@ Then use `write_file` to write the JSON report:
 
 **severity**: `critical` | `high` | `medium` | `low`
 
-**category**: `network` | `ssh` | `permissions` | `secrets` | `software` | `processes` | `firewall` | `docker` | `git` | `kyber`
+**category**: `network` | `ssh` | `permissions` | `secrets` | `software` | `processes` | `firewall` | `docker` | `git` | `kyber` | `malware`
 
 **category status**: `pass` (no issues) | `warn` (minor issues) | `fail` (critical/high issues) | `skip` (not applicable)
 

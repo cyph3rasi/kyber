@@ -19,6 +19,7 @@ One install command, pick your provider, and you're chatting. No bloat, no confi
 - Built-in tools — web search, shell commands, GitHub, file I/O, and an extensible skills system
 - Runs on anything — your laptop, a VPS, a Raspberry Pi. Optional system service keeps it always on
 - Secure by default — API keys stored in a locked-down `.env` file, never in plaintext JSON
+- Built-in Security Center — environment scanning, vulnerability detection, and malware scanning via ClamAV
 - Secure local dashboard for config and monitoring
 - Scheduled tasks and heartbeat for proactive check-ins
 
@@ -347,7 +348,7 @@ Skills extend the agent's capabilities through markdown instruction files. They 
 | `summarize` | Summarize URLs, files, and YouTube videos |
 | `tmux` | Remote-control tmux sessions |
 | `skill-creator` | Create new skills |
-| `security-scan` | Environment security scanning |
+| `security-scan` | Environment security scanning and malware detection |
 
 Skills are loaded progressively — always-on skills are included in every prompt, while others are loaded on demand when the agent reads their `SKILL.md` file.
 
@@ -397,6 +398,9 @@ Jobs can optionally deliver their output to a chat channel with `--deliver --to 
 | `kyber cron list` | List scheduled jobs |
 | `kyber cron add` | Add a scheduled job |
 | `kyber cron remove <id>` | Remove a scheduled job |
+| `kyber restart gateway` | Restart the gateway service |
+| `kyber restart dashboard` | Restart the dashboard service |
+| `kyber setup-clamav` | Install and configure ClamAV for malware scanning |
 | `kyber --version` | Show version |
 
 ---
@@ -417,6 +421,16 @@ Kyber separates secrets from configuration by design:
 - The dashboard is local-only by default with bearer token auth
 - Use `allowFrom` on all channels to restrict who can interact with the bot
 - Shell execution can be sandboxed with `restrictToWorkspace`
+
+**Security Center:** Kyber includes a built-in Security Center that scans your environment for vulnerabilities across 11 categories — network exposure, SSH config, file permissions, secrets, outdated software, suspicious processes, firewall, Docker, git, kyber config, and malware. Run a scan from the dashboard or ask the agent directly.
+
+**Malware scanning:** Install ClamAV for full-system malware detection:
+
+```bash
+kyber setup-clamav
+```
+
+This installs ClamAV, configures it, and downloads the latest virus signatures. The security scan automatically updates signatures before each scan and performs a full recursive scan of your system.
 
 **Migrating from older versions:** If you have API keys in `config.json`, run `kyber migrate-secrets` to move them to `.env`.
 
