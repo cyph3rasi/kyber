@@ -142,4 +142,27 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
         )
         return JSONResponse({"ok": True})
 
+    @app.post("/agent/turn", dependencies=[Depends(require)])
+    async def agent_turn(body: dict[str, Any]) -> JSONResponse:
+        """Inject a message into the agent as if from an internal source.
+
+        Used by the dashboard to trigger on-demand operations like security scans.
+        """
+        from kyber.bus.events import InboundMessage
+        from datetime import datetime
+
+        message = str(body.get("message", "")).strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="message is required")
+
+        msg = InboundMessage(
+            channel="dashboard",
+            sender_id="dashboard",
+            chat_id="dashboard",
+            content=message,
+            timestamp=datetime.now(),
+        )
+        await agent.bus.publish_inbound(msg)
+        return JSONResponse({"ok": True, "message": "Message queued for agent"})
+
     return app

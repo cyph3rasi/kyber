@@ -39,40 +39,78 @@ def main(
 # ============================================================================
 
 
-@app.command()
 def onboard():
     """Initialize kyber configuration and workspace."""
-    from kyber.config.loader import get_config_path, save_config
+    from kyber.config.loader import get_config_path, get_env_path, save_config
     from kyber.config.schema import Config
     from kyber.utils.helpers import get_workspace_path
-    
+
     config_path = get_config_path()
-    
+
     if config_path.exists():
         console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
         if not typer.confirm("Overwrite?"):
             raise typer.Exit()
-    
+
     # Create default config
     config = Config()
     save_config(config)
     console.print(f"[green]✓[/green] Created config at {config_path}")
-    
+    console.print(f"[green]✓[/green] Created secrets file at {get_env_path()} (mode 600)")
+
     # Create workspace
     workspace = get_workspace_path()
     console.print(f"[green]✓[/green] Created workspace at {workspace}")
-    
+
     # Create default bootstrap files
     _create_workspace_templates(workspace)
-    
+
     console.print(f"\n{__logo__} kyber is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.kyber/config.json[/cyan]")
+    console.print("  1. Add your API key to [cyan]~/.kyber/.env[/cyan]")
+    console.print("     Example: KYBER_PROVIDERS__OPENROUTER__API_KEY=sk-or-v1-xxx")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print("  2. Chat: [cyan]kyber agent -m \"Hello!\"[/cyan]")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/kyber#-chat-apps[/dim]")
 
 
+@app.command("migrate-secrets")
+def migrate_secrets_cmd():
+    """Migrate API keys from config.json to ~/.kyber/.env (secure storage)."""
+    from kyber.config.loader import migrate_secrets, get_config_path, get_env_path, _config_has_secrets
+
+    config_path = get_config_path()
+    if not config_path.exists():
+        console.print("[red]No config.json found. Run [cyan]kyber onboard[/cyan] first.[/red]")
+        raise typer.Exit(1)
+
+    if not _config_has_secrets(config_path):
+        console.print("[green]✓[/green] config.json is already clean — no secrets to migrate.")
+        env_path = get_env_path()
+        if env_path.exists():
+            console.print(f"  Secrets are in [cyan]{env_path}[/cyan]")
+        raise typer.Exit()
+
+    result = migrate_secrets(config_path)
+    migrated = result.get("migrated", 0)
+    console.print(f"[green]✓[/green] Migrated {migrated} secret(s) to [cyan]{get_env_path()}[/cyan]")
+    console.print(f"  config.json has been scrubbed — no more plaintext keys.")
+    console.print(f"  .env file permissions set to [cyan]600[/cyan] (owner only).")
+
+
+@app.command("show-dashboard-token")
+def show_dashboard_token():
+    """Print the dashboard auth token."""
+    from kyber.config.loader import load_config
+
+    config = load_config()
+    token = config.dashboard.auth_token.strip()
+    if not token:
+        console.print("[yellow]No dashboard token set. Start the dashboard to generate one:[/yellow]")
+        console.print("  kyber dashboard")
+        raise typer.Exit(1)
+
+    console.print(token)
 
 
 def _create_workspace_templates(workspace: Path):
@@ -163,6 +201,100 @@ This file stores important information that should persist across sessions.
 
 
 # ============================================================================
+# Shared Orchestrator Factory
+# ============================================================================
+
+
+def _create_orchestrator(
+    config,
+    bus,
+    *,
+    background_progress_updates: bool = False,
+    task_history_path: Path | None = None,
+):
+    """Create an Orchestrator with providers from config.
+
+    Shared by the ``gateway`` and ``agent`` commands so provider/model
+    resolution lives in one place.
+    """
+    from kyber.providers.litellm_provider import LiteLLMProvider
+    from kyber.agent.orchestrator import Orchestrator
+
+    # ── Chat provider ──
+    chat_details = config.get_chat_provider_details()
+    chat_api_key = chat_details.get("api_key")
+    chat_api_base = chat_details.get("api_base")
+    chat_provider_name = chat_details.get("provider_name") or config.get_provider_name()
+    chat_model = config.get_chat_model()
+    chat_is_bedrock = chat_model.startswith("bedrock/")
+
+    if chat_provider_name and not chat_api_key and not chat_is_bedrock:
+        console.print(f"[red]Error: No API key configured for chat provider {chat_provider_name}.[/red]")
+        console.print(f"Set one in ~/.kyber/.env: KYBER_PROVIDERS__{chat_provider_name.upper()}__API_KEY=your-key")
+        raise typer.Exit(1)
+
+    if not chat_api_key and not chat_is_bedrock:
+        console.print("[red]Error: No API key configured.[/red]")
+        console.print("Set one in ~/.kyber/.env: KYBER_PROVIDERS__OPENROUTER__API_KEY=your-key")
+        raise typer.Exit(1)
+
+    chat_provider = LiteLLMProvider(
+        api_key=chat_api_key,
+        api_base=chat_api_base,
+        default_model=chat_model,
+        provider_name=chat_provider_name,
+        is_custom=chat_details.get("is_custom", False),
+    )
+
+    # ── Task provider ──
+    task_details = config.get_task_provider_details()
+    task_provider_name = task_details.get("provider_name") or chat_provider_name
+    task_api_key = task_details.get("api_key")
+    task_api_base = task_details.get("api_base")
+    task_model = config.get_task_model()
+    task_is_bedrock = task_model.startswith("bedrock/")
+
+    if (task_provider_name == chat_provider_name
+        and task_api_key == chat_api_key
+        and task_api_base == chat_api_base):
+        task_provider = chat_provider
+    else:
+        if task_provider_name and not task_api_key and not task_is_bedrock:
+            console.print(f"[red]Error: No API key configured for task provider {task_provider_name}.[/red]")
+            console.print(f"Set one in ~/.kyber/.env: KYBER_PROVIDERS__{task_provider_name.upper()}__API_KEY=your-key")
+            raise typer.Exit(1)
+        task_provider = LiteLLMProvider(
+            api_key=task_api_key,
+            api_base=task_api_base,
+            default_model=task_model,
+            provider_name=task_provider_name,
+            is_custom=task_details.get("is_custom", False),
+        )
+
+    # ── Persona ──
+    workspace = config.workspace_path
+    soul_path = workspace / "SOUL.md"
+    persona = ""
+    if soul_path.exists():
+        persona = soul_path.read_text(encoding="utf-8")
+
+    # ── Orchestrator ──
+    return Orchestrator(
+        bus=bus,
+        provider=chat_provider,
+        workspace=workspace,
+        persona_prompt=persona,
+        model=chat_model,
+        brave_api_key=config.tools.web.search.api_key or None,
+        background_progress_updates=background_progress_updates,
+        task_history_path=task_history_path,
+        task_provider=task_provider,
+        task_model=task_model,
+        timezone=config.agents.defaults.timezone or None,
+    )
+
+
+# ============================================================================
 # Gateway / Server
 # ============================================================================
 
@@ -176,8 +308,6 @@ def gateway(
     from kyber.config.loader import load_config, get_data_dir
     from kyber.config.loader import save_config
     from kyber.bus.queue import MessageBus
-    from kyber.providers.litellm_provider import LiteLLMProvider
-    from kyber.agent.orchestrator import Orchestrator
     from kyber.channels.manager import ChannelManager
     from kyber.cron.service import CronService
     from kyber.cron.types import CronJob
@@ -189,6 +319,15 @@ def gateway(
         logging.basicConfig(level=logging.DEBUG)
     
     config = load_config()
+
+    # Warn if config.json still has plaintext secrets
+    from kyber.config.loader import _config_has_secrets
+    if _config_has_secrets():
+        console.print(
+            "[yellow]⚠  config.json contains plaintext API keys. "
+            "Run [cyan]kyber migrate-secrets[/cyan] to move them to ~/.kyber/.env[/yellow]"
+        )
+
     # Default port comes from config so dashboard proxy and gateway stay in sync.
     if port is None:
         port = int(config.gateway.port)
@@ -217,90 +356,37 @@ def gateway(
     # Create components
     bus = MessageBus()
     
-    # Create chat provider (for conversational replies)
-    chat_details = config.get_chat_provider_details()
-    chat_api_key = chat_details.get("api_key")
-    chat_api_base = chat_details.get("api_base")
-    chat_provider_name = chat_details.get("provider_name") or config.get_provider_name()
-    chat_model = config.get_chat_model()
-    chat_is_bedrock = chat_model.startswith("bedrock/")
-
-    if chat_provider_name and not chat_api_key and not chat_is_bedrock:
-        console.print(f"[red]Error: No API key configured for chat provider {chat_provider_name}.[/red]")
-        console.print(f"Set one in ~/.kyber/config.json under providers.{chat_provider_name}.apiKey")
-        raise typer.Exit(1)
-
-    if not chat_api_key and not chat_is_bedrock:
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.kyber/config.json under providers.openrouter.apiKey")
-        raise typer.Exit(1)
-    
-    chat_provider = LiteLLMProvider(
-        api_key=chat_api_key,
-        api_base=chat_api_base,
-        default_model=chat_model,
-        provider_name=chat_provider_name,
-        is_custom=chat_details.get("is_custom", False),
-    )
-
-    # Create task provider (for background workers)
-    task_details = config.get_task_provider_details()
-    task_provider_name = task_details.get("provider_name") or chat_provider_name
-    task_api_key = task_details.get("api_key")
-    task_api_base = task_details.get("api_base")
-    task_model = config.get_task_model()
-    task_is_bedrock = task_model.startswith("bedrock/")
-
-    # Only create a separate task provider if it differs from chat
-    if (task_provider_name == chat_provider_name
-        and task_api_key == chat_api_key
-        and task_api_base == chat_api_base):
-        task_provider = chat_provider
-    else:
-        if task_provider_name and not task_api_key and not task_is_bedrock:
-            console.print(f"[red]Error: No API key configured for task provider {task_provider_name}.[/red]")
-            console.print(f"Set one in ~/.kyber/config.json under providers.{task_provider_name}.apiKey")
-            raise typer.Exit(1)
-        task_provider = LiteLLMProvider(
-            api_key=task_api_key,
-            api_base=task_api_base,
-            default_model=task_model,
-            provider_name=task_provider_name,
-            is_custom=task_details.get("is_custom", False),
-        )
-    
-    # Load persona from SOUL.md
-    soul_path = workspace / "SOUL.md"
-    persona = ""
-    if soul_path.exists():
-        persona = soul_path.read_text(encoding="utf-8")
-    
-    # Create agent
-    agent = Orchestrator(
-        bus=bus,
-        provider=chat_provider,
-        workspace=workspace,
-        persona_prompt=persona,
-        model=chat_model,
-        brave_api_key=config.tools.web.search.api_key or None,
+    agent = _create_orchestrator(
+        config,
+        bus,
         background_progress_updates=getattr(config.agents.defaults, "background_progress_updates", True),
         task_history_path=get_data_dir() / "tasks" / "history.jsonl",
-        task_provider=task_provider,
-        task_model=task_model,
     )
     
     # Create cron service
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
+        # When the job has delivery configured, route through that channel
+        # so spawned background workers send completions to the right place.
+        channel = "cli"
+        chat_id = "direct"
+        if job.payload.deliver and job.payload.to:
+            channel = job.payload.channel or "discord"
+            chat_id = job.payload.to
+
         response = await agent.process_direct(
             job.payload.message,
-            session_key=f"cron:{job.id}"
+            session_key=f"cron:{job.id}",
+            channel=channel,
+            chat_id=chat_id,
         )
-        # Optionally deliver to channel
-        if job.payload.deliver and job.payload.to:
+        # If delivery is configured but the agent didn't spawn a background
+        # task (i.e. it handled inline), push the response to the channel.
+        # Background tasks handle their own completion delivery.
+        if job.payload.deliver and job.payload.to and response:
             from kyber.bus.events import OutboundMessage
             await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "whatsapp",
+                channel=job.payload.channel or "discord",
                 chat_id=job.payload.to,
                 content=response or ""
             ))
@@ -383,81 +469,10 @@ def agent(
     """Interact with the agent directly."""
     from kyber.config.loader import load_config
     from kyber.bus.queue import MessageBus
-    from kyber.providers.litellm_provider import LiteLLMProvider
-    from kyber.agent.orchestrator import Orchestrator
     
     config = load_config()
-    
-    api_key = config.get_api_key()
-    api_base = config.get_api_base()
-    provider_name = (config.agents.defaults.provider or "").strip().lower() or config.get_provider_name()
-
-    # Chat provider
-    chat_details = config.get_chat_provider_details()
-    chat_api_key = chat_details.get("api_key") or api_key
-    chat_api_base = chat_details.get("api_base") or api_base
-    chat_provider_name = chat_details.get("provider_name") or provider_name
-    chat_model = config.get_chat_model()
-    chat_is_bedrock = chat_model.startswith("bedrock/")
-
-    if chat_provider_name and not chat_api_key and not chat_is_bedrock:
-        console.print(f"[red]Error: No API key configured for provider {chat_provider_name}.[/red]")
-        console.print(f"Set one in ~/.kyber/config.json under providers.{chat_provider_name}.apiKey")
-        raise typer.Exit(1)
-
-    if not chat_api_key and not chat_is_bedrock:
-        console.print("[red]Error: No API key configured.[/red]")
-        raise typer.Exit(1)
-
     bus = MessageBus()
-    chat_provider = LiteLLMProvider(
-        api_key=chat_api_key,
-        api_base=chat_api_base,
-        default_model=chat_model,
-        provider_name=chat_provider_name,
-        is_custom=chat_details.get("is_custom", False),
-    )
-
-    # Task provider
-    task_details = config.get_task_provider_details()
-    task_provider_name = task_details.get("provider_name") or chat_provider_name
-    task_api_key = task_details.get("api_key")
-    task_model = config.get_task_model()
-
-    if (task_provider_name == chat_provider_name
-        and task_api_key == chat_api_key
-        and task_details.get("api_base") == chat_api_base):
-        task_provider = chat_provider
-    else:
-        task_is_bedrock = task_model.startswith("bedrock/")
-        if task_provider_name and not task_api_key and not task_is_bedrock:
-            console.print(f"[red]Error: No API key configured for task provider {task_provider_name}.[/red]")
-            raise typer.Exit(1)
-        task_provider = LiteLLMProvider(
-            api_key=task_api_key,
-            api_base=task_details.get("api_base"),
-            default_model=task_model,
-            provider_name=task_provider_name,
-            is_custom=task_details.get("is_custom", False),
-        )
-    
-    # Load persona from SOUL.md
-    soul_path = config.workspace_path / "SOUL.md"
-    persona = ""
-    if soul_path.exists():
-        persona = soul_path.read_text(encoding="utf-8")
-    
-    # Create agent
-    agent_instance = Orchestrator(
-        bus=bus,
-        provider=chat_provider,
-        workspace=config.workspace_path,
-        persona_prompt=persona,
-        model=chat_model,
-        brave_api_key=config.tools.web.search.api_key or None,
-        task_provider=task_provider,
-        task_model=task_model,
-    )
+    agent_instance = _create_orchestrator(config, bus)
     
     if message:
         # Single message mode
@@ -915,15 +930,19 @@ def cron_run(
 @app.command()
 def status():
     """Show kyber status."""
-    from kyber.config.loader import load_config, get_config_path
+    from kyber.config.loader import load_config, get_config_path, get_env_path, _config_has_secrets
 
     config_path = get_config_path()
+    env_path = get_env_path()
     config = load_config()
     workspace = config.workspace_path
 
     console.print(f"{__logo__} kyber Status\n")
 
     console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
+    console.print(f"Secrets: {env_path} {'[green]✓[/green]' if env_path.exists() else '[yellow]missing[/yellow]'}")
+    if _config_has_secrets():
+        console.print(f"  [yellow]⚠  config.json has plaintext keys — run [cyan]kyber migrate-secrets[/cyan][/yellow]")
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
     if config_path.exists():

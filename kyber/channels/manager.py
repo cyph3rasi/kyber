@@ -122,7 +122,14 @@ class ChannelManager:
             retry_at = datetime.now() + timedelta(seconds=delay_s)
             pending.append((retry_at, attempts, msg, str(err)))
 
+        # Internal-only channels that don't need outbound delivery.
+        # Messages originating from these sources (e.g. dashboard, cron) are
+        # fire-and-forget; the caller doesn't expect a chat response.
+        _SILENT_CHANNELS = frozenset({"dashboard", "cron", "internal", "system"})
+
         async def _try_send(msg: OutboundMessage, attempts: int = 1) -> None:
+            if msg.channel in _SILENT_CHANNELS:
+                return  # silently drop — no chat channel to deliver to
             channel = self.channels.get(msg.channel)
             if not channel:
                 raise PermanentDeliveryError(f"Unknown channel: {msg.channel}")

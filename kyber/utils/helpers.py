@@ -59,6 +59,27 @@ def timestamp() -> str:
     return datetime.now().isoformat()
 
 
+def current_datetime_str(timezone: str | None = None) -> str:
+    """Get a human-readable current date/time string, optionally in a specific timezone.
+
+    Returns something like: "2026-02-08 14:35 (Sunday) — America/New_York"
+    Falls back to local system time if the timezone is invalid or not provided.
+    """
+    from zoneinfo import ZoneInfo
+
+    try:
+        if timezone:
+            tz = ZoneInfo(timezone)
+            now = datetime.now(tz)
+            return now.strftime(f"%Y-%m-%d %H:%M (%A) — {timezone}")
+    except Exception:
+        pass
+
+    now = datetime.now().astimezone()
+    tz_name = now.strftime("%Z") or "local"
+    return now.strftime(f"%Y-%m-%d %H:%M (%A) — {tz_name}")
+
+
 def truncate_string(s: str, max_len: int = 100, suffix: str = "...") -> str:
     """Truncate a string to max length, adding suffix if truncated."""
     if len(s) <= max_len:

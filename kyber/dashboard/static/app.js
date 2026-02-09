@@ -4,6 +4,8 @@ const TOKEN_KEY = 'kyber_dashboard_token';
 const TASKS_AUTOREFRESH_KEY = 'kyber_tasks_autorefresh';
 const DEBUG_AUTOREFRESH_KEY = 'kyber_debug_autorefresh';
 const SKILLS_AUTOREFRESH_KEY = 'kyber_skills_autorefresh';
+const CRON_AUTOREFRESH_KEY = 'kyber_cron_autorefresh';
+const SECURITY_AUTOREFRESH_KEY = 'kyber_security_autorefresh';
 const LAST_SECTION_KEY = 'kyber_dashboard_last_section';
 const SCROLL_KEY_PREFIX = 'kyber_dashboard_scroll:';
 
@@ -60,6 +62,14 @@ const SECTIONS = {
   skills: {
     title: 'Skills',
     desc: 'Install and manage SKILL.md packages (skills.sh compatible).',
+  },
+  cron: {
+    title: 'Cron Jobs',
+    desc: 'Schedule recurring or one-time tasks for your agent.',
+  },
+  security: {
+    title: 'Security Center',
+    desc: 'Environment security scans, findings, and recommendations.',
   },
   tasks: {
     title: 'Tasks',
@@ -269,6 +279,8 @@ function renderSection() {
   if (activeSection === 'tasks') { renderTasks(); finishRender(); return; }
   if (activeSection === 'debug') { renderDebug(); finishRender(); return; }
   if (activeSection === 'skills') { renderSkills(); finishRender(); return; }
+  if (activeSection === 'cron') { renderCron(); finishRender(); return; }
+  if (activeSection === 'security') { renderSecurity(); finishRender(); return; }
 
   const data = config[activeSection];
   if (!data || !isObj(data)) {
@@ -1572,6 +1584,1044 @@ function renderSkills() {
       doRender({ showLoading: false });
     }, 8000);
   }
+}
+
+// ── Cron Jobs ──
+const CRON_API = '/api/cron';
+
+async function fetchCronJobs() {
+  const res = await apiFetch(`${CRON_API}/jobs`);
+  return await res.json();
+}
+
+function cronHumanSchedule(sched) {
+  if (!sched) return 'Unknown';
+  if (sched.kind === 'every' && sched.everyMs) {
+    const totalSec = Math.round(sched.everyMs / 1000);
+    if (totalSec < 60) return `Every ${totalSec} second${totalSec !== 1 ? 's' : ''}`;
+    const mins = Math.round(totalSec / 60);
+    if (mins < 60) return `Every ${mins} minute${mins !== 1 ? 's' : ''}`;
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return `Every ${hrs} hour${hrs !== 1 ? 's' : ''}`;
+    const days = Math.round(hrs / 24);
+    return `Every ${days} day${days !== 1 ? 's' : ''}`;
+  }
+  if (sched.kind === 'cron' && sched.expr) {
+    return cronExprToHuman(sched.expr) + (sched.tz ? ` (${sched.tz})` : '');
+  }
+  if (sched.kind === 'at' && sched.atMs) {
+    try { return 'Once at ' + new Date(sched.atMs).toLocaleString(); }
+    catch { return 'One-time'; }
+  }
+  return 'Unknown';
+}
+
+function cronExprToHuman(expr) {
+  // Simple human-readable translation for common cron patterns
+  const parts = (expr || '').trim().split(/\s+/);
+  if (parts.length < 5) return expr;
+  const [min, hr, dom, mon, dow] = parts;
+
+  // Every minute
+  if (min === '*' && hr === '*' && dom === '*' && mon === '*' && dow === '*') return 'Every minute';
+  // Every N minutes
+  if (min.startsWith('*/') && hr === '*' && dom === '*') return `Every ${min.slice(2)} minutes`;
+  // Every hour at :MM
+  if (!min.includes('*') && !min.includes('/') && hr === '*' && dom === '*') return `Every hour at :${min.padStart(2, '0')}`;
+  // Every N hours
+  if (min === '0' && hr.startsWith('*/') && dom === '*') return `Every ${hr.slice(2)} hours`;
+  // Daily at HH:MM
+  if (!min.includes('*') && !hr.includes('*') && dom === '*' && mon === '*' && dow === '*') {
+    return `Daily at ${hr.padStart(2, '0')}:${min.padStart(2, '0')}`;
+  }
+  // Weekdays at HH:MM
+  if (!min.includes('*') && !hr.includes('*') && dom === '*' && mon === '*' && dow === '1-5') {
+    return `Weekdays at ${hr.padStart(2, '0')}:${min.padStart(2, '0')}`;
+  }
+  // Weekly
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  if (!min.includes('*') && !hr.includes('*') && dom === '*' && mon === '*' && /^\d$/.test(dow)) {
+    return `${dayNames[+dow] || dow} at ${hr.padStart(2, '0')}:${min.padStart(2, '0')}`;
+  }
+  return expr;
+}
+
+function cronFmtTime(ms) {
+  if (!ms) return '—';
+  try { return new Date(ms).toLocaleString(); }
+  catch { return '—'; }
+}
+
+function renderCron() {
+  // Top controls
+  const topRow = document.createElement('div');
+  topRow.className = 'tasks-toprow';
+  const leftControls = document.createElement('div');
+  leftControls.className = 'tasks-controls';
+
+  const refreshBtn = document.createElement('button');
+  refreshBtn.className = 'btn btn-ghost';
+  refreshBtn.textContent = 'Refresh';
+  leftControls.appendChild(refreshBtn);
+
+  const newBtn = document.createElement('button');
+  newBtn.className = 'btn btn-primary';
+  newBtn.textContent = '+ New Job';
+  leftControls.appendChild(newBtn);
+
+  topRow.appendChild(leftControls);
+  contentBody.appendChild(topRow);
+
+  // Job list card
+  const listCard = makeCard('Scheduled Jobs');
+  const listWrap = document.createElement('div');
+  listWrap.className = 'tasks-history';
+  listCard.body.appendChild(listWrap);
+
+  // Editor card (hidden by default)
+  const editorCard = document.createElement('div');
+  editorCard.className = 'card hidden';
+  editorCard.id = 'cronEditor';
+  const editorHeader = document.createElement('div');
+  editorHeader.className = 'card-header';
+  editorHeader.innerHTML = '<span class="card-title" id="cronEditorTitle">New Job</span>';
+  const editorCloseBtn = document.createElement('button');
+  editorCloseBtn.className = 'btn-icon';
+  editorCloseBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+  editorHeader.appendChild(editorCloseBtn);
+  editorCard.appendChild(editorHeader);
+  const editorBody = document.createElement('div');
+  editorBody.className = 'card-body';
+  editorCard.appendChild(editorBody);
+
+  // State for editor
+  let editingJobId = null;
+
+  function buildEditor(job) {
+    editingJobId = job ? job.id : null;
+    editorCard.classList.remove('hidden');
+    editorHeader.querySelector('.card-title').textContent = job ? `Edit: ${job.name}` : 'New Job';
+    editorBody.innerHTML = '';
+
+    const name = job ? job.name : '';
+    const message = job ? (job.payload ? job.payload.message : '') : '';
+    const schedKind = job ? job.schedule.kind : 'every';
+    const everyMs = job && job.schedule.everyMs ? job.schedule.everyMs : 3600000;
+    const cronExpr = job && job.schedule.expr ? job.schedule.expr : '';
+    const cronTz = job && job.schedule.tz ? job.schedule.tz : '';
+    const atMs = job && job.schedule.atMs ? job.schedule.atMs : null;
+    const deliver = job && job.payload ? job.payload.deliver : false;
+    const channel = job && job.payload ? (job.payload.channel || '') : '';
+    const to = job && job.payload ? (job.payload.to || '') : '';
+    const deleteAfterRun = job ? !!job.deleteAfterRun : false;
+
+    // Name
+    const nameRow = document.createElement('div');
+    nameRow.className = 'field-row';
+    nameRow.innerHTML = '<div class="field-label">Name</div>';
+    const nameWrap = document.createElement('div');
+    nameWrap.className = 'field-input';
+    const nameInp = document.createElement('input');
+    nameInp.type = 'text';
+    nameInp.value = name;
+    nameInp.placeholder = 'e.g. Daily summary, Hourly check-in';
+    nameWrap.appendChild(nameInp);
+    nameRow.appendChild(nameWrap);
+    editorBody.appendChild(nameRow);
+
+    // Message
+    const msgRow = document.createElement('div');
+    msgRow.className = 'field-row';
+    msgRow.style.alignItems = 'flex-start';
+    msgRow.innerHTML = '<div class="field-label" style="padding-top:8px">Message</div>';
+    const msgWrap = document.createElement('div');
+    msgWrap.className = 'field-input';
+    const msgInp = document.createElement('textarea');
+    msgInp.value = message;
+    msgInp.placeholder = 'What should the agent do when this job runs?';
+    msgWrap.appendChild(msgInp);
+    msgRow.appendChild(msgWrap);
+    editorBody.appendChild(msgRow);
+
+    // Schedule type
+    const typeRow = document.createElement('div');
+    typeRow.className = 'field-row';
+    typeRow.innerHTML = '<div class="field-label">Schedule Type</div>';
+    const typeWrap = document.createElement('div');
+    typeWrap.className = 'field-input';
+    const typeSel = document.createElement('select');
+    [['every', 'Repeating interval'], ['cron', 'Cron expression'], ['at', 'One-time']].forEach(([v, t]) => {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = t;
+      if (v === schedKind) opt.selected = true;
+      typeSel.appendChild(opt);
+    });
+    typeWrap.appendChild(typeSel);
+    typeRow.appendChild(typeWrap);
+    editorBody.appendChild(typeRow);
+
+    // Schedule details container
+    const schedDetails = document.createElement('div');
+    editorBody.appendChild(schedDetails);
+
+    function renderScheduleFields() {
+      schedDetails.innerHTML = '';
+      const kind = typeSel.value;
+
+      if (kind === 'every') {
+        // Interval with human-friendly unit selector
+        const row = document.createElement('div');
+        row.className = 'field-row';
+        row.innerHTML = '<div class="field-label">Run every</div>';
+        const wrap = document.createElement('div');
+        wrap.className = 'field-input';
+        wrap.style.display = 'flex';
+        wrap.style.gap = '8px';
+
+        const numInp = document.createElement('input');
+        numInp.type = 'number';
+        numInp.min = '1';
+        numInp.style.width = '80px';
+        numInp.style.flex = '0 0 80px';
+
+        const unitSel = document.createElement('select');
+        [['60000', 'minutes'], ['3600000', 'hours'], ['86400000', 'days']].forEach(([v, t]) => {
+          const opt = document.createElement('option');
+          opt.value = v;
+          opt.textContent = t;
+          unitSel.appendChild(opt);
+        });
+
+        // Decompose everyMs into value + unit
+        if (everyMs >= 86400000 && everyMs % 86400000 === 0) {
+          numInp.value = everyMs / 86400000;
+          unitSel.value = '86400000';
+        } else if (everyMs >= 3600000 && everyMs % 3600000 === 0) {
+          numInp.value = everyMs / 3600000;
+          unitSel.value = '3600000';
+        } else {
+          numInp.value = Math.max(1, Math.round(everyMs / 60000));
+          unitSel.value = '60000';
+        }
+
+        wrap.appendChild(numInp);
+        wrap.appendChild(unitSel);
+        row.appendChild(wrap);
+        schedDetails.appendChild(row);
+      }
+
+      if (kind === 'cron') {
+        const row = document.createElement('div');
+        row.className = 'field-row';
+        row.innerHTML = '<div class="field-label">Cron Expression</div>';
+        const wrap = document.createElement('div');
+        wrap.className = 'field-input';
+        const inp = document.createElement('input');
+        inp.type = 'text';
+        inp.value = cronExpr;
+        inp.placeholder = '0 9 * * *  (min hr day month weekday)';
+        inp.id = 'cronExprInput';
+
+        const hint = document.createElement('div');
+        hint.className = 'cron-hint';
+        hint.style.fontSize = '12px';
+        hint.style.color = 'var(--text-tertiary)';
+        hint.style.marginTop = '6px';
+        hint.textContent = cronExpr ? cronExprToHuman(cronExpr) : 'e.g. 0 9 * * * = Daily at 09:00';
+        inp.addEventListener('input', () => {
+          hint.textContent = inp.value.trim() ? cronExprToHuman(inp.value.trim()) : '';
+        });
+
+        wrap.appendChild(inp);
+        wrap.appendChild(hint);
+        row.appendChild(wrap);
+        schedDetails.appendChild(row);
+
+        // Timezone
+        const tzRow = document.createElement('div');
+        tzRow.className = 'field-row';
+        tzRow.innerHTML = '<div class="field-label">Timezone</div>';
+        const tzWrap = document.createElement('div');
+        tzWrap.className = 'field-input';
+        const tzInp = document.createElement('input');
+        tzInp.type = 'text';
+        tzInp.value = cronTz;
+        tzInp.placeholder = 'e.g. US/Eastern (leave blank for system default)';
+        tzInp.id = 'cronTzInput';
+        tzWrap.appendChild(tzInp);
+        tzRow.appendChild(tzWrap);
+        schedDetails.appendChild(tzRow);
+      }
+
+      if (kind === 'at') {
+        const row = document.createElement('div');
+        row.className = 'field-row';
+        row.innerHTML = '<div class="field-label">Run at</div>';
+        const wrap = document.createElement('div');
+        wrap.className = 'field-input';
+        const inp = document.createElement('input');
+        inp.type = 'datetime-local';
+        inp.id = 'cronAtInput';
+        if (atMs) {
+          const d = new Date(atMs);
+          // Format for datetime-local: YYYY-MM-DDTHH:MM
+          const pad = (n) => String(n).padStart(2, '0');
+          inp.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        }
+        wrap.appendChild(inp);
+        row.appendChild(wrap);
+        schedDetails.appendChild(row);
+
+        // Delete after run
+        const delRow = document.createElement('div');
+        delRow.className = 'field-row';
+        delRow.innerHTML = '<div class="field-label">Auto-delete</div>';
+        const delWrap = document.createElement('div');
+        delWrap.className = 'field-input';
+        const delChk = document.createElement('div');
+        delChk.className = 'checkbox-wrap';
+        const delCb = document.createElement('input');
+        delCb.type = 'checkbox';
+        delCb.checked = deleteAfterRun;
+        delCb.id = 'cronDeleteAfterRun';
+        const delLbl = document.createElement('label');
+        delLbl.className = 'checkbox-label';
+        delLbl.htmlFor = 'cronDeleteAfterRun';
+        delLbl.textContent = 'Remove job after it runs';
+        delChk.appendChild(delCb);
+        delChk.appendChild(delLbl);
+        delWrap.appendChild(delChk);
+        delRow.appendChild(delWrap);
+        schedDetails.appendChild(delRow);
+      }
+    }
+
+    typeSel.addEventListener('change', renderScheduleFields);
+    renderScheduleFields();
+
+    // Delivery section
+    const deliverRow = document.createElement('div');
+    deliverRow.className = 'field-row';
+    deliverRow.innerHTML = '<div class="field-label">Deliver result</div>';
+    const deliverWrap = document.createElement('div');
+    deliverWrap.className = 'field-input';
+    const deliverChk = document.createElement('div');
+    deliverChk.className = 'checkbox-wrap';
+    const deliverCb = document.createElement('input');
+    deliverCb.type = 'checkbox';
+    deliverCb.checked = deliver;
+    deliverCb.id = 'cronDeliver';
+    const deliverLbl = document.createElement('label');
+    deliverLbl.className = 'checkbox-label';
+    deliverLbl.htmlFor = 'cronDeliver';
+    deliverLbl.textContent = 'Send response to a channel';
+    deliverChk.appendChild(deliverCb);
+    deliverChk.appendChild(deliverLbl);
+    deliverWrap.appendChild(deliverChk);
+    deliverRow.appendChild(deliverWrap);
+    editorBody.appendChild(deliverRow);
+
+    const deliveryDetails = document.createElement('div');
+    editorBody.appendChild(deliveryDetails);
+
+    function renderDeliveryFields() {
+      deliveryDetails.innerHTML = '';
+      if (!deliverCb.checked) return;
+
+      const chRow = document.createElement('div');
+      chRow.className = 'field-row';
+      chRow.innerHTML = '<div class="field-label">Channel</div>';
+      const chWrap = document.createElement('div');
+      chWrap.className = 'field-input';
+      const chSel = document.createElement('select');
+      [['', '— Select —'], ['whatsapp', 'WhatsApp'], ['telegram', 'Telegram'], ['discord', 'Discord']].forEach(([v, t]) => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = t;
+        if (v === channel) opt.selected = true;
+        chSel.appendChild(opt);
+      });
+      chSel.id = 'cronChannel';
+      chWrap.appendChild(chSel);
+      chRow.appendChild(chWrap);
+      deliveryDetails.appendChild(chRow);
+
+      const toRow = document.createElement('div');
+      toRow.className = 'field-row';
+      toRow.innerHTML = '<div class="field-label">Recipient</div>';
+      const toWrap = document.createElement('div');
+      toWrap.className = 'field-input';
+      const toInp = document.createElement('input');
+      toInp.type = 'text';
+      toInp.value = to;
+      toInp.placeholder = 'e.g. phone number, chat ID';
+      toInp.id = 'cronTo';
+      toWrap.appendChild(toInp);
+      toRow.appendChild(toWrap);
+      deliveryDetails.appendChild(toRow);
+    }
+
+    deliverCb.addEventListener('change', () => {
+      deliverLbl.textContent = deliverCb.checked ? 'Send response to a channel' : 'Send response to a channel';
+      renderDeliveryFields();
+    });
+    renderDeliveryFields();
+
+    // Save / Cancel buttons
+    const btnRow = document.createElement('div');
+    btnRow.style.display = 'flex';
+    btnRow.style.gap = '10px';
+    btnRow.style.marginTop = '16px';
+
+    const saveJobBtn = document.createElement('button');
+    saveJobBtn.className = 'btn btn-primary';
+    saveJobBtn.textContent = job ? 'Save Changes' : 'Create Job';
+    btnRow.appendChild(saveJobBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-ghost';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => {
+      editorCard.classList.add('hidden');
+      editingJobId = null;
+    });
+    btnRow.appendChild(cancelBtn);
+
+    editorBody.appendChild(btnRow);
+
+    // Save handler
+    saveJobBtn.addEventListener('click', async () => {
+      const n = nameInp.value.trim();
+      const m = msgInp.value.trim();
+      if (!n) { showToast('Name is required', 'error'); return; }
+      if (!m) { showToast('Message is required', 'error'); return; }
+
+      const kind = typeSel.value;
+      const schedule = { kind };
+
+      if (kind === 'every') {
+        const numEl = schedDetails.querySelector('input[type="number"]');
+        const unitEl = schedDetails.querySelector('select');
+        const val = parseInt(numEl.value) || 1;
+        const unit = parseInt(unitEl.value) || 3600000;
+        schedule.everyMs = val * unit;
+      } else if (kind === 'cron') {
+        const exprEl = document.getElementById('cronExprInput');
+        const tzEl = document.getElementById('cronTzInput');
+        if (!exprEl.value.trim()) { showToast('Cron expression is required', 'error'); return; }
+        schedule.expr = exprEl.value.trim();
+        if (tzEl.value.trim()) schedule.tz = tzEl.value.trim();
+      } else if (kind === 'at') {
+        const atEl = document.getElementById('cronAtInput');
+        if (!atEl.value) { showToast('Date/time is required', 'error'); return; }
+        schedule.atMs = new Date(atEl.value).getTime();
+      }
+
+      const payload = {
+        name: n,
+        message: m,
+        schedule,
+        deliver: deliverCb.checked,
+      };
+
+      if (deliverCb.checked) {
+        const chEl = document.getElementById('cronChannel');
+        const toEl = document.getElementById('cronTo');
+        if (chEl) payload.channel = chEl.value;
+        if (toEl) payload.to = toEl.value;
+      }
+
+      if (kind === 'at') {
+        const darEl = document.getElementById('cronDeleteAfterRun');
+        if (darEl) payload.deleteAfterRun = darEl.checked;
+      }
+
+      saveJobBtn.disabled = true;
+      try {
+        if (editingJobId) {
+          await apiFetch(`${CRON_API}/jobs/${encodeURIComponent(editingJobId)}`, {
+            method: 'PUT',
+            body: JSON.stringify(payload),
+          });
+          showToast('Job updated', 'success');
+        } else {
+          await apiFetch(`${CRON_API}/jobs`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+          });
+          showToast('Job created', 'success');
+        }
+        editorCard.classList.add('hidden');
+        editingJobId = null;
+        await doRender({ showLoading: false });
+      } catch (e) {
+        showToast('Failed to save job', 'error');
+      } finally {
+        saveJobBtn.disabled = false;
+      }
+    });
+
+    // Scroll editor into view
+    requestAnimationFrame(() => editorCard.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+  }
+
+  editorCloseBtn.addEventListener('click', () => {
+    editorCard.classList.add('hidden');
+    editingJobId = null;
+  });
+
+  newBtn.addEventListener('click', () => buildEditor(null));
+
+  async function doRender(opts = { showLoading: true }) {
+    const showLoading = opts && opts.showLoading !== undefined ? !!opts.showLoading : true;
+    if (showLoading && !listWrap.childElementCount) {
+      listWrap.innerHTML = '<div class="empty-state">Loading…</div>';
+    }
+    try {
+      const data = await fetchCronJobs();
+      const jobs = data.jobs || [];
+      listWrap.innerHTML = '';
+
+      if (!jobs.length) {
+        listWrap.innerHTML = '<div class="empty-state">No cron jobs yet. Click "+ New Job" to create one.</div>';
+        return;
+      }
+
+      jobs.forEach((job) => {
+        const row = document.createElement('div');
+        row.className = 'task-row';
+        row.style.flexWrap = 'wrap';
+
+        const left = document.createElement('div');
+        left.className = 'task-left';
+        left.style.flex = '1';
+        left.style.minWidth = '200px';
+
+        const title = document.createElement('div');
+        title.className = 'task-title';
+        title.textContent = job.name;
+        left.appendChild(title);
+
+        const meta = document.createElement('div');
+        meta.className = 'task-meta';
+        const schedText = cronHumanSchedule(job.schedule);
+        const statusBit = job.enabled ? '🟢 Active' : '⏸ Paused';
+        const nextRun = job.state && job.state.nextRunAtMs ? `Next: ${cronFmtTime(job.state.nextRunAtMs)}` : '';
+        const lastStatus = job.state && job.state.lastStatus ? `Last: ${job.state.lastStatus}` : '';
+        meta.textContent = [statusBit, schedText, nextRun, lastStatus].filter(Boolean).join(' · ');
+        left.appendChild(meta);
+
+        if (job.payload && job.payload.message) {
+          const msgPreview = document.createElement('div');
+          msgPreview.className = 'task-meta';
+          msgPreview.style.fontStyle = 'italic';
+          msgPreview.style.marginTop = '2px';
+          const msg = job.payload.message;
+          msgPreview.textContent = msg.length > 80 ? msg.slice(0, 80) + '…' : msg;
+          left.appendChild(msgPreview);
+        }
+
+        row.appendChild(left);
+
+        const right = document.createElement('div');
+        right.className = 'task-right';
+
+        // Toggle enabled
+        const toggleWrap = document.createElement('label');
+        toggleWrap.className = 'task-toggle';
+        const toggleCb = document.createElement('input');
+        toggleCb.type = 'checkbox';
+        toggleCb.checked = job.enabled;
+        toggleCb.addEventListener('change', async () => {
+          try {
+            await apiFetch(`${CRON_API}/jobs/${encodeURIComponent(job.id)}/toggle`, {
+              method: 'POST',
+              body: JSON.stringify({ enabled: toggleCb.checked }),
+            });
+            showToast(toggleCb.checked ? 'Job enabled' : 'Job paused', 'success');
+            await doRender({ showLoading: false });
+          } catch {
+            showToast('Failed to toggle job', 'error');
+            toggleCb.checked = !toggleCb.checked;
+          }
+        });
+        const toggleText = document.createElement('span');
+        toggleText.textContent = 'Enabled';
+        toggleWrap.appendChild(toggleCb);
+        toggleWrap.appendChild(toggleText);
+        right.appendChild(toggleWrap);
+
+        // Edit button
+        const editBtn = document.createElement('button');
+        editBtn.className = 'btn-icon';
+        editBtn.title = 'Edit job';
+        editBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M11.5 1.5l3 3L5 14H2v-3L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>';
+        editBtn.addEventListener('click', () => buildEditor(job));
+        right.appendChild(editBtn);
+
+        // Delete button
+        const delBtn = document.createElement('button');
+        delBtn.className = 'btn-icon danger';
+        delBtn.title = 'Delete job';
+        delBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+        delBtn.addEventListener('click', async () => {
+          if (!confirm(`Delete job "${job.name}"?`)) return;
+          delBtn.disabled = true;
+          try {
+            await apiFetch(`${CRON_API}/jobs/${encodeURIComponent(job.id)}`, { method: 'DELETE' });
+            showToast('Job deleted', 'success');
+            await doRender({ showLoading: false });
+          } catch {
+            showToast('Failed to delete job', 'error');
+          } finally {
+            delBtn.disabled = false;
+          }
+        });
+        right.appendChild(delBtn);
+
+        row.appendChild(right);
+        listWrap.appendChild(row);
+      });
+    } catch (e) {
+      console.error(e);
+      listWrap.innerHTML = '<div class="empty-state">Failed to load cron jobs.</div>';
+    }
+  }
+
+  refreshBtn.addEventListener('click', () => doRender({ showLoading: true }));
+
+  contentBody.appendChild(editorCard);
+  contentBody.appendChild(listCard.el);
+
+  doRender({ showLoading: true });
+}
+
+// ── Security Center ──
+
+async function fetchSecurityReports() {
+  const res = await apiFetch(`${API}/security/reports`);
+  return await res.json();
+}
+
+async function triggerSecurityScan() {
+  const res = await apiFetch(`${API}/security/scan`, { method: 'POST' });
+  return await res.json();
+}
+
+function securityScoreColor(score) {
+  if (score >= 80) return 'var(--green)';
+  if (score >= 60) return 'var(--amber)';
+  return 'var(--red)';
+}
+
+function securityScoreLabel(score) {
+  if (score >= 90) return 'Excellent';
+  if (score >= 80) return 'Good';
+  if (score >= 60) return 'Fair';
+  if (score >= 40) return 'Poor';
+  return 'Critical';
+}
+
+function severityColor(sev) {
+  if (sev === 'critical') return 'var(--red)';
+  if (sev === 'high') return '#f97316';
+  if (sev === 'medium') return 'var(--amber)';
+  return 'var(--text-tertiary)';
+}
+
+function categoryStatusIcon(status) {
+  if (status === 'pass') return '✅';
+  if (status === 'warn') return '⚠️';
+  if (status === 'fail') return '🚨';
+  return '⏭️';
+}
+
+function categoryLabel(cat) {
+  const labels = {
+    network: 'Network & Ports',
+    ssh: 'SSH Configuration',
+    permissions: 'File Permissions',
+    secrets: 'Secrets & Env Vars',
+    software: 'Software Updates',
+    processes: 'Running Processes',
+    firewall: 'Firewall',
+    docker: 'Docker & Containers',
+    git: 'Git Security',
+    kyber: 'Kyber Config',
+  };
+  return labels[cat] || cat;
+}
+
+function renderSecurity() {
+  let securityPollTimer = null;
+  let scanIsRunning = false;
+
+  // Top controls
+  const topRow = document.createElement('div');
+  topRow.className = 'tasks-toprow';
+  const leftControls = document.createElement('div');
+  leftControls.className = 'tasks-controls';
+
+  const refreshBtn = document.createElement('button');
+  refreshBtn.className = 'btn btn-ghost';
+  refreshBtn.textContent = 'Refresh';
+  leftControls.appendChild(refreshBtn);
+
+  const scanBtn = document.createElement('button');
+  scanBtn.className = 'btn btn-primary';
+  scanBtn.textContent = '🛡️ Run Scan Now';
+  leftControls.appendChild(scanBtn);
+
+  topRow.appendChild(leftControls);
+  contentBody.appendChild(topRow);
+
+  // In-progress banner (hidden by default)
+  const progressBanner = document.createElement('div');
+  progressBanner.className = 'security-progress hidden';
+  progressBanner.innerHTML = `
+    <div class="security-progress-inner">
+      <div class="security-progress-spinner"></div>
+      <div class="security-progress-text">
+        <span class="security-progress-title">Security scan in progress…</span>
+        <span class="security-progress-detail" id="secScanDetail">Analyzing your environment</span>
+      </div>
+      <span class="security-progress-elapsed" id="secScanElapsed"></span>
+    </div>
+  `;
+  contentBody.appendChild(progressBanner);
+
+  // Main container
+  const container = document.createElement('div');
+  container.id = 'securityContainer';
+  contentBody.appendChild(container);
+
+  // ── Scan status detection ──
+
+  let scanTriggeredAt = 0; // timestamp when scan was triggered
+  const SCAN_GRACE_MS = 90000; // 90s grace before hiding banner if no task found
+
+  function _isScanTask(t) {
+    const desc = ((t.description || '') + ' ' + (t.label || '')).toLowerCase();
+    return desc.includes('security scan') || desc.includes('security-scan') || desc.includes('security audit');
+  }
+
+  async function checkScanStatus() {
+    try {
+      const res = await apiFetch(`${API}/tasks`);
+      const data = await res.json();
+      const active = (data.active || []).filter(_isScanTask);
+      if (active.length > 0) {
+        const task = active[0];
+        showScanRunning(task);
+        return true;
+      }
+    } catch (_) { /* ignore */ }
+
+    // No active scan task found — but if we just triggered one, the
+    // orchestrator may still be processing (LLM thinking before spawning).
+    // Don't hide the banner until the grace period expires.
+    if (scanIsRunning) {
+      const elapsed = Date.now() - scanTriggeredAt;
+      if (scanTriggeredAt && elapsed < SCAN_GRACE_MS) {
+        // Still within grace period — update the detail text
+        const detail = document.getElementById('secScanDetail');
+        if (detail) detail.textContent = 'Waiting for agent to start scan…';
+        const elapsedEl = document.getElementById('secScanElapsed');
+        if (elapsedEl) {
+          const s = Math.floor(elapsed / 1000);
+          elapsedEl.textContent = `${s}s`;
+        }
+        return true; // keep polling, don't hide
+      }
+      hideScanRunning();
+      // Scan finished (or grace expired) — auto-refresh reports
+      doRender({});
+    }
+    return false;
+  }
+
+  function showScanRunning(task) {
+    scanIsRunning = true;
+    scanBtn.disabled = true;
+    scanBtn.textContent = '⏳ Scan Running…';
+    scanBtn.classList.add('btn-disabled');
+    progressBanner.classList.remove('hidden');
+
+    const detail = document.getElementById('secScanDetail');
+    const elapsed = document.getElementById('secScanElapsed');
+    if (detail) {
+      const action = task.current_action || 'Analyzing your environment';
+      const step = task.iteration ? `Step ${task.iteration}` : '';
+      detail.textContent = step ? `${step} — ${action}` : action;
+    }
+    if (elapsed && task.created_at) {
+      const secs = Math.floor((Date.now() - new Date(task.created_at).getTime()) / 1000);
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      elapsed.textContent = m ? `${m}m ${s}s` : `${s}s`;
+    }
+  }
+
+  function hideScanRunning() {
+    scanIsRunning = false;
+    scanBtn.disabled = false;
+    scanBtn.textContent = '🛡️ Run Scan Now';
+    scanBtn.classList.remove('btn-disabled');
+    progressBanner.classList.add('hidden');
+  }
+
+  function startPolling() {
+    if (securityPollTimer) return;
+    securityPollTimer = setInterval(() => checkScanStatus(), 3000);
+  }
+
+  function stopPolling() {
+    if (securityPollTimer) {
+      clearInterval(securityPollTimer);
+      securityPollTimer = null;
+    }
+  }
+
+  // Clean up polling when leaving the section
+  const origSwitch = switchSection;
+  const _secCleanup = () => { stopPolling(); };
+  // Patch: stop polling when navigating away
+  const navBtns = document.querySelectorAll('.nav-item[data-section]');
+  navBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (btn.dataset.section !== 'security') _secCleanup();
+    });
+  });
+
+  function renderEmpty() {
+    container.innerHTML = `
+      <div class="security-empty">
+        <div class="security-empty-icon">🛡️</div>
+        <h3>No Security Reports Yet</h3>
+        <p>Run your first security scan to get a comprehensive overview of your environment.</p>
+        <p style="font-size:12px;color:var(--text-tertiary);margin-top:8px;">
+          Tip: Set up a cron job to run scans automatically twice a day.
+        </p>
+      </div>
+    `;
+  }
+
+  function renderReport(data) {
+    if (!data || !data.latest) { renderEmpty(); return; }
+    const report = data.latest;
+    const summary = report.summary || {};
+    const score = summary.score ?? 0;
+    const findings = report.findings || [];
+    const categories = report.categories || {};
+    const notes = report.notes || '';
+    const ts = report.timestamp ? new Date(report.timestamp).toLocaleString() : 'Unknown';
+    const dur = report.duration_seconds ? `${report.duration_seconds}s` : '';
+
+    container.innerHTML = '';
+
+    // Score card
+    const scoreCard = document.createElement('div');
+    scoreCard.className = 'card';
+    scoreCard.innerHTML = `
+      <div class="card-body">
+        <div class="security-score-row">
+          <div class="security-score-ring" style="--score-color: ${securityScoreColor(score)}">
+            <svg viewBox="0 0 120 120" class="security-score-svg">
+              <circle cx="60" cy="60" r="52" fill="none" stroke="var(--border)" stroke-width="8"/>
+              <circle cx="60" cy="60" r="52" fill="none" stroke="${securityScoreColor(score)}" stroke-width="8"
+                stroke-dasharray="${(score / 100) * 327} 327"
+                stroke-linecap="round" transform="rotate(-90 60 60)"
+                style="transition: stroke-dasharray 0.6s ease"/>
+            </svg>
+            <div class="security-score-value">
+              <span class="security-score-num" style="color:${securityScoreColor(score)}">${score}</span>
+              <span class="security-score-label">${securityScoreLabel(score)}</span>
+            </div>
+          </div>
+          <div class="security-score-details">
+            <div class="security-score-title">Security Score</div>
+            <div class="security-score-meta">Last scan: ${ts}${dur ? ' · ' + dur : ''}</div>
+            <div class="security-severity-pills">
+              ${summary.critical ? `<span class="severity-pill critical">${summary.critical} Critical</span>` : ''}
+              ${summary.high ? `<span class="severity-pill high">${summary.high} High</span>` : ''}
+              ${summary.medium ? `<span class="severity-pill medium">${summary.medium} Medium</span>` : ''}
+              ${summary.low ? `<span class="severity-pill low">${summary.low} Low</span>` : ''}
+              ${summary.total_findings === 0 ? '<span class="severity-pill pass">No Issues Found</span>' : ''}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    container.appendChild(scoreCard);
+
+    // Categories grid
+    const catCard = document.createElement('div');
+    catCard.className = 'card';
+    catCard.style.marginTop = '16px';
+    const catHeader = document.createElement('div');
+    catHeader.className = 'card-header';
+    catHeader.innerHTML = '<span class="card-title">Scan Categories</span>';
+    catCard.appendChild(catHeader);
+    const catBody = document.createElement('div');
+    catBody.className = 'card-body';
+    catBody.style.padding = '0';
+
+    const catGrid = document.createElement('div');
+    catGrid.className = 'security-cat-grid';
+
+    const catOrder = ['network','ssh','permissions','secrets','software','processes','firewall','docker','git','kyber'];
+    for (const key of catOrder) {
+      const cat = categories[key];
+      if (!cat) continue;
+      const item = document.createElement('div');
+      item.className = 'security-cat-item';
+      item.innerHTML = `
+        <span class="security-cat-icon">${categoryStatusIcon(cat.status)}</span>
+        <span class="security-cat-name">${categoryLabel(key)}</span>
+        <span class="security-cat-count">${cat.checked ? (cat.finding_count || 0) + ' findings' : 'Skipped'}</span>
+      `;
+      catGrid.appendChild(item);
+    }
+    catBody.appendChild(catGrid);
+    catCard.appendChild(catBody);
+    container.appendChild(catCard);
+
+    // Findings list
+    if (findings.length > 0) {
+      const findCard = document.createElement('div');
+      findCard.className = 'card';
+      findCard.style.marginTop = '16px';
+      const findHeader = document.createElement('div');
+      findHeader.className = 'card-header';
+      findHeader.innerHTML = `<span class="card-title">Findings (${findings.length})</span>`;
+      findCard.appendChild(findHeader);
+      const findBody = document.createElement('div');
+      findBody.className = 'card-body';
+      findBody.style.padding = '0';
+
+      // Sort: critical first, then high, medium, low
+      const sevOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+      const sorted = [...findings].sort((a, b) => (sevOrder[a.severity] ?? 9) - (sevOrder[b.severity] ?? 9));
+
+      for (const f of sorted) {
+        const row = document.createElement('details');
+        row.className = 'security-finding';
+        const sum = document.createElement('summary');
+        sum.className = 'security-finding-summary';
+        sum.innerHTML = `
+          <span class="security-finding-sev" style="background:${severityColor(f.severity)}">${f.severity.toUpperCase()}</span>
+          <span class="security-finding-id">${f.id || ''}</span>
+          <span class="security-finding-title">${f.title}</span>
+          <svg class="security-finding-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        `;
+        row.appendChild(sum);
+
+        const body = document.createElement('div');
+        body.className = 'security-finding-body';
+        body.innerHTML = `
+          <p>${f.description || ''}</p>
+          ${f.remediation ? `<div class="security-finding-fix"><strong>Fix:</strong> ${f.remediation}</div>` : ''}
+          ${f.evidence ? `<pre class="security-finding-evidence">${f.evidence}</pre>` : ''}
+        `;
+        row.appendChild(body);
+        findBody.appendChild(row);
+      }
+      findCard.appendChild(findBody);
+      container.appendChild(findCard);
+    }
+
+    // AI Notes
+    if (notes) {
+      const notesCard = document.createElement('div');
+      notesCard.className = 'card';
+      notesCard.style.marginTop = '16px';
+      const notesHeader = document.createElement('div');
+      notesHeader.className = 'card-header';
+      notesHeader.innerHTML = '<span class="card-title">🤖 AI Notes & Recommendations</span>';
+      notesCard.appendChild(notesHeader);
+      const notesBody = document.createElement('div');
+      notesBody.className = 'card-body';
+      notesBody.innerHTML = `<div class="security-notes">${notes.replace(/\n/g, '<br>')}</div>`;
+      notesCard.appendChild(notesBody);
+      container.appendChild(notesCard);
+    }
+
+    // Report history
+    if (data.reports && data.reports.length > 1) {
+      const histCard = document.createElement('div');
+      histCard.className = 'card';
+      histCard.style.marginTop = '16px';
+      const histHeader = document.createElement('div');
+      histHeader.className = 'card-header';
+      histHeader.innerHTML = `<span class="card-title">Scan History (${data.reports.length})</span>`;
+      histCard.appendChild(histHeader);
+      const histBody = document.createElement('div');
+      histBody.className = 'card-body';
+      histBody.style.padding = '0';
+
+      for (const r of data.reports) {
+        const s = r.summary || {};
+        const rTs = r.timestamp ? new Date(r.timestamp).toLocaleString() : 'Unknown';
+        const rScore = s.score ?? '?';
+        const row = document.createElement('div');
+        row.className = 'security-hist-row';
+        row.innerHTML = `
+          <span class="security-hist-score" style="color:${securityScoreColor(rScore)}">${rScore}</span>
+          <span class="security-hist-date">${rTs}</span>
+          <span class="security-hist-counts">
+            ${s.critical ? `<span style="color:var(--red)">${s.critical}C</span>` : ''}
+            ${s.high ? `<span style="color:#f97316">${s.high}H</span>` : ''}
+            ${s.medium ? `<span style="color:var(--amber)">${s.medium}M</span>` : ''}
+            ${s.low ? `<span style="color:var(--text-tertiary)">${s.low}L</span>` : ''}
+          </span>
+        `;
+        histBody.appendChild(row);
+      }
+      histCard.appendChild(histBody);
+      container.appendChild(histCard);
+    }
+  }
+
+  async function doRender(opts = {}) {
+    if (opts.showLoading) container.innerHTML = '<div class="empty-state">Loading security reports…</div>';
+    try {
+      const data = await fetchSecurityReports();
+      renderReport(data);
+    } catch (e) {
+      container.innerHTML = '<div class="empty-state">Failed to load security reports.</div>';
+    }
+    // Always check if a scan is currently running
+    const running = await checkScanStatus();
+    if (running) startPolling();
+  }
+
+  scanBtn.addEventListener('click', async () => {
+    if (scanIsRunning) return; // guard against double-click
+    scanBtn.disabled = true;
+    scanBtn.textContent = '⏳ Triggering…';
+    scanBtn.classList.add('btn-disabled');
+    try {
+      await triggerSecurityScan();
+      showToast('Security scan triggered — the agent is working on it', 'success');
+      // Start polling immediately so the banner appears once the task registers
+      scanIsRunning = true;
+      scanTriggeredAt = Date.now();
+      progressBanner.classList.remove('hidden');
+      document.getElementById('secScanDetail').textContent = 'Waiting for agent to start scan…';
+      document.getElementById('secScanElapsed').textContent = '0s';
+      startPolling();
+    } catch (e) {
+      showToast('Failed to trigger scan', 'error');
+      scanBtn.disabled = false;
+      scanBtn.textContent = '🛡️ Run Scan Now';
+      scanBtn.classList.remove('btn-disabled');
+    }
+  });
+
+  refreshBtn.addEventListener('click', () => doRender({ showLoading: true }));
+
+  doRender({ showLoading: true });
 }
 
 // ── Debug (Errors) ──

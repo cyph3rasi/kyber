@@ -190,6 +190,7 @@ class Orchestrator:
         task_history_path: Path | None = None,
         task_provider: LLMProvider | None = None,
         task_model: str | None = None,
+        timezone: str | None = None,
     ):
         self.bus = bus
         self.provider = provider
@@ -197,6 +198,7 @@ class Orchestrator:
         self.model = model or provider.get_default_model()
         self.brave_api_key = brave_api_key
         self.background_progress_updates = background_progress_updates
+        self.timezone = timezone
 
         # Task provider defaults to the chat provider if not specified
         _task_provider = task_provider or provider
@@ -206,7 +208,7 @@ class Orchestrator:
         self.registry = TaskRegistry(history_path=task_history_path)
         self.sessions = SessionManager(workspace)
         self.voice = CharacterVoice(persona_prompt, provider, model=self.model)
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(workspace, timezone=timezone)
         self.workers = WorkerPool(
             provider=_task_provider,
             workspace=workspace,
@@ -214,10 +216,12 @@ class Orchestrator:
             persona_prompt=persona_prompt,
             model=_task_model,
             brave_api_key=brave_api_key,
+            timezone=timezone,
         )
 
         self._running = False
         self._last_progress_update: dict[str, datetime] = {}
+        self._last_user_content: str = ""
     
     async def run(self) -> None:
         """
@@ -309,6 +313,7 @@ class Orchestrator:
         messages = self._build_messages(session, msg.content, system_state)
 
         # Get structured response from LLM
+        self._last_user_content = msg.content
         agent_response = await self._get_structured_response(messages)
 
         if not agent_response:
@@ -401,11 +406,23 @@ class Orchestrator:
                 for tc in response.tool_calls:
                     if tc.name == "respond":
                         return parse_tool_call(tc)
-                # Tool calls present but none named "respond"
+                # Tool calls present but none named "respond" — the model
+                # tried to invoke worker tools directly (common with weaker
+                # models).  Treat this as an implicit spawn_task intent so
+                # the request isn't silently dropped.
                 tool_names = [tc.name for tc in (response.tool_calls or [])]
-                logger.error(
-                    f"LLM returned tool calls but none named 'respond': {tool_names} | "
-                    f"content={response.content!r:.200} | finish_reason={response.finish_reason}"
+                logger.warning(
+                    f"LLM returned tool calls but none named 'respond': {tool_names} — "
+                    f"auto-wrapping as spawn_task"
+                )
+                return AgentResponse(
+                    message="On it — working on that now.",
+                    intent=Intent(
+                        action=IntentAction.SPAWN_TASK,
+                        task_description=self._last_user_content or "Execute the requested task",
+                        task_label="Requested task",
+                        complexity="moderate",
+                    ),
                 )
 
             # Fallback: LLM didn't use the tool, treat as pure chat
@@ -792,12 +809,23 @@ class Orchestrator:
             except Exception as e:
                 logger.error(f"Error in progress loop: {e}")
     
-    async def process_direct(self, content: str, session_key: str = "cli:direct") -> str:
-        """Process a message directly (for CLI usage)."""
+    async def process_direct(
+        self,
+        content: str,
+        session_key: str = "cli:direct",
+        channel: str = "cli",
+        chat_id: str = "direct",
+    ) -> str:
+        """Process a message directly (for CLI or cron usage).
+        
+        When called from cron with delivery enabled, pass the target
+        channel/chat_id so spawned background workers route their
+        completions to the correct destination instead of 'cli:direct'.
+        """
         msg = InboundMessage(
-            channel="cli",
+            channel=channel,
             sender_id="user",
-            chat_id="direct",
+            chat_id=chat_id,
             content=content,
         )
         

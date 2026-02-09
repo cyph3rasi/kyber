@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import platform
 import secrets
 import subprocess
@@ -279,8 +280,14 @@ def create_dashboard_app(config: Config) -> FastAPI:
         token = request.app.state.auth_token
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         url = _gateway_base() + path
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.request(method, url, headers=headers, json=json_body)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.request(method, url, headers=headers, json=json_body)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            return JSONResponse(
+                {"error": "Gateway is not running. Start it with: kyber gateway"},
+                status_code=502,
+            )
         # Pass through status and body
         try:
             data = resp.json()
@@ -468,5 +475,200 @@ def create_dashboard_app(config: Config) -> FastAPI:
                 {"error": str(e), "models": []},
                 status_code=502,
             )
+
+    # ── Cron Jobs API ──
+
+    def _cron_service():
+        from kyber.config.loader import get_data_dir
+        from kyber.cron.service import CronService
+        cfg = load_config()
+        store_path = get_data_dir() / "cron" / "jobs.json"
+        user_tz = cfg.agents.defaults.timezone or None
+        return CronService(store_path, timezone=user_tz)
+
+    def _job_to_dict(j) -> dict:
+        import time as _time
+        return {
+            "id": j.id,
+            "name": j.name,
+            "enabled": j.enabled,
+            "schedule": {
+                "kind": j.schedule.kind,
+                "atMs": j.schedule.at_ms,
+                "everyMs": j.schedule.every_ms,
+                "expr": j.schedule.expr,
+                "tz": j.schedule.tz,
+            },
+            "payload": {
+                "kind": j.payload.kind,
+                "message": j.payload.message,
+                "deliver": j.payload.deliver,
+                "channel": j.payload.channel,
+                "to": j.payload.to,
+            },
+            "state": {
+                "nextRunAtMs": j.state.next_run_at_ms,
+                "lastRunAtMs": j.state.last_run_at_ms,
+                "lastStatus": j.state.last_status,
+                "lastError": j.state.last_error,
+            },
+            "createdAtMs": j.created_at_ms,
+            "updatedAtMs": j.updated_at_ms,
+            "deleteAfterRun": j.delete_after_run,
+        }
+
+    @app.get("/api/cron/jobs", dependencies=[Depends(_require_token)])
+    async def list_cron_jobs() -> JSONResponse:
+        svc = _cron_service()
+        jobs = svc.list_jobs(include_disabled=True)
+        return JSONResponse({"jobs": [_job_to_dict(j) for j in jobs]})
+
+    @app.post("/api/cron/jobs", dependencies=[Depends(_require_token)])
+    async def create_cron_job(body: dict[str, Any]) -> JSONResponse:
+        from kyber.cron.types import CronSchedule
+        svc = _cron_service()
+        name = str(body.get("name", "") or "").strip()
+        message = str(body.get("message", "") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+        if not message:
+            raise HTTPException(status_code=400, detail="message is required")
+
+        sched_data = body.get("schedule", {})
+        kind = sched_data.get("kind", "every")
+        schedule = CronSchedule(
+            kind=kind,
+            at_ms=sched_data.get("atMs"),
+            every_ms=sched_data.get("everyMs"),
+            expr=sched_data.get("expr"),
+            tz=sched_data.get("tz"),
+        )
+
+        job = svc.add_job(
+            name=name,
+            schedule=schedule,
+            message=message,
+            deliver=bool(body.get("deliver", False)),
+            channel=body.get("channel") or None,
+            to=body.get("to") or None,
+            delete_after_run=bool(body.get("deleteAfterRun", False)),
+        )
+        return JSONResponse(_job_to_dict(job))
+
+    @app.put("/api/cron/jobs/{job_id}", dependencies=[Depends(_require_token)])
+    async def update_cron_job(job_id: str, body: dict[str, Any]) -> JSONResponse:
+        from kyber.cron.types import CronSchedule
+        svc = _cron_service()
+
+        kwargs: dict[str, Any] = {}
+        if "name" in body:
+            kwargs["name"] = str(body["name"]).strip()
+        if "message" in body:
+            kwargs["message"] = str(body["message"]).strip()
+        if "enabled" in body:
+            kwargs["enabled"] = bool(body["enabled"])
+        if "deliver" in body:
+            kwargs["deliver"] = bool(body["deliver"])
+        if "channel" in body:
+            kwargs["channel"] = body["channel"] or None
+        if "to" in body:
+            kwargs["to"] = body["to"] or None
+        if "deleteAfterRun" in body:
+            kwargs["delete_after_run"] = bool(body["deleteAfterRun"])
+        if "schedule" in body:
+            sd = body["schedule"]
+            kwargs["schedule"] = CronSchedule(
+                kind=sd.get("kind", "every"),
+                at_ms=sd.get("atMs"),
+                every_ms=sd.get("everyMs"),
+                expr=sd.get("expr"),
+                tz=sd.get("tz"),
+            )
+
+        job = svc.update_job(job_id, **kwargs)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return JSONResponse(_job_to_dict(job))
+
+    @app.delete("/api/cron/jobs/{job_id}", dependencies=[Depends(_require_token)])
+    async def delete_cron_job(job_id: str) -> JSONResponse:
+        svc = _cron_service()
+        if svc.remove_job(job_id):
+            return JSONResponse({"ok": True})
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    @app.post("/api/cron/jobs/{job_id}/toggle", dependencies=[Depends(_require_token)])
+    async def toggle_cron_job(job_id: str, body: dict[str, Any]) -> JSONResponse:
+        svc = _cron_service()
+        enabled = bool(body.get("enabled", True))
+        job = svc.enable_job(job_id, enabled=enabled)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return JSONResponse(_job_to_dict(job))
+
+    # ── Security Center API ──
+
+    def _security_reports_dir() -> Path:
+        return Path.home() / ".kyber" / "security" / "reports"
+
+    def _load_security_report(path: Path) -> dict[str, Any] | None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data
+        except Exception:
+            return None
+
+    @app.get("/api/security/reports", dependencies=[Depends(_require_token)])
+    async def list_security_reports(limit: int = Query(20, ge=1, le=100)) -> JSONResponse:
+        """List available security reports, newest first."""
+        reports_dir = _security_reports_dir()
+        if not reports_dir.exists():
+            return JSONResponse({"reports": [], "latest": None})
+
+        files = sorted(reports_dir.glob("report_*.json"), reverse=True)[:limit]
+        reports = []
+        for f in files:
+            data = _load_security_report(f)
+            if data:
+                reports.append({
+                    "filename": f.name,
+                    "timestamp": data.get("timestamp", ""),
+                    "summary": data.get("summary", {}),
+                })
+
+        latest = None
+        if files:
+            latest = _load_security_report(files[0])
+
+        return JSONResponse({"reports": reports, "latest": latest})
+
+    @app.get("/api/security/reports/{filename}", dependencies=[Depends(_require_token)])
+    async def get_security_report(filename: str) -> JSONResponse:
+        """Get a specific security report by filename."""
+        # Sanitize filename to prevent path traversal
+        safe_name = Path(filename).name
+        if not safe_name.startswith("report_") or not safe_name.endswith(".json"):
+            raise HTTPException(status_code=400, detail="Invalid report filename")
+
+        report_path = _security_reports_dir() / safe_name
+        if not report_path.exists():
+            raise HTTPException(status_code=404, detail="Report not found")
+
+        data = _load_security_report(report_path)
+        if not data:
+            raise HTTPException(status_code=500, detail="Failed to parse report")
+        return JSONResponse(data)
+
+    @app.post("/api/security/scan", dependencies=[Depends(_require_token)])
+    async def trigger_security_scan(request: Request) -> JSONResponse:
+        """Trigger an immediate security scan via the gateway agent."""
+        scan_message = (
+            "Perform a full security scan of this environment now. "
+            "Use the security-scan skill instructions. "
+            "Check all categories: network, ssh, permissions, secrets, software, "
+            "processes, firewall, docker, git, and kyber config. "
+            "Write the structured JSON report to ~/.kyber/security/reports/."
+        )
+        return await _proxy_gateway(request, "POST", "/agent/turn", json_body={"message": scan_message})
 
     return app

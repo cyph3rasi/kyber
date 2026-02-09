@@ -346,6 +346,7 @@ class Config(BaseSettings):
             "model": self.get_model(),
         }
 
-    class Config:
-        env_prefix = "KYBER_"
-        env_nested_delimiter = "__"
+    model_config = {
+        "env_prefix": "KYBER_",
+        "env_nested_delimiter": "__",
+    }

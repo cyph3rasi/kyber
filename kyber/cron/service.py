@@ -343,6 +343,49 @@ class CronService:
                 return job
         return None
     
+    def update_job(
+        self,
+        job_id: str,
+        name: str | None = None,
+        schedule: CronSchedule | None = None,
+        message: str | None = None,
+        enabled: bool | None = None,
+        deliver: bool | None = None,
+        channel: str | None = None,
+        to: str | None = None,
+        delete_after_run: bool | None = None,
+    ) -> CronJob | None:
+        """Update an existing job's fields."""
+        store = self._load_store()
+        for job in store.jobs:
+            if job.id == job_id:
+                if name is not None:
+                    job.name = name
+                if schedule is not None:
+                    job.schedule = schedule
+                if message is not None:
+                    job.payload.message = message
+                if enabled is not None:
+                    job.enabled = enabled
+                if deliver is not None:
+                    job.payload.deliver = deliver
+                if channel is not None:
+                    job.payload.channel = channel or None
+                if to is not None:
+                    job.payload.to = to or None
+                if delete_after_run is not None:
+                    job.delete_after_run = delete_after_run
+                job.updated_at_ms = _now_ms()
+                if job.enabled:
+                    job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms(), self.timezone)
+                else:
+                    job.state.next_run_at_ms = None
+                self._save_store()
+                self._arm_timer()
+                logger.info(f"Cron: updated job '{job.name}' ({job.id})")
+                return job
+        return None
+    
     async def run_job(self, job_id: str, force: bool = False) -> bool:
         """Manually run a job."""
         store = self._load_store()

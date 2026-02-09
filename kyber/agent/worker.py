@@ -44,6 +44,7 @@ class Worker:
         model: str | None = None,
         brave_api_key: str | None = None,
         exec_timeout: int = 60,
+        timezone: str | None = None,
     ):
         self.task = task
         self.provider = provider
@@ -54,6 +55,7 @@ class Worker:
         self.model = model or provider.get_default_model()
         self.brave_api_key = brave_api_key
         self.exec_timeout = exec_timeout
+        self.timezone = timezone
 
         self.tools = self._build_tools()
     
@@ -74,6 +76,8 @@ class Worker:
     
     def _build_system_prompt(self) -> str:
         """Build system prompt that embodies the bot's persona while executing tasks."""
+        from kyber.utils.helpers import current_datetime_str
+
         # Workers run without the orchestrator's "intent" wrapper, so we include
         # user/workspace bootstrap + skills here (but NOT the orchestrator's tool-policy rules).
         bootstrap_files = ["AGENTS.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
@@ -105,6 +109,9 @@ class Worker:
                 skills_block += f"### Available Skills\n\n{skills_summary}\n"
 
         return f"""{self.persona_prompt}
+
+    ## Current Time
+    {current_datetime_str(self.timezone)}
 
     ## Your Current Task
     {self.task.description}
@@ -452,6 +459,7 @@ class WorkerPool:
         model: str | None = None,
         brave_api_key: str | None = None,
         max_concurrent: int = 5,
+        timezone: str | None = None,
     ):
         self.provider = provider
         self.workspace = workspace
@@ -460,6 +468,7 @@ class WorkerPool:
         self.model = model
         self.brave_api_key = brave_api_key
         self.max_concurrent = max_concurrent
+        self.timezone = timezone
 
         self.completion_queue: asyncio.Queue[Task] = asyncio.Queue()
         self._running: dict[str, asyncio.Task] = {}
@@ -475,6 +484,7 @@ class WorkerPool:
             persona_prompt=self.persona_prompt,
             model=self.model,
             brave_api_key=self.brave_api_key,
+            timezone=self.timezone,
         )
 
         async_task = asyncio.create_task(worker.run())
@@ -513,6 +523,7 @@ class WorkerPool:
             persona_prompt=self.persona_prompt,
             model=self.model,
             brave_api_key=self.brave_api_key,
+            timezone=self.timezone,
         )
         await worker.run()
         return task

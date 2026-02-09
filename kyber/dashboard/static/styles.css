@@ -800,3 +800,379 @@ body {
   .field-label { width: auto; }
   .app { flex-direction: column; }
 }
+
+/* ── Security Center ── */
+.security-empty {
+  text-align: center;
+  padding: 64px 24px;
+  color: var(--text-secondary);
+}
+
+.security-empty-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.security-empty h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.security-empty p {
+  font-size: 13px;
+  max-width: 400px;
+  margin: 0 auto;
+  line-height: 1.5;
+}
+
+/* Score ring */
+.security-score-row {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  padding: 8px 0;
+}
+
+.security-score-ring {
+  position: relative;
+  width: 120px;
+  height: 120px;
+  flex-shrink: 0;
+}
+
+.security-score-svg {
+  width: 100%;
+  height: 100%;
+}
+
+.security-score-value {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.security-score-num {
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.03em;
+}
+
+.security-score-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+  font-weight: 500;
+}
+
+.security-score-details {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.security-score-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.security-score-meta {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.security-severity-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.severity-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  letter-spacing: 0.01em;
+}
+
+.severity-pill.critical {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--red);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+.severity-pill.high {
+  background: rgba(249, 115, 22, 0.12);
+  color: #f97316;
+  border: 1px solid rgba(249, 115, 22, 0.25);
+}
+
+.severity-pill.medium {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--amber);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+}
+
+.severity-pill.low {
+  background: rgba(136, 136, 136, 0.1);
+  color: var(--text-tertiary);
+  border: 1px solid var(--border);
+}
+
+.severity-pill.pass {
+  background: rgba(34, 197, 94, 0.1);
+  color: var(--green);
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+
+/* Categories grid */
+.security-cat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+}
+
+.security-cat-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.security-cat-item:nth-last-child(-n+2) {
+  border-bottom: none;
+}
+
+.security-cat-item:nth-child(odd) {
+  border-right: 1px solid var(--border);
+}
+
+.security-cat-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.security-cat-name {
+  color: var(--text);
+  font-weight: 500;
+  flex: 1;
+}
+
+.security-cat-count {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+/* Findings */
+.security-finding {
+  border-bottom: 1px solid var(--border);
+}
+
+.security-finding:last-child {
+  border-bottom: none;
+}
+
+.security-finding-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text);
+  list-style: none;
+}
+
+.security-finding-summary::-webkit-details-marker { display: none; }
+
+.security-finding-sev {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 4px;
+  color: #fff;
+  letter-spacing: 0.03em;
+  flex-shrink: 0;
+  min-width: 64px;
+  text-align: center;
+}
+
+.security-finding-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.security-finding-title {
+  flex: 1;
+  font-weight: 500;
+}
+
+.security-finding-body {
+  padding: 0 20px 16px 20px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.security-finding-fix {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(34, 197, 94, 0.06);
+  border: 1px solid rgba(34, 197, 94, 0.15);
+  border-radius: var(--radius);
+  font-size: 12px;
+}
+
+.security-finding-evidence {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow: auto;
+}
+
+/* AI Notes */
+.security-notes {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+/* History */
+.security-hist-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.security-hist-row:last-child {
+  border-bottom: none;
+}
+
+.security-hist-score {
+  font-weight: 700;
+  font-size: 15px;
+  min-width: 32px;
+  text-align: center;
+}
+
+.security-hist-date {
+  flex: 1;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.security-hist-counts {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--mono);
+}
+
+@media (max-width: 768px) {
+  .security-score-row { flex-direction: column; align-items: center; text-align: center; }
+  .security-cat-grid { grid-template-columns: 1fr; }
+  .security-cat-item:nth-child(odd) { border-right: none; }
+}
+
+/* ── Security scan in-progress banner ── */
+.security-progress {
+  margin-bottom: 16px;
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  border-radius: var(--radius-lg);
+  background: rgba(59, 130, 246, 0.06);
+  overflow: hidden;
+}
+
+.security-progress-inner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 20px;
+}
+
+.security-progress-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2.5px solid rgba(59, 130, 246, 0.2);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: secSpin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes secSpin {
+  to { transform: rotate(360deg); }
+}
+
+.security-progress-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.security-progress-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--blue);
+}
+
+.security-progress-detail {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.security-progress-elapsed {
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+
+.btn-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* Finding chevron */
+.security-finding-chevron {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  transition: transform var(--transition);
+}
+
+.security-finding[open] .security-finding-chevron {
+  transform: rotate(90deg);
+}

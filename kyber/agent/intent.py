@@ -128,11 +128,26 @@ def parse_tool_call(tool_call: Any) -> AgentResponse:
     if hasattr(tool_call, 'arguments'):
         args = tool_call.arguments
         if isinstance(args, str):
-            args = json.loads(args)
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                args = {}
     else:
         args = tool_call
 
+    # Guard: if args is still not a dict after parsing, wrap it
+    if not isinstance(args, dict):
+        args = {}
+
     intent_data = args.get("intent", {})
+    if isinstance(intent_data, str):
+        try:
+            intent_data = json.loads(intent_data)
+        except (json.JSONDecodeError, ValueError):
+            intent_data = {}
+    if not isinstance(intent_data, dict):
+        intent_data = {}
+
     intent = Intent(
         action=IntentAction(intent_data.get("action", "none")),
         task_description=intent_data.get("task_description"),
