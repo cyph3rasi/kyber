@@ -7,6 +7,8 @@ import litellm
 from litellm import acompletion
 from loguru import logger
 
+litellm.drop_params = True
+
 from kyber.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
@@ -113,6 +115,14 @@ class LiteLLMProvider(LLMProvider):
                 and not model.startswith("openrouter/")
             ):
                 model = f"groq/{model}"
+
+            # For OpenAI, ensure openai/ prefix.
+            if (
+                self.provider_name == "openai"
+                and not model.startswith("openai/")
+                and not model.startswith("openrouter/")
+            ):
+                model = f"openai/{model}"
 
             # For Anthropic, ensure anthropic/ prefix.
             if (

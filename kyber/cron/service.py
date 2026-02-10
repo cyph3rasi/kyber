@@ -32,16 +32,24 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int, tz_name: str | None =
             from croniter import croniter
             from datetime import datetime, timezone
 
-            # Use per-job tz, then global user tz, then system local time
+            # Use per-job tz, then global user tz, then detected system tz
             effective_tz = schedule.tz or tz_name
+            tz = None
             if effective_tz:
                 try:
                     import zoneinfo
                     tz = zoneinfo.ZoneInfo(effective_tz)
                 except Exception:
-                    tz = None
-            else:
-                tz = None
+                    pass
+
+            # Fallback: detect system local timezone so cron expressions
+            # resolve in local time even when the system clock is UTC.
+            if tz is None:
+                try:
+                    from datetime import timezone as _tz
+                    tz = datetime.now(_tz.utc).astimezone().tzinfo
+                except Exception:
+                    pass
 
             if tz:
                 now_dt = datetime.now(tz)
@@ -283,13 +291,20 @@ class CronService:
         channel: str | None = None,
         to: str | None = None,
         delete_after_run: bool = False,
+        job_id: str | None = None,
     ) -> CronJob:
-        """Add a new job."""
+        """Add a new job. If job_id is provided and already exists, return the existing job."""
         store = self._load_store()
         now = _now_ms()
-        
+
+        # If a fixed ID was requested, check for duplicates
+        if job_id:
+            for existing in store.jobs:
+                if existing.id == job_id:
+                    return existing
+
         job = CronJob(
-            id=str(uuid.uuid4())[:8],
+            id=job_id or str(uuid.uuid4())[:8],
             name=name,
             enabled=True,
             schedule=schedule,
@@ -305,11 +320,11 @@ class CronService:
             updated_at_ms=now,
             delete_after_run=delete_after_run,
         )
-        
+
         store.jobs.append(job)
         self._save_store()
         self._arm_timer()
-        
+
         logger.info(f"Cron: added job '{name}' ({job.id})")
         return job
     

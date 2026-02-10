@@ -292,6 +292,7 @@ def _create_orchestrator(
         task_provider=task_provider,
         task_model=task_model,
         timezone=config.agents.defaults.timezone or None,
+        exec_timeout=config.tools.exec.timeout,
     )
 
 
@@ -367,6 +368,21 @@ def gateway(
     # Create cron service
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
+        # Special case: background ClamAV scan runs directly without the agent
+        if "clamscan" in job.name.lower() or "clamav" in job.name.lower() or "clamscan" in job.payload.message.lower():
+            import asyncio
+            from kyber.security.clamscan import run_clamscan
+            loop = asyncio.get_event_loop()
+            report = await loop.run_in_executor(None, run_clamscan)
+            status = report.get("status", "error")
+            count = len(report.get("infected_files", []))
+            if status == "clean":
+                return "ClamAV scan complete — no threats detected."
+            elif status == "threats_found":
+                return f"ClamAV scan complete — {count} threat(s) detected! Check the Security Center."
+            else:
+                return f"ClamAV scan error: {report.get('error', 'unknown')}"
+
         # When the job has delivery configured, route through that channel
         # so spawned background workers send completions to the right place.
         channel = "cli"
@@ -396,7 +412,10 @@ def gateway(
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     user_tz = config.agents.defaults.timezone or None
     cron = CronService(cron_store_path, on_job=on_cron_job, timezone=user_tz)
-    
+
+    # Auto-register daily ClamAV scan if ClamAV is installed
+    _ensure_clamscan_cron(cron)
+
     # Create heartbeat service
     async def on_heartbeat(prompt: str) -> str:
         """Execute heartbeat through the agent."""
@@ -719,7 +738,7 @@ def _get_bridge_dir() -> Path:
     
     if not source:
         console.print("[red]Bridge source not found.[/red]")
-        console.print("Try reinstalling: pip install --force-reinstall kyber")
+        console.print("Try reinstalling: uv tool install --force kyber-chat")
         raise typer.Exit(1)
     
     console.print(f"{__logo__} Setting up bridge...")
@@ -1009,148 +1028,142 @@ def restart_dashboard():
 
 
 # ============================================================================
+# Skill Scanner Setup
+# ============================================================================
+
+
+@app.command("setup-skillscanner")
+def setup_skillscanner():
+    """Install the Cisco AI Defense skill-scanner for skill security scanning."""
+    import shutil
+    import subprocess as sp
+
+    if shutil.which("skill-scanner"):
+        console.print(f"[green]✓[/green] skill-scanner is already installed: {shutil.which('skill-scanner')}")
+        result = sp.run(["skill-scanner", "--version"], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            console.print(f"  [dim]Version: {result.stdout.strip()}[/dim]")
+        return
+
+    if not shutil.which("uv"):
+        console.print("[red]✗[/red] uv is not installed. Install it from https://docs.astral.sh/uv/getting-started/installation/")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Setting up Cisco AI Defense skill-scanner...\n")
+
+    console.print("[cyan]Installing cisco-ai-skill-scanner via uv...[/cyan]")
+    result = sp.run(
+        ["uv", "tool", "install", "cisco-ai-skill-scanner"],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        console.print(f"[red]✗[/red] Installation failed:\n{stderr[:500]}")
+        raise typer.Exit(1)
+
+    if shutil.which("skill-scanner"):
+        console.print(f"[green]✓[/green] skill-scanner installed: {shutil.which('skill-scanner')}")
+    else:
+        console.print("[green]✓[/green] Package installed (skill-scanner may require a shell restart to appear in PATH)")
+
+    console.print(f"\n{__logo__} Skill scanner is ready! The security scan will now include skill security checks.")
+
+
+# ============================================================================
 # ClamAV Setup
 # ============================================================================
 
 
 @app.command("setup-clamav")
 def setup_clamav():
-    """Install and configure ClamAV for malware scanning."""
+    """Install and configure ClamAV as a proper system daemon.
+
+    Sets up both clamd (scan daemon) and freshclam (signature updater) as
+    system services. Idempotent — re-running fixes broken installs.
+    """
     import shutil
     import subprocess as sp
 
     system = platform.system()
 
-    # Check if already installed
-    if shutil.which("clamscan"):
-        console.print(f"[green]✓[/green] ClamAV is already installed: {shutil.which('clamscan')}")
-
-        # Verify freshclam config is valid (fix if needed)
-        _ensure_freshclam_config(system)
-
-        # Offer to update signatures
-        if typer.confirm("Update virus signature database now?", default=True):
-            _run_freshclam()
-        return
-
     console.print(f"{__logo__} Setting up ClamAV malware scanner...\n")
 
-    if system == "Darwin":
-        if not shutil.which("brew"):
-            console.print("[red]✗[/red] Homebrew not found. Install it from https://brew.sh then re-run this command.")
-            raise typer.Exit(1)
-
-        console.print("[cyan]Installing ClamAV via Homebrew...[/cyan]")
-        result = sp.run(["brew", "install", "clamav"], capture_output=True, text=True)
-        if result.returncode != 0:
-            console.print(f"[red]✗[/red] brew install failed:\n{result.stderr}")
-            raise typer.Exit(1)
-        console.print("[green]✓[/green] ClamAV installed")
-
-        # Configure freshclam
-        prefix_result = sp.run(["brew", "--prefix"], capture_output=True, text=True)
-        brew_prefix = prefix_result.stdout.strip() or "/usr/local"
-        conf_dir = Path(brew_prefix) / "etc" / "clamav"
-        db_dir = Path(brew_prefix) / "share" / "clamav"
-        sample = conf_dir / "freshclam.conf.sample"
-        conf = conf_dir / "freshclam.conf"
-
-        console.print("[cyan]Configuring freshclam...[/cyan]")
-
-        # Ensure the database directory exists
-        db_dir.mkdir(parents=True, exist_ok=True)
-
-        # Build config: start from sample (or existing broken conf), then
-        # - comment out the "Example" directive (required)
-        # - ensure DatabaseDirectory points to the Homebrew share path
-        source = conf if conf.exists() else sample
-        if not source.exists():
-            console.print(f"[red]✗[/red] Neither {sample} nor {conf} found — ClamAV may not have installed correctly.")
-            raise typer.Exit(1)
-
-        lines = source.read_text().splitlines()
-        db_dir_set = False
-        new_lines: list[str] = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped == "Example":
-                new_lines.append("# Example")
-                continue
-            # Replace any existing DatabaseDirectory with the correct path
-            if stripped.startswith("DatabaseDirectory") and not stripped.startswith("#"):
-                new_lines.append(f"DatabaseDirectory {db_dir}")
-                db_dir_set = True
-                continue
-            # Uncomment a commented-out DatabaseDirectory and set it
-            if stripped.startswith("#") and "DatabaseDirectory" in stripped and not db_dir_set:
-                new_lines.append(f"DatabaseDirectory {db_dir}")
-                db_dir_set = True
-                continue
-            new_lines.append(line)
-
-        # If DatabaseDirectory was never in the file, add it
-        if not db_dir_set:
-            new_lines.append(f"DatabaseDirectory {db_dir}")
-
-        conf.write_text("\n".join(new_lines) + "\n")
-        console.print(f"[green]✓[/green] Configured {conf}")
-        console.print(f"[green]✓[/green] Database directory: {db_dir}")
-
-    elif system == "Linux":
-        # Detect package manager
-        if shutil.which("apt"):
-            console.print("[cyan]Installing ClamAV via apt...[/cyan]")
-            result = sp.run(["sudo", "apt", "install", "-y", "clamav"], capture_output=True, text=True)
-        elif shutil.which("dnf"):
-            console.print("[cyan]Installing ClamAV via dnf...[/cyan]")
-            result = sp.run(["sudo", "dnf", "install", "-y", "clamav", "clamav-update"], capture_output=True, text=True)
-        elif shutil.which("zypper"):
-            console.print("[cyan]Installing ClamAV via zypper...[/cyan]")
-            result = sp.run(["sudo", "zypper", "install", "-y", "clamav"], capture_output=True, text=True)
-        elif shutil.which("pacman"):
-            console.print("[cyan]Installing ClamAV via pacman...[/cyan]")
-            result = sp.run(["sudo", "pacman", "-S", "--noconfirm", "clamav"], capture_output=True, text=True)
+    # ── Step 1: Install ClamAV if not present ──
+    if not shutil.which("clamscan"):
+        if system == "Darwin":
+            if not shutil.which("brew"):
+                console.print("[red]✗[/red] Homebrew not found. Install from https://brew.sh")
+                raise typer.Exit(1)
+            console.print("[cyan]Installing ClamAV via Homebrew...[/cyan]")
+            result = sp.run(["brew", "install", "clamav"], capture_output=True, text=True)
+            if result.returncode != 0:
+                console.print(f"[red]✗[/red] brew install failed:\n{result.stderr}")
+                raise typer.Exit(1)
+            console.print("[green]✓[/green] ClamAV installed")
+        elif system == "Linux":
+            pkg_cmd = None
+            if shutil.which("apt"):
+                pkg_cmd = ["sudo", "apt", "install", "-y", "clamav", "clamav-daemon"]
+            elif shutil.which("dnf"):
+                pkg_cmd = ["sudo", "dnf", "install", "-y", "clamav", "clamav-update", "clamd"]
+            elif shutil.which("zypper"):
+                pkg_cmd = ["sudo", "zypper", "install", "-y", "clamav"]
+            elif shutil.which("pacman"):
+                pkg_cmd = ["sudo", "pacman", "-S", "--noconfirm", "clamav"]
+            else:
+                console.print("[red]✗[/red] No supported package manager (apt, dnf, zypper, pacman).")
+                raise typer.Exit(1)
+            console.print(f"[cyan]Installing ClamAV...[/cyan]")
+            result = sp.run(pkg_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                console.print(f"[red]✗[/red] Install failed:\n{result.stderr}")
+                raise typer.Exit(1)
+            console.print("[green]✓[/green] ClamAV installed")
         else:
-            console.print("[red]✗[/red] No supported package manager found (apt, dnf, zypper, pacman).")
-            console.print("Install ClamAV manually: https://docs.clamav.net/manual/Installing/Packages.html")
+            console.print(f"[red]✗[/red] Unsupported platform: {system}")
             raise typer.Exit(1)
-
-        if result.returncode != 0:
-            console.print(f"[red]✗[/red] Install failed:\n{result.stderr}")
-            raise typer.Exit(1)
-        console.print("[green]✓[/green] ClamAV installed")
-
-        # Linux packages usually come pre-configured, but verify the
-        # freshclam config has the Example line commented out.
-        for conf_path in [Path("/etc/clamav/freshclam.conf"), Path("/etc/freshclam.conf")]:
-            if conf_path.exists():
-                lines = conf_path.read_text().splitlines()
-                if any(line.strip() == "Example" for line in lines):
-                    console.print(f"[cyan]Fixing {conf_path}...[/cyan]")
-                    fixed = [("# Example" if line.strip() == "Example" else line) for line in lines]
-                    sp.run(
-                        ["sudo", "tee", str(conf_path)],
-                        input="\n".join(fixed) + "\n",
-                        capture_output=True, text=True,
-                    )
-                    console.print(f"[green]✓[/green] Configured {conf_path}")
-                break
-
     else:
-        console.print(f"[red]✗[/red] Unsupported platform: {system}")
-        console.print("Install ClamAV manually: https://docs.clamav.net/manual/Installing/Packages.html")
-        raise typer.Exit(1)
+        console.print(f"[green]✓[/green] ClamAV already installed: {shutil.which('clamscan')}")
 
-    # Update virus signatures
-    _run_freshclam()
+    # ── Step 2: Configure freshclam + clamd ──
+    _ensure_freshclam_config(system)
+    _ensure_clamd_config(system)
 
-    console.print(f"\n{__logo__} ClamAV is ready! The security scan will now include malware detection.")
+    # ── Step 3: Stop standalone freshclam (conflicts with service) ──
+    if system == "Linux":
+        sp.run(["sudo", "systemctl", "stop", "clamav-freshclam"], capture_output=True, text=True)
+
+    # ── Step 4: Initial signature download if needed ──
+    db_dir = _find_clamav_db_dir()
+    needs_sigs = True
+    if db_dir and db_dir.is_dir():
+        db_files = [f for f in db_dir.iterdir() if f.suffix in (".cvd", ".cld")]
+        if db_files:
+            needs_sigs = False
+            console.print(f"[green]✓[/green] Signatures: {', '.join(f.name for f in sorted(db_files))}")
+    if needs_sigs:
+        console.print("[cyan]Downloading virus signatures (this may take a minute)...[/cyan]")
+        _run_freshclam_once(system)
+
+    # ── Step 5: Enable and start services ──
+    if system == "Linux":
+        _setup_linux_clamav_services()
+    elif system == "Darwin":
+        _setup_macos_clamav_services()
+
+    # ── Step 6: Verify ──
+    console.print("")
+    _verify_clamav_setup(system)
+    console.print(f"\n{__logo__} ClamAV is ready! Scans will use the clamd daemon for fast malware detection.")
+    console.print("[dim]Run [cyan]kyber clamscan --schedule[/cyan] to set up a daily background scan.[/dim]")
 
 
 def _ensure_freshclam_config(system: str):
-    """Ensure freshclam.conf is properly configured for the platform."""
-    import shutil
+    """Ensure freshclam.conf is properly configured."""
     import subprocess as sp
+
+    console.print("[cyan]Configuring freshclam...[/cyan]")
 
     if system == "Darwin":
         prefix_result = sp.run(["brew", "--prefix"], capture_output=True, text=True)
@@ -1161,22 +1174,11 @@ def _ensure_freshclam_config(system: str):
 
         source = conf if conf.exists() else sample
         if not source.exists():
-            return  # Nothing to fix
-
-        db_dir.mkdir(parents=True, exist_ok=True)
-
-        lines = source.read_text().splitlines()
-        needs_fix = any(line.strip() == "Example" for line in lines)
-        has_correct_db = any(
-            line.strip() == f"DatabaseDirectory {db_dir}"
-            for line in lines
-            if not line.strip().startswith("#")
-        )
-
-        if not needs_fix and has_correct_db:
+            console.print(f"  [dim]No freshclam config found[/dim]")
             return
 
-        console.print("[cyan]Fixing freshclam config...[/cyan]")
+        db_dir.mkdir(parents=True, exist_ok=True)
+        lines = source.read_text().splitlines()
         db_dir_set = False
         new_lines: list[str] = []
         for line in lines:
@@ -1196,71 +1198,225 @@ def _ensure_freshclam_config(system: str):
         if not db_dir_set:
             new_lines.append(f"DatabaseDirectory {db_dir}")
         conf.write_text("\n".join(new_lines) + "\n")
-        console.print(f"[green]✓[/green] Fixed {conf}")
+        console.print(f"  [green]✓[/green] {conf}")
 
     elif system == "Linux":
         for conf_path in [Path("/etc/clamav/freshclam.conf"), Path("/etc/freshclam.conf")]:
             if conf_path.exists():
                 lines = conf_path.read_text().splitlines()
                 if any(line.strip() == "Example" for line in lines):
-                    console.print(f"[cyan]Fixing {conf_path}...[/cyan]")
                     fixed = [("# Example" if line.strip() == "Example" else line) for line in lines]
                     sp.run(
                         ["sudo", "tee", str(conf_path)],
                         input="\n".join(fixed) + "\n",
                         capture_output=True, text=True,
                     )
-                    console.print(f"[green]✓[/green] Fixed {conf_path}")
+                console.print(f"  [green]✓[/green] {conf_path}")
                 break
 
 
-def _run_freshclam():
-    """Run freshclam to update virus signature database."""
+def _ensure_clamd_config(system: str):
+    """Ensure clamd.conf is configured with a local socket."""
+    import subprocess as sp
+
+    console.print("[cyan]Configuring clamd...[/cyan]")
+
+    if system == "Darwin":
+        prefix_result = sp.run(["brew", "--prefix"], capture_output=True, text=True)
+        brew_prefix = prefix_result.stdout.strip() or "/usr/local"
+        conf = Path(brew_prefix) / "etc" / "clamav" / "clamd.conf"
+        sample = Path(brew_prefix) / "etc" / "clamav" / "clamd.conf.sample"
+        db_dir = Path(brew_prefix) / "share" / "clamav"
+        socket_path = Path(brew_prefix) / "var" / "run" / "clamav" / "clamd.sock"
+
+        source = conf if conf.exists() else sample
+        if not source.exists():
+            socket_path.parent.mkdir(parents=True, exist_ok=True)
+            conf.write_text(
+                f"# Kyber-managed clamd config\n"
+                f"LocalSocket {socket_path}\n"
+                f"DatabaseDirectory {db_dir}\n"
+            )
+            console.print(f"  [green]✓[/green] Created {conf}")
+            return
+
+        lines = source.read_text().splitlines()
+        has_socket = False
+        db_dir_set = False
+        new_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped == "Example":
+                new_lines.append("# Example")
+                continue
+            if stripped.startswith("LocalSocket") and not stripped.startswith("#"):
+                has_socket = True
+            if stripped.startswith("DatabaseDirectory") and not stripped.startswith("#"):
+                new_lines.append(f"DatabaseDirectory {db_dir}")
+                db_dir_set = True
+                continue
+            new_lines.append(line)
+        if not has_socket:
+            socket_path.parent.mkdir(parents=True, exist_ok=True)
+            new_lines.append(f"LocalSocket {socket_path}")
+        if not db_dir_set:
+            new_lines.append(f"DatabaseDirectory {db_dir}")
+        conf.write_text("\n".join(new_lines) + "\n")
+        console.print(f"  [green]✓[/green] {conf}")
+
+    elif system == "Linux":
+        for conf_path in [Path("/etc/clamav/clamd.conf"), Path("/etc/clamd.conf"), Path("/etc/clamd.d/scan.conf")]:
+            if conf_path.exists():
+                lines = conf_path.read_text().splitlines()
+                needs_write = False
+                new_lines_l: list[str] = []
+                has_socket = False
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped == "Example":
+                        new_lines_l.append("# Example")
+                        needs_write = True
+                        continue
+                    if "LocalSocket" in stripped and not stripped.startswith("#"):
+                        has_socket = True
+                    new_lines_l.append(line)
+                if not has_socket:
+                    new_lines_l.append("LocalSocket /var/run/clamav/clamd.ctl")
+                    needs_write = True
+                if needs_write:
+                    sp.run(
+                        ["sudo", "tee", str(conf_path)],
+                        input="\n".join(new_lines_l) + "\n",
+                        capture_output=True, text=True,
+                    )
+                console.print(f"  [green]✓[/green] {conf_path}")
+                return
+
+        # No config found — create one
+        debian_conf = Path("/etc/clamav/clamd.conf")
+        sp.run(
+            ["sudo", "tee", str(debian_conf)],
+            input=(
+                "# Kyber-managed clamd config\n"
+                "LocalSocket /var/run/clamav/clamd.ctl\n"
+                "DatabaseDirectory /var/lib/clamav\n"
+                "User clamav\n"
+            ),
+            capture_output=True, text=True,
+        )
+        console.print(f"  [green]✓[/green] Created {debian_conf}")
+
+
+def _run_freshclam_once(system: str):
+    """Run freshclam once to download initial signatures."""
     import shutil
     import subprocess as sp
 
     freshclam = shutil.which("freshclam")
     if not freshclam:
-        console.print("[yellow]⚠  freshclam not found — virus signatures not updated[/yellow]")
+        console.print("[yellow]⚠  freshclam not found[/yellow]")
         return
 
-    console.print("[cyan]Updating virus signature database (this may take a minute)...[/cyan]")
-    # Run freshclam with output visible so the user can see download progress.
-    # Try without sudo first (works on macOS / user installs).
-    result = sp.run([freshclam, "--stdout"], capture_output=True, text=True, timeout=300)
-    if result.returncode != 0 and "Can't create" in (result.stderr or ""):
-        # Permission issue — retry with sudo on Linux
-        result = sp.run(["sudo", freshclam, "--stdout"], capture_output=True, text=True, timeout=300)
+    if system == "Linux":
+        result = sp.run(
+            ["sudo", freshclam, "--stdout", "--log=/dev/null"],
+            capture_output=True, text=True, timeout=300,
+        )
+    else:
+        result = sp.run(
+            [freshclam, "--stdout", "--log=/dev/null"],
+            capture_output=True, text=True, timeout=300,
+        )
 
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
-    output = stdout or stderr
-
+    output = (result.stdout or result.stderr or "").strip()
     if result.returncode == 0:
-        # Show what freshclam actually did
         if "up to date" in output.lower():
             console.print("[green]✓[/green] Virus signatures already up to date")
         else:
-            console.print("[green]✓[/green] Virus signatures updated")
-        # Print summary lines (download info, signature counts)
-        for line in output.splitlines():
-            line = line.strip()
-            if any(kw in line.lower() for kw in ["downloading", "updated", "signatures", "main.c", "daily.c", "bytecode.c"]):
-                console.print(f"  [dim]{line}[/dim]")
+            console.print("[green]✓[/green] Virus signatures downloaded")
     else:
-        console.print(f"[yellow]⚠  freshclam returned warnings:[/yellow]\n{output[:500]}")
+        preview = "\n".join(output.splitlines()[:5]) if output else "(no output)"
+        console.print(f"[yellow]⚠  freshclam warnings:[/yellow]\n  {preview}")
 
-    # Verify databases actually exist
-    db_paths = _find_clamav_db_dir()
-    if db_paths:
-        db_files = [f.name for f in db_paths.iterdir() if f.suffix in (".cvd", ".cld")]
-        if db_files:
-            console.print(f"  [dim]Database files: {', '.join(sorted(db_files))}[/dim]")
-        else:
-            console.print("[yellow]⚠  No signature database files found — scans will not work[/yellow]")
-            console.print(f"  Checked: {db_paths}")
+
+def _setup_linux_clamav_services():
+    """Enable and start ClamAV systemd services."""
+    import subprocess as sp
+
+    console.print("[cyan]Enabling ClamAV services...[/cyan]")
+
+    for svc_name in ["clamav-freshclam", "freshclam"]:
+        result = sp.run(["sudo", "systemctl", "enable", svc_name], capture_output=True, text=True)
+        if result.returncode == 0:
+            sp.run(["sudo", "systemctl", "start", svc_name], capture_output=True, text=True)
+            console.print(f"  [green]✓[/green] {svc_name} enabled and started")
+            break
     else:
-        console.print("[yellow]⚠  Could not locate ClamAV database directory[/yellow]")
+        console.print("  [yellow]⚠[/yellow] Could not enable freshclam service")
+
+    for svc_name in ["clamav-daemon", "clamd@scan", "clamd"]:
+        result = sp.run(["sudo", "systemctl", "enable", svc_name], capture_output=True, text=True)
+        if result.returncode == 0:
+            sp.run(["sudo", "systemctl", "start", svc_name], capture_output=True, text=True)
+            console.print(f"  [green]✓[/green] {svc_name} enabled and started")
+            break
+    else:
+        console.print("  [yellow]⚠[/yellow] Could not enable clamd service")
+
+
+def _setup_macos_clamav_services():
+    """Start ClamAV services on macOS via Homebrew."""
+    import subprocess as sp
+
+    console.print("[cyan]Starting ClamAV services...[/cyan]")
+    result = sp.run(["brew", "services", "start", "clamav"], capture_output=True, text=True)
+    if result.returncode == 0:
+        console.print("  [green]✓[/green] ClamAV services started via Homebrew")
+    else:
+        console.print("  [yellow]⚠[/yellow] Could not auto-start. Run: brew services start clamav")
+
+
+def _verify_clamav_setup(system: str):
+    """Verify ClamAV daemon is running and responsive."""
+    import shutil
+    import subprocess as sp
+
+    console.print("[cyan]Verifying setup...[/cyan]")
+
+    db_dir = _find_clamav_db_dir()
+    if db_dir:
+        db_files = [f.name for f in db_dir.iterdir() if f.suffix in (".cvd", ".cld")]
+        if db_files:
+            console.print(f"  [green]✓[/green] Signatures: {', '.join(sorted(db_files))}")
+        else:
+            console.print("  [yellow]⚠[/yellow] No signature databases — clamd may not start")
+
+    if shutil.which("clamdscan"):
+        result = sp.run(["clamdscan", "--ping", "3"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            console.print("  [green]✓[/green] clamd is running and responsive")
+        else:
+            console.print("  [yellow]⚠[/yellow] clamd not responding yet — may still be loading signatures")
+            console.print("  [dim]Give it a minute, then try: clamdscan --ping 5[/dim]")
+    else:
+        console.print("  [yellow]⚠[/yellow] clamdscan not found — will fall back to clamscan (slower)")
+
+    if system == "Linux":
+        for svc in ["clamav-freshclam", "freshclam"]:
+            result = sp.run(["systemctl", "is-active", svc], capture_output=True, text=True)
+            if result.stdout.strip() == "active":
+                console.print(f"  [green]✓[/green] {svc}: active (auto-updates signatures)")
+                break
+        else:
+            console.print("  [yellow]⚠[/yellow] freshclam service not active")
+
+        for svc in ["clamav-daemon", "clamd@scan", "clamd"]:
+            result = sp.run(["systemctl", "is-active", svc], capture_output=True, text=True)
+            if result.stdout.strip() == "active":
+                console.print(f"  [green]✓[/green] {svc}: active")
+                break
+        else:
+            console.print("  [yellow]⚠[/yellow] clamd service not active")
 
 
 def _find_clamav_db_dir() -> Path | None:
@@ -1285,6 +1441,157 @@ def _find_clamav_db_dir() -> Path | None:
         if p.is_dir():
             return p
     return None
+
+
+# ============================================================================
+# Background ClamAV Scan
+# ============================================================================
+
+
+@app.command("clamscan")
+def clamscan_cmd(
+    schedule: bool = typer.Option(False, "--schedule", help="Register a daily cron job instead of running now"),
+):
+    """Run a ClamAV malware scan in the background.
+
+    By default, runs the scan immediately and saves results to
+    ~/.kyber/security/clamscan/. Use --schedule to register a daily
+    cron job that runs the scan automatically.
+    """
+    if schedule:
+        _register_clamscan_cron()
+        return
+
+    import shutil
+    if not shutil.which("clamscan") and not shutil.which("clamdscan"):
+        console.print("[red]✗[/red] ClamAV not installed. Run [cyan]kyber setup-clamav[/cyan] first.")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Running ClamAV malware scan...\n")
+    console.print("[dim]Results are saved to ~/.kyber/security/clamscan/[/dim]\n")
+
+    from kyber.security.clamscan import run_clamscan
+    report = run_clamscan()
+
+    status = report.get("status", "error")
+    duration = report.get("duration_seconds", 0)
+    infected = report.get("infected_files", [])
+
+    if status == "clean":
+        console.print(f"[green]✓[/green] No threats detected ({duration}s)")
+    elif status == "threats_found":
+        console.print(f"[red]✗[/red] {len(infected)} threat(s) detected ({duration}s):")
+        for inf in infected:
+            console.print(f"  [red]•[/red] {inf.get('file', '?')} — {inf.get('threat', '?')}")
+    else:
+        console.print(f"[yellow]⚠[/yellow] Scan error: {report.get('error', 'unknown')} ({duration}s)")
+
+    console.print(f"\n[dim]Report saved to ~/.kyber/security/clamscan/latest.json[/dim]")
+
+
+def _register_clamscan_cron():
+    """Register a daily ClamAV scan as a kyber cron job (manual CLI path)."""
+    import asyncio
+
+    console.print(f"{__logo__} Setting up daily ClamAV scan...\n")
+
+    try:
+        from kyber.config.loader import load_config
+        config = load_config()
+    except Exception as e:
+        console.print(f"[red]✗[/red] Failed to load config: {e}")
+        raise typer.Exit(1)
+
+    from kyber.cron.service import CronService
+    from kyber.cron.types import CronSchedule
+
+    cron = CronService(config)
+
+    CLAMSCAN_JOB_ID = "kyber-clamscan"
+
+    # Check if already registered
+    for job in cron.list_jobs(include_disabled=True):
+        if job.id == CLAMSCAN_JOB_ID or "clamscan" in job.name.lower() or "clamav" in job.name.lower():
+            console.print(f"[green]✓[/green] Daily ClamAV scan already registered (job: {job.id})")
+            if not job.enabled:
+                cron.enable_job(job.id, enabled=True)
+                console.print("[green]✓[/green] Re-enabled the job")
+            return
+
+    # Register new job — daily at 3 AM
+    job = cron.add_job(
+        name="Daily ClamAV Scan",
+        schedule=CronSchedule(kind="cron", expr="0 3 * * *"),
+        message="Run a background ClamAV malware scan: from kyber.security.clamscan import run_clamscan; run_clamscan()",
+        job_id=CLAMSCAN_JOB_ID,
+    )
+
+    console.print(f"[green]✓[/green] Daily ClamAV scan registered (job: {job.id})")
+    console.print("[dim]Runs daily at 3:00 AM. View/manage in the dashboard under Cron Jobs.[/dim]")
+
+
+def _ensure_clamscan_cron(cron_svc) -> None:
+    """Auto-register the daily ClamAV cron job if ClamAV is installed.
+
+    Called at startup so the user never has to manually schedule it.
+    Also kicks off the first scan in a background thread if no results exist yet.
+    """
+    import shutil
+
+    if not shutil.which("clamscan") and not shutil.which("clamdscan"):
+        return  # ClamAV not installed, nothing to do
+
+    from kyber.cron.types import CronSchedule
+
+    CLAMSCAN_JOB_ID = "kyber-clamscan"
+
+    # Clean up any duplicate clamscan jobs from earlier bugs
+    seen_job: object = None
+    for job in cron_svc.list_jobs(include_disabled=True):
+        is_clamscan = (
+            job.id == CLAMSCAN_JOB_ID
+            or "clamscan" in job.name.lower()
+            or "clamav" in job.name.lower()
+        )
+        if is_clamscan:
+            if seen_job is not None:
+                # Duplicate — remove it
+                cron_svc.remove_job(job.id)
+            else:
+                seen_job = job
+                if not job.enabled:
+                    cron_svc.enable_job(job.id, enabled=True)
+
+    # Normalize the surviving job to the canonical ID so future lookups work
+    if seen_job is not None and seen_job.id != CLAMSCAN_JOB_ID:
+        cron_svc.remove_job(seen_job.id)
+        seen_job = None  # Re-create with the correct ID below
+
+    # Register with fixed ID (add_job deduplicates by ID)
+    if seen_job is None:
+        cron_svc.add_job(
+            name="Daily ClamAV Scan",
+            schedule=CronSchedule(kind="cron", expr="0 3 * * *"),
+            message="Run background ClamAV scan",
+            job_id=CLAMSCAN_JOB_ID,
+        )
+        console.print("[green]✓[/green] Auto-registered daily ClamAV scan (3:00 AM)")
+
+    # If no scan results exist yet, kick off the first scan in a background thread
+    from kyber.security.clamscan import get_latest_report, get_running_state
+    if get_latest_report() is None and get_running_state() is None:
+        import threading
+        from kyber.security.clamscan import run_clamscan
+
+        def _first_scan():
+            try:
+                run_clamscan()
+            except Exception:
+                pass  # Non-critical, will run again on schedule
+
+        t = threading.Thread(target=_first_scan, daemon=True, name="clamscan-initial")
+        t.start()
+        console.print("[cyan]⏳[/cyan] Running initial ClamAV scan in background…")
 
 
 if __name__ == "__main__":

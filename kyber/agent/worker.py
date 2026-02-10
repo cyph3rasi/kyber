@@ -198,12 +198,25 @@ class Worker:
                 s = s[: limit - 1].rstrip() + "…"
             return s
 
+        def _redact_secrets(s: str) -> str:
+            """Redact strings that look like API keys, tokens, or passwords."""
+            import re
+            # Common API key patterns: sk-..., key-..., Bearer ..., long hex/base64 strings
+            s = re.sub(
+                r'(?i)(api[_-]?key|token|secret|password|bearer)\s*[=:]\s*\S+',
+                r'\1=***',
+                s,
+            )
+            # Standalone key-like strings (sk-..., xai-..., etc.)
+            s = re.sub(r'\b(sk|key|xai|gsk|pk|rk)-[A-Za-z0-9_-]{20,}\b', '***', s)
+            return s
+
         def _format_action(tool_name: str, args: dict[str, Any]) -> str:
             """Human-readable action detail for progress/status; avoid internal tool jargon."""
             name = (tool_name or "").strip()
             args = args or {}
             if name == "exec":
-                cmd = _one_line(str(args.get("command", "")))
+                cmd = _redact_secrets(_one_line(str(args.get("command", ""))))
                 return f"running `{cmd}`" if cmd else "running a shell command"
             if name == "read_file":
                 p = _one_line(str(args.get("path", "")))
@@ -299,7 +312,17 @@ class Worker:
                         "content": result,
                     })
             else:
-                # No tool calls = LLM is done, this is the final answer
+                # No tool calls — either the LLM is done or it errored out.
+                if response.finish_reason == "error":
+                    # Transient LLM failure (e.g. provider 500). Don't treat
+                    # the error string as the final answer — retry so the
+                    # agent can finish its work (e.g. write a report file).
+                    logger.warning(
+                        f"Worker [{self.task.id}] LLM returned error, retrying: "
+                        f"{(response.content or '')[:200]}"
+                    )
+                    await asyncio.sleep(3)
+                    continue
                 final_result = response.content
                 break
 
@@ -460,6 +483,7 @@ class WorkerPool:
         brave_api_key: str | None = None,
         max_concurrent: int = 5,
         timezone: str | None = None,
+        exec_timeout: int = 60,
     ):
         self.provider = provider
         self.workspace = workspace
@@ -469,6 +493,7 @@ class WorkerPool:
         self.brave_api_key = brave_api_key
         self.max_concurrent = max_concurrent
         self.timezone = timezone
+        self.exec_timeout = exec_timeout
 
         self.completion_queue: asyncio.Queue[Task] = asyncio.Queue()
         self._running: dict[str, asyncio.Task] = {}
@@ -484,6 +509,7 @@ class WorkerPool:
             persona_prompt=self.persona_prompt,
             model=self.model,
             brave_api_key=self.brave_api_key,
+            exec_timeout=self.exec_timeout,
             timezone=self.timezone,
         )
 
@@ -523,6 +549,7 @@ class WorkerPool:
             persona_prompt=self.persona_prompt,
             model=self.model,
             brave_api_key=self.brave_api_key,
+            exec_timeout=self.exec_timeout,
             timezone=self.timezone,
         )
         await worker.run()

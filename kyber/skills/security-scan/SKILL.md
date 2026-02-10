@@ -8,6 +8,28 @@ metadata: {"kyber":{"emoji":"🛡️","requires":{"bins":["curl"]},"optional_bin
 
 You are performing a comprehensive security audit of the user's environment. Your job is to check for vulnerabilities, misconfigurations, and threats, then write a structured JSON report that the Security Center dashboard can display.
 
+## Previous Issues
+
+Before starting, check if there are previous findings to re-verify:
+
+```bash
+cat ~/.kyber/security/issues.json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    issues = [i for i in data.get('issues', {}).values() if i.get('status') != 'resolved']
+    if issues:
+        print(f'{len(issues)} outstanding issues from previous scans:')
+        for i in issues:
+            print(f\"  [{i.get('severity','?').upper()}] ({i.get('category','?')}) {i.get('title','?')} — seen {i.get('scan_count',1)} time(s)\")
+    else:
+        print('No outstanding issues from previous scans.')
+except: print('No previous scan data found.')
+" 2>/dev/null
+```
+
+If there are outstanding issues, you MUST specifically re-check each one and include it in your report if it still exists. Consistency across scans is critical — do not skip previously-found issues.
+
 ## What to Check
 
 Run these checks systematically. Use `exec` for shell commands and `read_file` / `list_dir` for file inspection.
@@ -110,83 +132,135 @@ cat .gitignore 2>/dev/null | grep -E "\.env|credentials|secret|\.pem|\.key"
 ### 10. Kyber-Specific Security
 
 ```bash
-# Check kyber config permissions
-ls -la ~/.kyber/config.json
-# Check if API keys are exposed
-cat ~/.kyber/config.json 2>/dev/null | python3 -c "import sys,json; c=json.load(sys.stdin); [print(f'{p}: key set') if v.get('api_key') else print(f'{p}: no key') for p,v in c.get('providers',{}).items() if isinstance(v,dict)]" 2>/dev/null
+# Check kyber config and .env permissions
+ls -la ~/.kyber/config.json ~/.kyber/.env 2>/dev/null
+# Check which providers have API keys configured (checks both .env and config.json)
+python3 -c "
+import json, os
+env_path = os.path.expanduser('~/.kyber/.env')
+cfg_path = os.path.expanduser('~/.kyber/config.json')
+env_keys = {}
+if os.path.exists(env_path):
+    for line in open(env_path):
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            if 'API_KEY' in k and v.strip().strip('\"').strip(\"'\"):
+                name = k.replace('KYBER_PROVIDERS__','').replace('__API_KEY','').lower()
+                env_keys[name] = True
+cfg_keys = {}
+if os.path.exists(cfg_path):
+    c = json.load(open(cfg_path))
+    for p, v in c.get('providers', {}).items():
+        if isinstance(v, dict) and v.get('api_key', v.get('apiKey', '')):
+            cfg_keys[p] = True
+all_keys = sorted(set(list(env_keys) + list(cfg_keys)))
+if all_keys:
+    sources = []
+    for p in all_keys:
+        src = 'env' if p in env_keys else 'config'
+        sources.append(f'{p} ({src})')
+    print(f'{len(all_keys)} provider(s) with API keys: {chr(44).join(sources)}')
+else:
+    print('No provider API keys found in config.json or .env')
+" 2>/dev/null
 # Dashboard token
 cat ~/.kyber/config.json 2>/dev/null | python3 -c "import sys,json; c=json.load(sys.stdin); t=c.get('dashboard',{}).get('auth_token',''); print('Dashboard token length:', len(t))" 2>/dev/null
 ```
 
-### 11. Malware Scan (ClamAV)
+Note: API keys are stored in `~/.kyber/.env`, NOT in `config.json`. Empty `api_key` fields in `config.json` are normal — they were migrated to `.env`. Do NOT flag empty config.json keys as a finding if the key exists in `.env`.
 
-First, check if ClamAV is installed:
+### 11. Malware Scan (Background ClamAV)
+
+ClamAV malware scans now run in the background on a daily schedule via the `kyber-clamscan` cron job. Do NOT run clamscan or clamdscan during the security scan — just read the latest background results.
 
 ```bash
-which clamscan 2>/dev/null
+cat ~/.kyber/security/clamscan/latest.json 2>/dev/null
 ```
 
-**If `clamscan` is NOT found**, skip the malware scan and add this finding to the report:
+**If the file does not exist**, the initial background scan may still be running. Add this finding:
 
 ```json
 {
   "id": "MAL-000",
   "category": "malware",
-  "severity": "medium",
-  "title": "ClamAV not installed — malware scanning disabled",
-  "description": "ClamAV is a free, open-source antivirus engine that detects trojans, viruses, malware, and other threats. Without it, kyber cannot scan your system for malicious files. ClamAV is maintained by Cisco Talos and is the industry standard for open-source malware detection on Linux and macOS.",
-  "remediation": "Run `kyber setup-clamav` to automatically install and configure ClamAV for your platform. This will install the scanner, configure the signature database, and download the latest threat definitions. Once installed, future security scans will automatically include malware detection.",
-  "evidence": "clamscan binary not found in PATH"
+  "severity": "low",
+  "title": "Malware scan in progress — initial background ClamAV scan has not completed yet",
+  "description": "ClamAV scans run automatically in the background on a daily schedule. The first scan starts when kyber launches. Results will appear once it completes.",
+  "remediation": "Results will be available shortly. If ClamAV is not installed, run `kyber setup-clamav`.",
+  "evidence": "~/.kyber/security/clamscan/latest.json not found"
 }
 ```
 
-Set the `malware` category to `"status": "skip"` with a note that ClamAV is not installed.
+Set the `malware` category to `"status": "skip"`.
 
-**If `clamscan` IS found**, proceed with the malware scan:
+**If the file exists**, read the JSON and check the `status` field:
 
-#### Step 1: Update threat database before scanning
+- `"status": "clean"` → No threats. Set malware category to `"status": "pass"`, `"finding_count": 0`.
+- `"status": "threats_found"` → Create a finding for each entry in `infected_files` array with category "malware", severity "critical".
+- `"status": "error"` → Note the error. Set malware category to `"status": "warn"`.
 
-Always update signatures before scanning to catch the latest threats:
+Include the `finished_at` timestamp in the report notes so the user knows when the last scan ran.
 
-```bash
-# Try without sudo first (works on macOS), fall back to sudo on Linux
-freshclam 2>&1 || sudo freshclam 2>&1
-```
+### 12. Skill Security Scan (Cisco AI Defense)
 
-If freshclam fails, note it in the report but continue with the scan using existing signatures.
-
-#### Step 2: Run full system scan
-
-Run a thorough scan of the entire home directory and common system locations:
+First, check if the Cisco AI Defense skill-scanner is installed:
 
 ```bash
-clamscan -r --infected ~/ 2>&1
+which skill-scanner 2>/dev/null
 ```
 
-This recursively scans the entire home directory — all user files, downloads, projects, configs, and application data.
-
-The `--infected` flag means only infected files are printed. The exit code tells you the result:
-- Exit 0: No threats found
-- Exit 1: Threats found (infected files listed in output)
-- Exit 2: Errors occurred during scan
-
-#### Step 3: Record findings
-
-For each infected file found, create a finding:
+**If `skill-scanner` is NOT found**, skip the skill scan and add this finding to the report:
 
 ```json
 {
-  "id": "MAL-001",
-  "category": "malware",
-  "severity": "critical",
-  "title": "Malware detected: <threat_name>",
-  "description": "ClamAV detected <threat_name> in <file_path>. This file should be quarantined or removed immediately.",
-  "remediation": "Delete or quarantine the infected file. If it's a downloaded file, re-download from a trusted source. Run a full scan with `clamscan -r ~/` to check for additional infections.",
-  "evidence": "<clamscan output line>"
+  "id": "SKL-000",
+  "category": "skill_scan",
+  "severity": "medium",
+  "title": "Skill scanner not installed — skill security scanning disabled",
+  "description": "The Cisco AI Defense skill-scanner detects prompt injection, data exfiltration, and malicious code patterns in agent skills. Without it, kyber cannot verify that installed skills are safe. It uses static analysis (YAML + YARA patterns), behavioral dataflow analysis, and optional LLM-based semantic analysis.",
+  "remediation": "Run `kyber setup-skillscanner` to install the scanner. Once installed, future security scans will automatically check all installed skills for threats.",
+  "evidence": "skill-scanner binary not found in PATH"
 }
 ```
 
-If no threats are found, set the `malware` category to `"status": "pass"` with `"finding_count": 0`.
+Set the `skill_scan` category to `"status": "skip"` with a note that skill-scanner is not installed.
+
+**If `skill-scanner` IS found**, scan all skill directories.
+
+Note: If the user has configured `tools.skill_scanner` in their kyber config (e.g. `use_llm: true` with an API key), the scan task description will include the appropriate env vars and CLI flags automatically. The commands below show the base form — the actual commands in the scan task may include additional flags like `--use-llm`, `--use-virustotal`, `--use-aidefense`, and `--enable-meta` with their corresponding env vars prepended.
+
+#### Step 1: Scan managed skills (~/.kyber/skills)
+
+```bash
+skill-scanner scan-all ~/.kyber/skills --recursive --use-behavioral --format json 2>&1
+```
+
+#### Step 2: Scan workspace skills (if they exist)
+
+```bash
+ls ~/kyber-workspace/skills 2>/dev/null && skill-scanner scan-all ~/kyber-workspace/skills --recursive --use-behavioral --format json 2>&1
+```
+
+#### Step 3: Record findings
+
+For each finding from skill-scanner, create a report finding:
+
+```json
+{
+  "id": "SKL-001",
+  "category": "skill_scan",
+  "severity": "high",
+  "title": "Prompt injection detected in skill: <skill_name>",
+  "description": "The skill-scanner detected <threat_type> in <skill_name>. <details about the finding>.",
+  "remediation": "Review the skill content and remove or quarantine the affected skill. Run `kyber skills remove <skill_name>` to uninstall it.",
+  "evidence": "<skill-scanner output>"
+}
+```
+
+Map skill-scanner severity levels: CRITICAL → critical, HIGH → high, MEDIUM → medium, LOW/INFO → low.
+
+If no threats are found, set the `skill_scan` category to `"status": "pass"` with `"finding_count": 0`.
 
 ## Report Format
 
@@ -234,7 +308,8 @@ Then use `write_file` to write the JSON report:
     "docker": {"checked": false, "finding_count": 0, "status": "skip"},
     "git": {"checked": true, "finding_count": 1, "status": "warn"},
     "kyber": {"checked": true, "finding_count": 1, "status": "pass"},
-    "malware": {"checked": true, "finding_count": 0, "status": "pass"}
+    "malware": {"checked": true, "finding_count": 0, "status": "pass"},
+    "skill_scan": {"checked": true, "finding_count": 0, "status": "pass"}
   },
   "notes": "Your environment is in decent shape overall. The main concern is Redis being exposed on all interfaces — that should be locked down immediately. A few .env files have overly permissive permissions. Consider running `chmod 600` on any files containing API keys or secrets. Your SSH config looks solid, but you have one authorized_keys entry I don't recognize — worth double-checking. Firewall is enabled which is great. No suspicious processes detected."
 }
@@ -244,7 +319,7 @@ Then use `write_file` to write the JSON report:
 
 **severity**: `critical` | `high` | `medium` | `low`
 
-**category**: `network` | `ssh` | `permissions` | `secrets` | `software` | `processes` | `firewall` | `docker` | `git` | `kyber` | `malware`
+**category**: `network` | `ssh` | `permissions` | `secrets` | `software` | `processes` | `firewall` | `docker` | `git` | `kyber` | `malware` | `skill_scan`
 
 **category status**: `pass` (no issues) | `warn` (minor issues) | `fail` (critical/high issues) | `skip` (not applicable)
 

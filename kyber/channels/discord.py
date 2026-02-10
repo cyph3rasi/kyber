@@ -42,7 +42,7 @@ class DiscordChannel(BaseChannel):
     async def start(self) -> None:
         """Start the Discord bot."""
         if not DISCORD_AVAILABLE:
-            logger.error("Discord SDK not installed. Run: pip install discord.py")
+            logger.error("Discord SDK not installed. Run: uv pip install discord.py")
             return
         
         if not self.config.token:

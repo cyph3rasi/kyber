@@ -248,6 +248,9 @@ _ENV_TO_ATTR: dict[str, tuple[str, ...]] = {
     "KYBER_PROVIDERS__GROQ__API_KEY": ("providers", "groq", "api_key"),
     "KYBER_PROVIDERS__GEMINI__API_KEY": ("providers", "gemini", "api_key"),
     "KYBER_TOOLS__WEB__SEARCH__API_KEY": ("providers",),  # handled specially below
+    "KYBER_TOOLS__SKILL_SCANNER__LLM_API_KEY": ("tools", "skill_scanner", "llm_api_key"),
+    "KYBER_TOOLS__SKILL_SCANNER__VIRUSTOTAL_API_KEY": ("tools", "skill_scanner", "virustotal_api_key"),
+    "KYBER_TOOLS__SKILL_SCANNER__AI_DEFENSE_API_KEY": ("tools", "skill_scanner", "ai_defense_api_key"),
     "KYBER_CHANNELS__TELEGRAM__TOKEN": ("channels", "telegram", "token"),
     "KYBER_CHANNELS__DISCORD__TOKEN": ("channels", "discord", "token"),
     "KYBER_DASHBOARD__AUTH_TOKEN": ("dashboard", "auth_token"),

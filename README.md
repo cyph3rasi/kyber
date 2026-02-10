@@ -33,14 +33,12 @@ One install command, pick your provider, and you're chatting. No bloat, no confi
 curl -fsSL https://kyber.chat/install.sh | bash
 ```
 
-This auto-detects your OS, installs Python/uv/pipx if needed, walks you through provider setup, writes your config and secrets, and optionally sets up system services.
+This auto-detects your OS, installs uv if needed, walks you through provider setup, writes your config and secrets, and optionally sets up system services.
 
 **Manual install:**
 
 ```bash
-pipx install kyber-chat    # recommended
-uv tool install kyber-chat  # or with uv
-pip install kyber-chat      # or plain pip
+uv tool install kyber-chat
 ```
 
 From source (for development):
@@ -48,10 +46,8 @@ From source (for development):
 ```bash
 git clone git@github.com:cyph3rasi/kyber.git
 cd kyber
-pip install -e .
+uv pip install -e .
 ```
-
-Requires Python 3.11+.
 
 ---
 

@@ -26,7 +26,7 @@ class ExecTool(Tool):
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
             r"\brmdir\s+/s\b",               # rmdir /s
-            r"\b(format|mkfs|diskpart)\b",   # disk operations
+            r"(?<![-\w])\b(format|mkfs|diskpart)\b",  # disk operations (not --format flags)
             r"\bdd\s+if=",                   # dd
             r">\s*/dev/sd",                  # write to disk
             r"\b(shutdown|reboot|poweroff)\b",  # system power
@@ -63,8 +63,10 @@ class ExecTool(Tool):
     # Commands that need extended timeouts (e.g. virus scanners, large builds).
     # Maps a regex pattern to a timeout in seconds (0 = no limit).
     EXTENDED_TIMEOUT_COMMANDS: dict[str, int] = {
-        r"\bclamscan\b": 0,       # No limit — scan duration depends on disk size
-        r"\bfreshclam\b": 300,    # 5 minutes — signature download
+        r"\bclamscan\b": 0,           # No limit — scan duration depends on disk size
+        r"\bclamdscan\b": 0,          # No limit — daemon scan, depends on disk size
+        r"\bfreshclam\b": 300,        # 5 minutes — signature download
+        r"\bskill-scanner\b": 600,    # 10 minutes — depends on number of skills + LLM calls
     }
 
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
@@ -77,7 +79,8 @@ class ExecTool(Tool):
         timeout = self.timeout
         for pattern, ext_timeout in self.EXTENDED_TIMEOUT_COMMANDS.items():
             if re.search(pattern, command):
-                timeout = max(timeout, ext_timeout)
+                # 0 means no limit — always honour that; otherwise take the larger value
+                timeout = ext_timeout if ext_timeout == 0 else max(timeout, ext_timeout)
                 break
         
         try:

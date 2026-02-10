@@ -2,7 +2,6 @@
 const API = '/api';
 const TOKEN_KEY = 'kyber_dashboard_token';
 const TASKS_AUTOREFRESH_KEY = 'kyber_tasks_autorefresh';
-const DEBUG_AUTOREFRESH_KEY = 'kyber_debug_autorefresh';
 const SKILLS_AUTOREFRESH_KEY = 'kyber_skills_autorefresh';
 const CRON_AUTOREFRESH_KEY = 'kyber_cron_autorefresh';
 const SECURITY_AUTOREFRESH_KEY = 'kyber_security_autorefresh';
@@ -33,6 +32,7 @@ let toastTimer = null;
 let tasksPollTimer = null;
 let restoreScrollAfterRender = false;
 let pendingScrollY = 0;
+
 
 // Cache fetched models per provider to avoid re-fetching
 const modelCache = {};
@@ -74,10 +74,6 @@ const SECTIONS = {
   tasks: {
     title: 'Tasks',
     desc: 'View running background tasks, cancel them, and inspect recent results.',
-  },
-  debug: {
-    title: 'Debug',
-    desc: 'Error-only logs from the gateway (for quick copy/paste while remote).',
   },
   dashboard: {
     title: 'Dashboard',
@@ -277,7 +273,6 @@ function renderSection() {
 
   if (activeSection === 'json') { renderJSON(); finishRender(); return; }
   if (activeSection === 'tasks') { renderTasks(); finishRender(); return; }
-  if (activeSection === 'debug') { renderDebug(); finishRender(); return; }
   if (activeSection === 'skills') { renderSkills(); finishRender(); return; }
   if (activeSection === 'cron') { renderCron(); finishRender(); return; }
   if (activeSection === 'security') { renderSecurity(); finishRender(); return; }
@@ -737,10 +732,9 @@ function renderAgents(data) {
   const providers = config.providers || {};
   const currentChatProvider = (defaults.chatProvider || defaults.chat_provider || '').toLowerCase();
   const currentTaskProvider = (defaults.taskProvider || defaults.task_provider || '').toLowerCase();
-  const currentLegacyProvider = (defaults.provider || '').toLowerCase();
 
   // Helper: build a provider <select> element
-  function buildProviderSelect(currentValue, fallbackValue, configKey, label) {
+  function buildProviderSelect(currentValue, configKey, label) {
     const row = document.createElement('div');
     row.className = 'field-row';
     const lbl = document.createElement('div');
@@ -753,7 +747,7 @@ function renderAgents(data) {
     const sel = document.createElement('select');
     const emptyOpt = document.createElement('option');
     emptyOpt.value = '';
-    emptyOpt.textContent = '— Use default provider —';
+    emptyOpt.textContent = '— Select a provider —';
     sel.appendChild(emptyOpt);
 
     const selected = (currentValue || '').toLowerCase();
@@ -765,7 +759,6 @@ function renderAgents(data) {
       if (!hasKey) continue;
       const opt = document.createElement('option');
       opt.value = name;
-      // Show which models are configured for this role
       const roleModel = configKey === 'chatProvider'
         ? (prov.chatModel || prov.chat_model || prov.model || '')
         : (prov.taskModel || prov.task_model || prov.model || '');
@@ -807,62 +800,11 @@ function renderAgents(data) {
     return row;
   }
 
-  // Default Provider (legacy fallback)
-  const defaultProvRow = document.createElement('div');
-  defaultProvRow.className = 'field-row';
-  const defaultProvLabel = document.createElement('div');
-  defaultProvLabel.className = 'field-label';
-  defaultProvLabel.textContent = 'Default Provider';
-  defaultProvRow.appendChild(defaultProvLabel);
-  const defaultProvWrap = document.createElement('div');
-  defaultProvWrap.className = 'field-input';
-
-  const defaultSel = document.createElement('select');
-  const defaultEmpty = document.createElement('option');
-  defaultEmpty.value = '';
-  defaultEmpty.textContent = '— Select a provider —';
-  defaultSel.appendChild(defaultEmpty);
-
-  for (const name of BUILTIN_PROVIDERS) {
-    const prov = providers[name];
-    if (!prov) continue;
-    const hasKey = !!(prov.apiKey || prov.api_key);
-    if (!hasKey) continue;
-    const opt = document.createElement('option');
-    opt.value = name;
-    opt.textContent = humanize(name);
-    if (currentLegacyProvider === name) opt.selected = true;
-    defaultSel.appendChild(opt);
-  }
-  const customs = providers.custom || [];
-  for (const cp of customs) {
-    if (!cp.name || !cp.apiKey) continue;
-    const opt = document.createElement('option');
-    opt.value = cp.name.toLowerCase();
-    opt.textContent = cp.name;
-    if (currentLegacyProvider === cp.name.toLowerCase()) opt.selected = true;
-    defaultSel.appendChild(opt);
-  }
-  if (currentLegacyProvider && !defaultSel.querySelector(`option[value="${currentLegacyProvider}"]`)) {
-    const opt = document.createElement('option');
-    opt.value = currentLegacyProvider;
-    opt.textContent = humanize(currentLegacyProvider) + ' (not configured)';
-    opt.selected = true;
-    defaultSel.appendChild(opt);
-  }
-  defaultSel.addEventListener('change', () => {
-    setPath(config, ['agents', 'defaults', 'provider'], defaultSel.value);
-    markDirty();
-  });
-  defaultProvWrap.appendChild(defaultSel);
-  defaultProvRow.appendChild(defaultProvWrap);
-  card.body.appendChild(defaultProvRow);
-
   // Chat Provider
-  card.body.appendChild(buildProviderSelect(currentChatProvider, currentLegacyProvider, 'chatProvider', 'Chat Provider'));
+  card.body.appendChild(buildProviderSelect(currentChatProvider, 'chatProvider', 'Chat Provider'));
 
   // Task Provider
-  card.body.appendChild(buildProviderSelect(currentTaskProvider, currentLegacyProvider, 'taskProvider', 'Task Provider'));
+  card.body.appendChild(buildProviderSelect(currentTaskProvider, 'taskProvider', 'Task Provider'));
 
   // Render remaining agent defaults (excluding provider fields, model, and timezone)
   const otherFields = Object.fromEntries(
@@ -2233,6 +2175,47 @@ function severityColor(sev) {
   return 'var(--text-tertiary)';
 }
 
+function trackerBadge(status) {
+  if (status === 'recurring') return '<span class="tracker-badge tracker-recurring">Recurring</span>';
+  if (status === 'new') return '<span class="tracker-badge tracker-new">New</span>';
+  if (status === 'dismissed') return '<span class="tracker-badge tracker-dismissed">Dismissed</span>';
+  return '';
+}
+
+function findingFingerprint(f) {
+  const cat = (f.category || '').toLowerCase().trim();
+  const title = (f.title || '').toLowerCase().trim();
+  return `${cat}::${title}`;
+}
+
+function makeDismissBtn(f, onDismiss) {
+  const btn = document.createElement('button');
+  btn.className = 'btn btn-ghost btn-dismiss';
+  btn.textContent = f.tracker_status === 'dismissed' ? 'Restore' : 'Dismiss';
+  btn.title = f.tracker_status === 'dismissed' ? 'Restore this finding so it appears in future scans' : 'Dismiss this finding from future scans';
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const fp = findingFingerprint(f);
+    const endpoint = f.tracker_status === 'dismissed' ? 'undismiss' : 'dismiss';
+    try {
+      const res = await apiFetch(`${API}/security/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fingerprint: fp }),
+      });
+      if (res.ok) {
+        showToast(endpoint === 'dismiss' ? 'Finding dismissed' : 'Finding restored', 'success');
+        if (onDismiss) onDismiss();
+      } else {
+        showToast('Failed to update finding', 'error');
+      }
+    } catch {
+      showToast('Failed to update finding', 'error');
+    }
+  });
+  return btn;
+}
+
 function categoryStatusIcon(status) {
   if (status === 'pass') return '✅';
   if (status === 'warn') return '⚠️';
@@ -2253,14 +2236,190 @@ function categoryLabel(cat) {
     git: 'Git Security',
     kyber: 'Kyber Config',
     malware: 'Malware Scan',
+    skill_scan: 'Skill Security',
   };
   return labels[cat] || cat;
+}
+
+function renderClamscanCard(container, data, runBtn) {
+  const latest = data.latest;
+  const nextRun = data.next_run;
+  const history = data.history || [];
+  const running = data.running;
+
+  // Show running state
+  if (running) {
+    const startedAt = running.started_at ? new Date(running.started_at) : null;
+    const elapsed = startedAt ? Math.floor((Date.now() - startedAt.getTime()) / 1000) : 0;
+    const elapsedStr = elapsed >= 3600 ? `${Math.floor(elapsed / 3600)}h ${Math.floor((elapsed % 3600) / 60)}m` : elapsed >= 60 ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : `${elapsed}s`;
+    container.innerHTML = `
+      <div class="malware-status malware-status-skip">
+        <div class="malware-status-icon">
+          <div class="security-progress-spinner"></div>
+        </div>
+        <div class="malware-status-info">
+          <div class="malware-status-title">ClamAV Scan Running…</div>
+          <div class="malware-status-desc">
+            A malware scan is in progress. This runs in the background and won't block your security scans.
+            <br>Elapsed: ${elapsedStr}
+          </div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  const installed = data.installed !== false;
+
+  if (!latest) {
+    if (!installed) {
+      container.innerHTML = `
+        <div class="malware-status malware-status-skip">
+          <div class="malware-status-icon">⚠️</div>
+          <div class="malware-status-info">
+            <div class="malware-status-title">ClamAV Not Installed</div>
+            <div class="malware-status-desc">
+              Malware scanning requires ClamAV. Once installed, scans run automatically in the background on a daily schedule.
+            </div>
+            <div class="malware-status-action">
+              Run <code>kyber setup-clamav</code> to install and configure it.
+            </div>
+          </div>
+        </div>
+      `;
+    } else {
+      container.innerHTML = `
+        <div class="malware-status malware-status-skip">
+          <div class="malware-status-icon">⏳</div>
+          <div class="malware-status-info">
+            <div class="malware-status-title">Initial Malware Scan Running…</div>
+            <div class="malware-status-desc">
+              ClamAV scans run automatically in the background on a daily schedule.
+              The first scan is running now — results will appear here when it finishes.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    return;
+  }
+
+  const status = latest.status;
+  const finishedAt = latest.finished_at ? new Date(latest.finished_at).toLocaleString() : 'Unknown';
+  const duration = latest.duration_seconds || 0;
+  const durStr = duration >= 3600 ? `${Math.floor(duration / 3600)}h ${Math.floor((duration % 3600) / 60)}m` : duration >= 60 ? `${Math.floor(duration / 60)}m ${duration % 60}s` : `${duration}s`;
+  const infected = latest.infected_files || [];
+  const scannedDirs = (latest.scanned_dirs || []).map(d => d.replace(/^\/Users\/[^/]+/, '~')).join(', ');
+  const scannerType = latest.is_daemon ? 'clamdscan (daemon)' : 'clamscan (standalone)';
+  const nextRunStr = nextRun ? new Date(nextRun).toLocaleString() : 'Not scheduled';
+
+  let statusHtml = '';
+
+  if (status === 'clean') {
+    statusHtml = `
+      <div class="malware-status malware-status-clean">
+        <div class="malware-status-icon">✅</div>
+        <div class="malware-status-info">
+          <div class="malware-status-title">No Threats Detected</div>
+          <div class="malware-status-desc">
+            Last scan completed ${finishedAt} (${durStr}) using ${scannerType}.
+            <br>Scanned: ${scannedDirs || 'standard directories'}
+          </div>
+          <div class="malware-status-meta">
+            Next scheduled scan: ${nextRunStr}
+          </div>
+        </div>
+      </div>
+    `;
+  } else if (status === 'threats_found') {
+    statusHtml = `
+      <div class="malware-status malware-status-threat">
+        <div class="malware-status-icon">🚨</div>
+        <div class="malware-status-info">
+          <div class="malware-status-title">${infected.length} Threat${infected.length !== 1 ? 's' : ''} Detected</div>
+          <div class="malware-status-desc">
+            Last scan completed ${finishedAt} (${durStr}) using ${scannerType}.
+            <br>ClamAV detected potentially malicious files. Review and take action immediately.
+          </div>
+          <div class="malware-status-meta">
+            Next scheduled scan: ${nextRunStr}
+          </div>
+        </div>
+      </div>
+    `;
+  } else {
+    const errMsg = latest.error || 'Unknown error';
+    statusHtml = `
+      <div class="malware-status malware-status-skip">
+        <div class="malware-status-icon">⚠️</div>
+        <div class="malware-status-info">
+          <div class="malware-status-title">Scan Error</div>
+          <div class="malware-status-desc">
+            Last scan attempt ${finishedAt}: ${errMsg}
+          </div>
+          <div class="malware-status-action">
+            Run <code>kyber setup-clamav</code> to fix the installation, then <code>kyber clamscan</code> to retry.
+          </div>
+          <div class="malware-status-meta">
+            Next scheduled scan: ${nextRunStr}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  container.innerHTML = statusHtml;
+
+  // Show infected files if any
+  if (infected.length > 0) {
+    const threatList = document.createElement('div');
+    threatList.className = 'malware-findings';
+    for (const inf of infected) {
+      const row = document.createElement('details');
+      row.className = 'security-finding';
+      const sum = document.createElement('summary');
+      sum.className = 'security-finding-summary';
+      sum.innerHTML = `
+        <span class="security-finding-sev" style="background:var(--red)">CRITICAL</span>
+        <span class="security-finding-title">${inf.threat || 'Unknown threat'}</span>
+        <svg class="security-finding-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      `;
+      row.appendChild(sum);
+      const body = document.createElement('div');
+      body.className = 'security-finding-body';
+      body.innerHTML = `
+        <p>Infected file: <code>${inf.file || 'unknown'}</code></p>
+        <div class="security-finding-fix"><strong>Fix:</strong> Delete or quarantine this file immediately.</div>
+      `;
+      row.appendChild(body);
+      threatList.appendChild(row);
+    }
+    container.appendChild(threatList);
+  }
+
+  // Show scan history if available
+  if (history.length > 1) {
+    const histDiv = document.createElement('div');
+    histDiv.style.marginTop = '12px';
+    histDiv.style.borderTop = '1px solid var(--border)';
+    histDiv.style.paddingTop = '12px';
+    let histHtml = '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">Recent scans</div>';
+    for (const h of history.slice(0, 5)) {
+      const hDate = h.finished_at ? new Date(h.finished_at).toLocaleString() : h.started_at ? new Date(h.started_at).toLocaleString() : '?';
+      const hStatus = h.status === 'clean' ? '✅' : h.status === 'threats_found' ? '🚨' : '⚠️';
+      const hThreats = h.threat_count ? ` — ${h.threat_count} threat(s)` : '';
+      histHtml += `<div style="font-size:12px;color:var(--text-tertiary);padding:2px 0;">${hStatus} ${hDate}${hThreats}</div>`;
+    }
+    histDiv.innerHTML = histHtml;
+    container.appendChild(histDiv);
+  }
 }
 
 // ── Security scan state (hoisted outside renderSecurity so it persists across tab switches) ──
 let _secPollTimer = null;
 let _secScanRunning = false;
 let _secScanTriggeredAt = 0;
+let _secScanTaskSeen = false;
 let _secNeedsRefresh = false;  // set when scan finishes while on another tab
 
 function _secStopPolling() {
@@ -2348,6 +2507,30 @@ function renderSecurity() {
     }
 
     if (_secScanRunning) {
+      // If we already saw the task running and it's gone, it finished — skip grace period
+      if (_secScanTaskSeen) {
+        hideScanRunning();
+        _secStopPolling();
+        if (activeSection === 'security') {
+          try {
+            const data = await fetchSecurityReports();
+            renderReport(data);
+            if (data && data.latest) {
+              showToast('Security scan complete — report updated', 'success');
+            } else {
+              showToast('Scan finished but no report was generated. The agent may have run out of steps. Try running again.', 'error');
+            }
+          } catch (_) {
+            showToast('Scan finished but failed to load results', 'error');
+          }
+        } else {
+          _secNeedsRefresh = true;
+          showToast('Security scan complete — switch to Security Center to view results', 'success');
+        }
+        return false;
+      }
+
+      // Haven't seen the task yet — use grace period for agent startup delay
       const elapsed = Date.now() - _secScanTriggeredAt;
       if (_secScanTriggeredAt && elapsed < SCAN_GRACE_MS) {
         const detail = document.getElementById('secScanDetail');
@@ -2384,10 +2567,17 @@ function renderSecurity() {
 
   function showScanRunning(task) {
     _secScanRunning = true;
-    scanBtn.disabled = true;
-    scanBtn.textContent = '⏳ Scan Running…';
-    scanBtn.classList.add('btn-disabled');
-    progressBanner.classList.remove('hidden');
+    _secScanTaskSeen = true;
+    if (!_secScanTriggeredAt) _secScanTriggeredAt = Date.now();
+    // Update whichever DOM elements are currently live
+    const btn = contentBody.querySelector('.btn-primary');
+    const banner = contentBody.querySelector('.security-progress');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ Scan Running…';
+      btn.classList.add('btn-disabled');
+    }
+    if (banner) banner.classList.remove('hidden');
 
     const detail = document.getElementById('secScanDetail');
     const elapsed = document.getElementById('secScanElapsed');
@@ -2407,10 +2597,16 @@ function renderSecurity() {
   function hideScanRunning() {
     _secScanRunning = false;
     _secScanTriggeredAt = 0;
-    scanBtn.disabled = false;
-    scanBtn.textContent = '🛡️ Run Scan Now';
-    scanBtn.classList.remove('btn-disabled');
-    progressBanner.classList.add('hidden');
+    _secScanTaskSeen = false;
+    // Update whichever DOM elements are currently live
+    const btn = contentBody.querySelector('.btn-primary');
+    const banner = contentBody.querySelector('.security-progress');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '🛡️ Run Scan Now';
+      btn.classList.remove('btn-disabled');
+    }
+    if (banner) banner.classList.add('hidden');
   }
 
   function startPolling() {
@@ -2441,10 +2637,18 @@ function renderSecurity() {
     const notes = report.notes || '';
     const ts = report.timestamp ? new Date(report.timestamp).toLocaleString() : 'Unknown';
     const dur = report.duration_seconds ? `${report.duration_seconds}s` : '';
+    const tracker = data.tracker || {};
 
     container.innerHTML = '';
 
     // Score card
+    const newCount = findings.filter(f => f.tracker_status === 'new').length;
+    const recurCount = findings.filter(f => f.tracker_status === 'recurring').length;
+    const resolvedCount = tracker.resolved || 0;
+    const trackerLine = (newCount || recurCount || resolvedCount)
+      ? `<div class="security-tracker-summary">${newCount ? `<span class="tracker-badge tracker-new">${newCount} New</span>` : ''}${recurCount ? `<span class="tracker-badge tracker-recurring">${recurCount} Recurring</span>` : ''}${resolvedCount ? `<span class="tracker-badge tracker-resolved">${resolvedCount} Resolved</span>` : ''}</div>`
+      : '';
+
     const scoreCard = document.createElement('div');
     scoreCard.className = 'card';
     scoreCard.innerHTML = `
@@ -2473,6 +2677,7 @@ function renderSecurity() {
               ${summary.low ? `<span class="severity-pill low">${summary.low} Low</span>` : ''}
               ${summary.total_findings === 0 ? '<span class="severity-pill pass">No Issues Found</span>' : ''}
             </div>
+            ${trackerLine}
           </div>
         </div>
       </div>
@@ -2511,105 +2716,202 @@ function renderSecurity() {
     catCard.appendChild(catBody);
     container.appendChild(catCard);
 
-    // Malware Scan card (dedicated, between categories and findings)
-    const malCat = categories.malware;
-    const malFindings = findings.filter(f => f.category === 'malware');
+    // Malware Scan card — shows background ClamAV scan results
     const malCard = document.createElement('div');
     malCard.className = 'card';
     malCard.style.marginTop = '16px';
 
     const malHeader = document.createElement('div');
     malHeader.className = 'card-header';
-    malHeader.innerHTML = '<span class="card-title">🦠 Malware Scan</span>';
+    const malHeaderLeft = document.createElement('span');
+    malHeaderLeft.className = 'card-title';
+    malHeaderLeft.textContent = '🦠 Malware Scan';
+    malHeader.appendChild(malHeaderLeft);
+
+    const malRunBtn = document.createElement('button');
+    malRunBtn.className = 'btn btn-ghost';
+    malRunBtn.textContent = '▶ Run Now';
+    malRunBtn.style.marginLeft = 'auto';
+    malRunBtn.style.fontSize = '12px';
+    malRunBtn.disabled = true; // disabled until we know scan state
+    malHeader.appendChild(malRunBtn);
     malCard.appendChild(malHeader);
 
     const malBody = document.createElement('div');
     malBody.className = 'card-body';
+    malBody.innerHTML = '<div class="malware-status malware-status-skip"><div class="malware-status-icon">⏳</div><div class="malware-status-info"><div class="malware-status-title">Loading ClamAV results…</div></div></div>';
 
-    if (!malCat) {
-      // Category not present in report at all — scan predates malware feature or agent didn't run it
-      malBody.innerHTML = `
+    malCard.appendChild(malBody);
+    container.appendChild(malCard);
+
+    let _clamPollTimer = null;
+
+    async function fetchAndRenderClamscan() {
+      try {
+        const res = await apiFetch(`${API}/security/clamscan`);
+        const clamData = await res.json();
+        renderClamscanCard(malBody, clamData, malRunBtn);
+
+        // If a scan is running, poll every 5s until it finishes
+        if (clamData.running) {
+          malRunBtn.disabled = true;
+          malRunBtn.textContent = '⏳ Scanning…';
+          if (!_clamPollTimer) {
+            _clamPollTimer = setInterval(async () => {
+              if (activeSection !== 'security') {
+                clearInterval(_clamPollTimer);
+                _clamPollTimer = null;
+                return;
+              }
+              try {
+                const r = await apiFetch(`${API}/security/clamscan`);
+                const d = await r.json();
+                renderClamscanCard(malBody, d, malRunBtn);
+                if (!d.running) {
+                  clearInterval(_clamPollTimer);
+                  _clamPollTimer = null;
+                  malRunBtn.disabled = false;
+                  malRunBtn.textContent = '▶ Run Now';
+                  showToast('ClamAV scan complete', 'success');
+                }
+              } catch (_) {}
+            }, 5000);
+          }
+        } else {
+          if (_clamPollTimer) { clearInterval(_clamPollTimer); _clamPollTimer = null; }
+          malRunBtn.disabled = false;
+          malRunBtn.textContent = '▶ Run Now';
+        }
+      } catch (e) {
+        malBody.innerHTML = `
+          <div class="malware-status malware-status-skip">
+            <div class="malware-status-icon">❓</div>
+            <div class="malware-status-info">
+              <div class="malware-status-title">Could not load ClamAV results</div>
+              <div class="malware-status-desc">Failed to fetch background scan data.</div>
+              <div class="malware-status-action">If ClamAV is not installed, run <code>kyber setup-clamav</code> to get started.</div>
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    fetchAndRenderClamscan();
+
+    malRunBtn.addEventListener('click', async () => {
+      if (malRunBtn.disabled) return;
+      malRunBtn.disabled = true;
+      malRunBtn.textContent = '⏳ Triggering…';
+      try {
+        const res = await apiFetch(`${API}/security/clamscan/run`, { method: 'POST' });
+        if (res.status === 409) {
+          showToast('A ClamAV scan is already running', 'info');
+        } else {
+          showToast('ClamAV scan started in background', 'success');
+        }
+        // Start polling to track progress either way
+        setTimeout(fetchAndRenderClamscan, 1000);
+      } catch (e) {
+        showToast('Failed to trigger ClamAV scan', 'error');
+        malRunBtn.disabled = false;
+        malRunBtn.textContent = '▶ Run Now';
+      }
+    });
+
+    // Skill Security Scan card (Cisco AI Defense skill-scanner)
+    const sklCat = categories.skill_scan;
+    const sklFindings = findings.filter(f => f.category === 'skill_scan');
+    const sklCard = document.createElement('div');
+    sklCard.className = 'card';
+    sklCard.style.marginTop = '16px';
+
+    const sklHeader = document.createElement('div');
+    sklHeader.className = 'card-header';
+    sklHeader.innerHTML = '<span class="card-title">🔍 Skill Security Scan</span>';
+    sklCard.appendChild(sklHeader);
+
+    const sklBody = document.createElement('div');
+    sklBody.className = 'card-body';
+
+    if (!sklCat) {
+      sklBody.innerHTML = `
         <div class="malware-status malware-status-skip">
           <div class="malware-status-icon">❓</div>
           <div class="malware-status-info">
-            <div class="malware-status-title">Malware Scan Not Run</div>
+            <div class="malware-status-title">Skill Scan Not Run</div>
             <div class="malware-status-desc">
-              This scan did not include a malware check. Run a new scan to include ClamAV malware detection.
+              This scan did not include a skill security check. Run a new scan to include Cisco AI Defense skill scanning.
             </div>
             <div class="malware-status-action">
-              If ClamAV is not installed, run <code>kyber setup-clamav</code> first.
+              If skill-scanner is not installed, run <code>kyber setup-skillscanner</code> first.
             </div>
           </div>
         </div>
       `;
-    } else if (!malCat.checked) {
-      // Category exists but was skipped — ClamAV not installed
-      const notInstalled = malFindings.find(f => f.id === 'MAL-000');
-      malBody.innerHTML = `
+    } else if (!sklCat.checked) {
+      const notInstalled = sklFindings.find(f => f.id === 'SKL-000');
+      sklBody.innerHTML = `
         <div class="malware-status malware-status-skip">
           <div class="malware-status-icon">⚠️</div>
           <div class="malware-status-info">
-            <div class="malware-status-title">ClamAV Not Installed</div>
+            <div class="malware-status-title">Skill Scanner Not Installed</div>
             <div class="malware-status-desc">
-              Malware scanning is disabled. ClamAV is a free, open-source antivirus engine maintained by Cisco Talos
-              with over 3.6 million threat signatures.
+              Skill security scanning is disabled. The Cisco AI Defense skill-scanner detects prompt injection,
+              data exfiltration, and malicious code patterns in agent skills using static analysis, behavioral
+              dataflow analysis, and YARA rules.
             </div>
             <div class="malware-status-action">
-              Run <code>kyber setup-clamav</code> to install and configure ClamAV automatically.
-              Future scans will include full-system malware detection.
+              Run <code>kyber setup-skillscanner</code> to install.
+              Future scans will automatically check all installed skills for threats.
             </div>
           </div>
         </div>
       `;
-    } else if (malCat.status === 'skip') {
-      // Explicitly skipped (e.g. clamscan not found during scan)
-      malBody.innerHTML = `
+    } else if (sklCat.status === 'skip') {
+      sklBody.innerHTML = `
         <div class="malware-status malware-status-skip">
           <div class="malware-status-icon">⚠️</div>
           <div class="malware-status-info">
-            <div class="malware-status-title">Malware Scan Skipped</div>
+            <div class="malware-status-title">Skill Scan Skipped</div>
             <div class="malware-status-desc">
-              ClamAV was not available during this scan. Install it to enable malware detection.
+              The skill-scanner was not available during this scan. Install it to enable skill security scanning.
             </div>
             <div class="malware-status-action">
-              Run <code>kyber setup-clamav</code> to install and configure ClamAV automatically.
+              Run <code>kyber setup-skillscanner</code> to install.
             </div>
           </div>
         </div>
       `;
-    } else if (malCat.finding_count === 0 && malCat.status === 'pass') {
-      // Clean scan
-      malBody.innerHTML = `
+    } else if (sklCat.finding_count === 0 && sklCat.status === 'pass') {
+      sklBody.innerHTML = `
         <div class="malware-status malware-status-clean">
           <div class="malware-status-icon">✅</div>
           <div class="malware-status-info">
-            <div class="malware-status-title">No Threats Detected</div>
+            <div class="malware-status-title">All Skills Clean</div>
             <div class="malware-status-desc">
-              ClamAV performed a full system scan and found no malware, trojans, viruses, or other threats.
-              Threat signatures were updated before scanning.
+              Cisco AI Defense skill-scanner checked all installed skills and found no prompt injection,
+              data exfiltration, or malicious code patterns.
             </div>
           </div>
         </div>
       `;
     } else {
-      // Threats found
-      const threatCount = malCat.finding_count;
-      malBody.innerHTML = `
+      const threatCount = sklCat.finding_count;
+      sklBody.innerHTML = `
         <div class="malware-status malware-status-threat">
           <div class="malware-status-icon">🚨</div>
           <div class="malware-status-info">
-            <div class="malware-status-title">${threatCount} Threat${threatCount !== 1 ? 's' : ''} Detected</div>
+            <div class="malware-status-title">${threatCount} Skill Threat${threatCount !== 1 ? 's' : ''} Detected</div>
             <div class="malware-status-desc">
-              ClamAV detected potentially malicious files on your system. Review the findings below and take action immediately.
+              The skill-scanner detected potentially malicious patterns in your installed skills. Review the findings below and consider removing or quarantining affected skills.
             </div>
           </div>
         </div>
       `;
-      // Show malware findings inline in this card
-      if (malFindings.length > 0) {
-        const malList = document.createElement('div');
-        malList.className = 'malware-findings';
-        for (const f of malFindings) {
+      if (sklFindings.length > 0) {
+        const sklList = document.createElement('div');
+        sklList.className = 'malware-findings';
+        for (const f of sklFindings) {
           const row = document.createElement('details');
           row.className = 'security-finding';
           const sum = document.createElement('summary');
@@ -2618,8 +2920,10 @@ function renderSecurity() {
             <span class="security-finding-sev" style="background:${severityColor(f.severity)}">${f.severity.toUpperCase()}</span>
             <span class="security-finding-id">${f.id || ''}</span>
             <span class="security-finding-title">${f.title}</span>
+            ${trackerBadge(f.tracker_status)}
             <svg class="security-finding-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
           `;
+          sum.appendChild(makeDismissBtn(f, () => doRender()));
           row.appendChild(sum);
           const body = document.createElement('div');
           body.className = 'security-finding-body';
@@ -2629,17 +2933,17 @@ function renderSecurity() {
             ${f.evidence ? `<pre class="security-finding-evidence">${f.evidence}</pre>` : ''}
           `;
           row.appendChild(body);
-          malList.appendChild(row);
+          sklList.appendChild(row);
         }
-        malBody.appendChild(malList);
+        sklBody.appendChild(sklList);
       }
     }
 
-    malCard.appendChild(malBody);
-    container.appendChild(malCard);
+    sklCard.appendChild(sklBody);
+    container.appendChild(sklCard);
 
-    // Findings list (exclude malware findings since they're shown in the dedicated card)
-    const nonMalwareFindings = findings.filter(f => f.category !== 'malware');
+    // Findings list (exclude malware and skill_scan findings since they're shown in dedicated cards)
+    const nonMalwareFindings = findings.filter(f => f.category !== 'malware' && f.category !== 'skill_scan');
     if (nonMalwareFindings.length > 0) {
       const findCard = document.createElement('div');
       findCard.className = 'card';
@@ -2665,8 +2969,10 @@ function renderSecurity() {
           <span class="security-finding-sev" style="background:${severityColor(f.severity)}">${f.severity.toUpperCase()}</span>
           <span class="security-finding-id">${f.id || ''}</span>
           <span class="security-finding-title">${f.title}</span>
+          ${trackerBadge(f.tracker_status)}
           <svg class="security-finding-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
         `;
+        sum.appendChild(makeDismissBtn(f, () => doRender()));
         row.appendChild(sum);
 
         const body = document.createElement('div');
@@ -2712,22 +3018,41 @@ function renderSecurity() {
       histBody.className = 'card-body';
       histBody.style.padding = '0';
 
-      for (const r of data.reports) {
+      // Already sorted newest-first from the backend, but ensure it
+      const sorted = [...data.reports].sort((a, b) => {
+        const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+        const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+        return tb - ta;
+      });
+
+      for (const r of sorted) {
         const s = r.summary || {};
         const rTs = r.timestamp ? new Date(r.timestamp).toLocaleString() : 'Unknown';
         const rScore = s.score ?? '?';
+        const isLatest = r.filename === sorted[0].filename;
         const row = document.createElement('div');
-        row.className = 'security-hist-row';
+        row.className = 'security-hist-row security-hist-clickable';
+        if (isLatest) row.classList.add('security-hist-active');
         row.innerHTML = `
           <span class="security-hist-score" style="color:${securityScoreColor(rScore)}">${rScore}</span>
-          <span class="security-hist-date">${rTs}</span>
+          <span class="security-hist-date">${rTs}${isLatest ? ' <span class="security-hist-badge">Latest</span>' : ''}</span>
           <span class="security-hist-counts">
             ${s.critical ? `<span style="color:var(--red)">${s.critical}C</span>` : ''}
             ${s.high ? `<span style="color:#f97316">${s.high}H</span>` : ''}
             ${s.medium ? `<span style="color:var(--amber)">${s.medium}M</span>` : ''}
             ${s.low ? `<span style="color:var(--text-tertiary)">${s.low}L</span>` : ''}
           </span>
+          <svg class="security-hist-arrow" width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
         `;
+        row.addEventListener('click', async () => {
+          try {
+            const res = await apiFetch(`${API}/security/reports/${r.filename}`);
+            const reportData = await res.json();
+            renderReport({ latest: reportData, reports: data.reports });
+          } catch (e) {
+            showToast('Failed to load report', 'error');
+          }
+        });
         histBody.appendChild(row);
       }
       histCard.appendChild(histBody);
@@ -2763,8 +3088,10 @@ function renderSecurity() {
       _secScanRunning = true;
       _secScanTriggeredAt = Date.now();
       progressBanner.classList.remove('hidden');
-      document.getElementById('secScanDetail').textContent = 'Waiting for agent to start scan…';
-      document.getElementById('secScanElapsed').textContent = '0s';
+      const detail = document.getElementById('secScanDetail');
+      const elapsedEl = document.getElementById('secScanElapsed');
+      if (detail) detail.textContent = 'Waiting for agent to start scan…';
+      if (elapsedEl) elapsedEl.textContent = '0s';
       startPolling();
     } catch (e) {
       showToast('Failed to trigger scan', 'error');
@@ -2777,155 +3104,6 @@ function renderSecurity() {
   refreshBtn.addEventListener('click', () => doRender({ showLoading: true }));
 
   doRender({ showLoading: true });
-}
-
-// ── Debug (Errors) ──
-async function fetchErrors(limit = 200) {
-  const res = await apiFetch(`${API}/errors?limit=${encodeURIComponent(String(limit))}`);
-  const data = await res.json();
-  return data.errors || [];
-}
-
-async function clearErrors() {
-  const res = await apiFetch(`${API}/errors/clear`, { method: 'POST' });
-  return await res.json();
-}
-
-function renderDebug() {
-  const topRow = document.createElement('div');
-  topRow.className = 'tasks-toprow';
-
-  const leftControls = document.createElement('div');
-  leftControls.className = 'tasks-controls';
-
-  const refreshBtn = document.createElement('button');
-  refreshBtn.className = 'btn btn-ghost';
-  refreshBtn.textContent = 'Refresh';
-  leftControls.appendChild(refreshBtn);
-
-  const clearBtn = document.createElement('button');
-  clearBtn.className = 'btn btn-ghost';
-  clearBtn.textContent = 'Clear';
-  leftControls.appendChild(clearBtn);
-
-  const autoWrap = document.createElement('label');
-  autoWrap.className = 'task-toggle';
-  const autoCb = document.createElement('input');
-  autoCb.type = 'checkbox';
-  autoCb.checked = sessionStorage.getItem(DEBUG_AUTOREFRESH_KEY) === '1';
-  autoCb.addEventListener('change', () => {
-    sessionStorage.setItem(DEBUG_AUTOREFRESH_KEY, autoCb.checked ? '1' : '0');
-    if (tasksPollTimer) {
-      clearInterval(tasksPollTimer);
-      tasksPollTimer = null;
-    }
-    if (autoCb.checked) {
-      tasksPollTimer = setInterval(() => {
-        if (activeSection !== 'debug') return;
-        doRender({ showLoading: false });
-      }, 5000);
-      doRender({ showLoading: false });
-    }
-  });
-  const autoText = document.createElement('span');
-  autoText.textContent = 'Auto-refresh';
-  autoWrap.appendChild(autoCb);
-  autoWrap.appendChild(autoText);
-  leftControls.appendChild(autoWrap);
-
-  topRow.appendChild(leftControls);
-
-  const hint = document.createElement('div');
-  hint.className = 'tasks-hint';
-  hint.textContent = 'Only ERROR-level logs are shown here.';
-  topRow.appendChild(hint);
-
-  contentBody.appendChild(topRow);
-
-  const card = makeCard('Gateway Errors');
-  const wrap = document.createElement('div');
-  wrap.className = 'tasks-history';
-  card.body.appendChild(wrap);
-  contentBody.appendChild(card.el);
-
-  async function doRender(opts = { showLoading: true }) {
-    const showLoading = opts && opts.showLoading !== undefined ? !!opts.showLoading : true;
-
-    const openKeys = new Set();
-    wrap.querySelectorAll('details.task-disclosure[open]').forEach((d) => {
-      const k = d.dataset.key;
-      if (k) openKeys.add(k);
-    });
-    const y = window.scrollY;
-
-    if (showLoading && !wrap.childElementCount) {
-      wrap.innerHTML = '<div class="empty-state">Loading…</div>';
-    }
-
-    try {
-      const errors = await fetchErrors(250);
-      wrap.innerHTML = '';
-      if (!errors.length) {
-        wrap.innerHTML = '<div class="empty-state">No errors captured.</div>';
-      } else {
-        errors.forEach((e, idx) => {
-          const d = document.createElement('details');
-          d.className = 'task-disclosure';
-          const key = (e.ts || '') + '|' + (e.where || '') + '|' + String(idx);
-          d.dataset.key = key;
-
-          const s = document.createElement('summary');
-          s.className = 'task-summary';
-          const ts = e.ts ? fmtWhen(e.ts) : '';
-          const where = e.where || '';
-          const msg = (e.message || '').split('\n')[0];
-          s.textContent = `${ts} · ${where}` + (msg ? ` · ${msg}` : '');
-          d.appendChild(s);
-
-          const body = document.createElement('div');
-          body.className = 'task-body';
-
-          const pre = document.createElement('pre');
-          pre.className = 'task-output';
-          const detail = [];
-          if (e.level) detail.push(`level: ${e.level}`);
-          if (e.where) detail.push(`where: ${e.where}`);
-          if (e.message) detail.push(`message:\n${e.message}`);
-          if (e.exception) detail.push(`exception:\n${e.exception}`);
-          pre.textContent = detail.join('\n\n').slice(0, 30000);
-          body.appendChild(pre);
-
-          d.appendChild(body);
-          if (openKeys.has(key)) d.open = true;
-          wrap.appendChild(d);
-        });
-      }
-
-      window.scrollTo(0, y);
-    } catch (err) {
-      console.error(err);
-      wrap.innerHTML = '<div class="empty-state">Failed to load errors.</div>';
-    }
-  }
-
-  refreshBtn.addEventListener('click', () => doRender({ showLoading: true }));
-  clearBtn.addEventListener('click', async () => {
-    try {
-      await clearErrors();
-      showToast('Cleared error log', 'success');
-      await doRender({ showLoading: true });
-    } catch {
-      showToast('Failed to clear error log', 'error');
-    }
-  });
-
-  doRender({ showLoading: true });
-  if (autoCb.checked) {
-    tasksPollTimer = setInterval(() => {
-      if (activeSection !== 'debug') return;
-      doRender({ showLoading: false });
-    }, 5000);
-  }
 }
 
 // ── Event listeners ──

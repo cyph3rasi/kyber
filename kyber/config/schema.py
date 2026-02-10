@@ -123,10 +123,24 @@ class ExecToolConfig(BaseModel):
     restrict_to_workspace: bool = False  # If true, block commands accessing paths outside workspace
 
 
+class SkillScannerConfig(BaseModel):
+    """Cisco AI Defense skill-scanner configuration."""
+    llm_api_key: str = ""  # API key for LLM analyzer (auto-detected from providers if empty)
+    llm_model: str = ""  # Model for LLM analyzer (e.g. "claude-3-5-sonnet-20241022")
+    virustotal_api_key: str = ""  # VirusTotal API key for binary scanning
+    ai_defense_api_key: str = ""  # Cisco AI Defense API key
+    use_llm: bool = True  # Enable LLM-based semantic analysis (uses active provider key)
+    use_behavioral: bool = True  # Enable behavioral dataflow analysis
+    use_virustotal: bool = False  # Enable VirusTotal binary scanning (requires API key)
+    use_aidefense: bool = False  # Enable Cisco AI Defense cloud scanning (requires API key)
+    enable_meta: bool = True  # Enable meta-analyzer for false positive filtering
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    skill_scanner: SkillScannerConfig = Field(default_factory=SkillScannerConfig)
 
 
 class Config(BaseSettings):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import platform
 import secrets
@@ -311,14 +312,6 @@ def create_dashboard_app(config: Config) -> FastAPI:
     async def redeliver_task(request: Request, ref: str) -> JSONResponse:
         return await _proxy_gateway(request, "POST", f"/tasks/{ref}/redeliver")
 
-    @app.get("/api/errors", dependencies=[Depends(_require_token)])
-    async def get_errors(request: Request, limit: int = 200) -> JSONResponse:
-        return await _proxy_gateway(request, "GET", f"/errors?limit={int(limit)}")
-
-    @app.post("/api/errors/clear", dependencies=[Depends(_require_token)])
-    async def clear_errors(request: Request) -> JSONResponse:
-        return await _proxy_gateway(request, "POST", "/errors/clear")
-
     @app.get("/api/skills", dependencies=[Depends(_require_token)])
     async def get_skills() -> JSONResponse:
         cfg = load_config()
@@ -614,6 +607,15 @@ def create_dashboard_app(config: Config) -> FastAPI:
     def _load_security_report(path: Path) -> dict[str, Any] | None:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            # Derive timestamp from the filename (real system time) rather
+            # than trusting whatever the agent wrote into the JSON.
+            # Filename format: report_YYYY-MM-DDTHH-MM-SS.json
+            stem = path.stem
+            if stem.startswith("report_"):
+                ts_part = stem[len("report_"):]
+                parts = ts_part.split("T", 1)
+                if len(parts) == 2:
+                    data["timestamp"] = parts[0] + "T" + parts[1].replace("-", ":") + "Z"
             return data
         except Exception:
             return None
@@ -621,9 +623,11 @@ def create_dashboard_app(config: Config) -> FastAPI:
     @app.get("/api/security/reports", dependencies=[Depends(_require_token)])
     async def list_security_reports(limit: int = Query(20, ge=1, le=100)) -> JSONResponse:
         """List available security reports, newest first."""
+        from kyber.security.tracker import update_tracker, get_tracker_summary, _load_tracker
+
         reports_dir = _security_reports_dir()
         if not reports_dir.exists():
-            return JSONResponse({"reports": [], "latest": None})
+            return JSONResponse({"reports": [], "latest": None, "tracker": get_tracker_summary()})
 
         files = sorted(reports_dir.glob("report_*.json"), reverse=True)[:limit]
         reports = []
@@ -639,8 +643,20 @@ def create_dashboard_app(config: Config) -> FastAPI:
         latest = None
         if files:
             latest = _load_security_report(files[0])
+            if latest:
+                # Only run update_tracker if this report hasn't been processed yet.
+                # Re-processing the same report would flip "new" findings to "recurring".
+                tracker = _load_tracker()
+                if tracker.get("last_processed_report") != files[0].name:
+                    latest["_report_filename"] = files[0].name
+                    update_tracker(latest)
+                    latest.pop("_report_filename", None)
 
-        return JSONResponse({"reports": reports, "latest": latest})
+        return JSONResponse({
+            "reports": reports,
+            "latest": latest,
+            "tracker": get_tracker_summary(),
+        })
 
     @app.get("/api/security/reports/{filename}", dependencies=[Depends(_require_token)])
     async def get_security_report(filename: str) -> JSONResponse:
@@ -663,5 +679,98 @@ def create_dashboard_app(config: Config) -> FastAPI:
     async def trigger_security_scan(request: Request) -> JSONResponse:
         """Trigger an immediate security scan via the gateway's direct spawn endpoint."""
         return await _proxy_gateway(request, "POST", "/security/scan")
+
+    @app.get("/api/security/issues", dependencies=[Depends(_require_token)])
+    async def list_security_issues() -> JSONResponse:
+        """Return all tracked security issues with their status."""
+        from kyber.security.tracker import _load_tracker
+        tracker = _load_tracker()
+        issues = list(tracker.get("issues", {}).values())
+        # Sort: open issues first (new/recurring), then resolved; within each group by severity
+        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        status_order = {"new": 0, "recurring": 1, "resolved": 2}
+        issues.sort(key=lambda i: (
+            status_order.get(i.get("status", "new"), 9),
+            sev_order.get(i.get("severity", "low"), 9),
+        ))
+        return JSONResponse({"issues": issues, "last_updated": tracker.get("last_updated")})
+
+    @app.post("/api/security/dismiss", dependencies=[Depends(_require_token)])
+    async def dismiss_finding(request: Request) -> JSONResponse:
+        """Dismiss a security finding so it won't appear in future scans."""
+        from kyber.security.tracker import dismiss_issue
+        body = await request.json()
+        fp = body.get("fingerprint", "")
+        if not fp:
+            return JSONResponse({"ok": False, "error": "Missing fingerprint"}, status_code=400)
+        ok = dismiss_issue(fp)
+        if not ok:
+            return JSONResponse({"ok": False, "error": "Finding not found"}, status_code=404)
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/security/undismiss", dependencies=[Depends(_require_token)])
+    async def undismiss_finding(request: Request) -> JSONResponse:
+        """Restore a dismissed security finding."""
+        from kyber.security.tracker import undismiss_issue
+        body = await request.json()
+        fp = body.get("fingerprint", "")
+        if not fp:
+            return JSONResponse({"ok": False, "error": "Missing fingerprint"}, status_code=400)
+        ok = undismiss_issue(fp)
+        if not ok:
+            return JSONResponse({"ok": False, "error": "Finding not found or not dismissed"}, status_code=404)
+        return JSONResponse({"ok": True})
+
+    # ── ClamAV Background Scan API ──
+
+    @app.get("/api/security/clamscan", dependencies=[Depends(_require_token)])
+    async def get_clamscan_report() -> JSONResponse:
+        """Return the latest background ClamAV scan results and next scheduled run."""
+        from kyber.security.clamscan import get_latest_report, get_scan_history, get_running_state
+
+        report = get_latest_report()
+        history = get_scan_history(limit=5)
+        running = get_running_state()
+
+        # Find the next scheduled clamscan run from cron
+        next_run = None
+        try:
+            cron_svc = _cron_service()
+            for job in cron_svc.list_jobs():
+                if job.id == "kyber-clamscan" or "clamscan" in job.name.lower() or "clamav" in job.name.lower():
+                    if job.state.next_run_at_ms:
+                        from datetime import datetime, timezone
+                        next_run = datetime.fromtimestamp(
+                            job.state.next_run_at_ms / 1000, tz=timezone.utc
+                        ).isoformat()
+                    break
+        except Exception:
+            pass
+
+        # Check if ClamAV is installed
+        import shutil
+        installed = bool(shutil.which("clamdscan") or shutil.which("clamscan"))
+
+        return JSONResponse({
+            "latest": report,
+            "history": history,
+            "next_run": next_run,
+            "running": running,
+            "installed": installed,
+        })
+
+    @app.post("/api/security/clamscan/run", dependencies=[Depends(_require_token)])
+    async def trigger_clamscan() -> JSONResponse:
+        """Trigger an immediate background ClamAV scan."""
+        import asyncio
+        from kyber.security.clamscan import run_clamscan, get_running_state
+
+        if get_running_state():
+            return JSONResponse({"ok": False, "message": "A ClamAV scan is already running"}, status_code=409)
+
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, run_clamscan)
+
+        return JSONResponse({"ok": True, "message": "ClamAV scan started in background"})
 
     return app

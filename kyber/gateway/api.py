@@ -34,6 +34,18 @@ def _require_token(token: str):
     return _dep
 
 
+def _redact_secrets(s: str) -> str:
+    """Redact strings that look like API keys, tokens, or passwords."""
+    import re
+    s = re.sub(
+        r'(?i)(api[_-]?key|token|secret|password|bearer)\s*[=:]\s*\S+',
+        r'\1=***',
+        s,
+    )
+    s = re.sub(r'\b(sk|key|xai|gsk|pk|rk)-[A-Za-z0-9_-]{20,}\b', '***', s)
+    return s
+
+
 def _task_to_dict(t: Task) -> dict[str, Any]:
     return {
         "id": t.id,
@@ -49,10 +61,10 @@ def _task_to_dict(t: Task) -> dict[str, Any]:
         "completed_at": t.completed_at.isoformat() if t.completed_at else None,
         "iteration": t.iteration,
         "max_iterations": t.max_iterations,
-        "current_action": t.current_action,
-        "actions_completed": t.actions_completed[-10:],
+        "current_action": _redact_secrets(t.current_action),
+        "actions_completed": [_redact_secrets(a) for a in t.actions_completed[-10:]],
         "progress_updates_enabled": t.progress_updates_enabled,
-        "result": t.result,
+        "result": _redact_secrets(t.result) if t.result else t.result,
         "error": t.error,
     }
 
@@ -171,116 +183,12 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
 
         This is faster and more reliable than routing through /agent/turn because
         it doesn't depend on the chat model being available or responsive.
-        The task description includes all commands inline so the worker doesn't
-        need to read the SKILL.md, saving many LLM turns.
+        The task description is built from a shared module so dashboard and
+        chat-triggered scans are always identical.
         """
-        from datetime import datetime as _dt, timezone as _tz
+        from kyber.security.scan import build_scan_description
 
-        ts = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H-%M-%S")
-        report_path = f"~/.kyber/security/reports/report_{ts}.json"
-
-        description = f"""Perform a security scan. Follow these steps EXACTLY.
-
-## Step 1: Run all checks in ONE exec call
-
-Run this combined script in a single `exec` tool call:
-
-```
-echo "===NETWORK==="
-lsof -i -P -n 2>/dev/null | grep LISTEN || netstat -an 2>/dev/null | grep LISTEN
-echo "===SSH==="
-ls -la ~/.ssh/ 2>/dev/null
-cat ~/.ssh/config 2>/dev/null | head -50
-echo "===PERMISSIONS==="
-ls -la ~/.ssh/id_* ~/.kyber/config.json ~/.kyber/.env 2>/dev/null
-find ~ -maxdepth 3 -name ".env" -type f 2>/dev/null | head -10
-echo "===SECRETS==="
-grep -i "api_key\\|secret\\|token\\|password" ~/.bashrc ~/.zshrc ~/.bash_profile ~/.zprofile 2>/dev/null | head -20
-echo "===SOFTWARE==="
-brew outdated 2>/dev/null | head -10
-echo "===PROCESSES==="
-ps aux --sort=-%cpu 2>/dev/null | head -10 || ps aux -r 2>/dev/null | head -10
-crontab -l 2>/dev/null
-echo "===FIREWALL==="
-/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null || sudo ufw status 2>/dev/null
-echo "===DOCKER==="
-docker ps 2>/dev/null || echo "Docker not running"
-echo "===GIT==="
-cat ~/.gitignore 2>/dev/null | head -10
-echo "===KYBER==="
-ls -la ~/.kyber/config.json ~/.kyber/.env 2>/dev/null
-cat ~/.kyber/config.json 2>/dev/null | python3 -c "import sys,json; c=json.load(sys.stdin); [print(f'{{p}}: key set') if v.get('api_key') else print(f'{{p}}: no key') for p,v in c.get('providers',{{}}).items() if isinstance(v,dict)]" 2>/dev/null
-echo "===MALWARE==="
-which clamscan 2>/dev/null && echo "ClamAV installed" || echo "ClamAV not installed"
-```
-
-## Step 2: If ClamAV is installed, run malware scan
-
-If the output shows "ClamAV installed", run TWO exec calls:
-1. `freshclam 2>&1 || sudo freshclam 2>&1` (update signatures)
-2. `clamscan -r --infected ~/ 2>&1` (full home directory scan)
-
-If ClamAV is NOT installed, skip this and add a finding with id "MAL-000", category "malware", severity "medium", title "ClamAV not installed — malware scanning disabled", remediation "Run `kyber setup-clamav`".
-
-## Step 3: Write the report
-
-Create the directory and write the JSON report in ONE write_file call:
-
-First: `exec` with `mkdir -p ~/.kyber/security/reports`
-
-Then: `write_file` to `{report_path}` with this EXACT JSON structure:
-
-```json
-{{
-  "version": 1,
-  "timestamp": "<current ISO timestamp>",
-  "duration_seconds": <elapsed seconds>,
-  "summary": {{
-    "total_findings": <count>,
-    "critical": <count>,
-    "high": <count>,
-    "medium": <count>,
-    "low": <count>,
-    "score": <0-100, start at 100, deduct: critical=-20, high=-10, medium=-5, low=-2>
-  }},
-  "findings": [
-    {{
-      "id": "<CAT-NNN>",
-      "category": "<network|ssh|permissions|secrets|software|processes|firewall|docker|git|kyber|malware>",
-      "severity": "<critical|high|medium|low>",
-      "title": "<short title>",
-      "description": "<what's wrong>",
-      "remediation": "<how to fix>",
-      "evidence": "<sanitized command output>"
-    }}
-  ],
-  "categories": {{
-    "network": {{"checked": true, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "ssh": {{"checked": true, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "permissions": {{"checked": true, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "secrets": {{"checked": true, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "software": {{"checked": true, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "processes": {{"checked": true, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "firewall": {{"checked": true, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "docker": {{"checked": <true|false>, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "git": {{"checked": true, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "kyber": {{"checked": true, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}},
-    "malware": {{"checked": <true if scanned>, "finding_count": <n>, "status": "<pass|warn|fail|skip>"}}
-  }},
-  "notes": "<conversational summary of findings and recommendations>"
-}}
-```
-
-Category status: pass (no issues), warn (medium/low), fail (critical/high), skip (not applicable).
-Never include actual secret values — only note presence/absence.
-
-## Step 4: Clean up old reports
-
-`exec`: `ls -t ~/.kyber/security/reports/report_*.json | tail -n +21 | xargs rm -f 2>/dev/null`
-
-## Step 5: Deliver results
-
-Your final message should summarize the key findings conversationally. Do NOT end on a tool call."""
+        description, _report_path = build_scan_description()
 
         task = agent.registry.create(
             description=description,
@@ -296,5 +204,37 @@ Your final message should summarize the key findings conversationally. Do NOT en
             "task_id": task.id,
             "reference": task.reference,
         })
+
+    @app.post("/security/dismiss", dependencies=[Depends(require)])
+    async def dismiss_finding(body: dict[str, Any]) -> JSONResponse:
+        """Dismiss a security finding so it no longer appears in future scans."""
+        from kyber.security.tracker import dismiss_issue
+
+        fingerprint = str(body.get("fingerprint", "")).strip()
+        if not fingerprint:
+            raise HTTPException(status_code=400, detail="fingerprint is required")
+
+        if dismiss_issue(fingerprint):
+            return JSONResponse({"ok": True})
+        raise HTTPException(status_code=404, detail="Finding not found")
+
+    @app.post("/security/undismiss", dependencies=[Depends(require)])
+    async def undismiss_finding(body: dict[str, Any]) -> JSONResponse:
+        """Restore a previously dismissed finding."""
+        from kyber.security.tracker import undismiss_issue
+
+        fingerprint = str(body.get("fingerprint", "")).strip()
+        if not fingerprint:
+            raise HTTPException(status_code=400, detail="fingerprint is required")
+
+        if undismiss_issue(fingerprint):
+            return JSONResponse({"ok": True})
+        raise HTTPException(status_code=404, detail="Finding not found or not dismissed")
+
+    @app.get("/security/dismissed", dependencies=[Depends(require)])
+    async def list_dismissed() -> JSONResponse:
+        """List all dismissed findings."""
+        from kyber.security.tracker import get_dismissed_issues
+        return JSONResponse({"dismissed": get_dismissed_issues()})
 
     return app

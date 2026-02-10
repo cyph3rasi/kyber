@@ -71,6 +71,23 @@ def _looks_like_status_request(text: str) -> bool:
     return False
 
 
+def _is_security_scan_request(text: str) -> bool:
+    """Detect if a task description is requesting a security scan."""
+    s = (text or "").lower()
+    return any(phrase in s for phrase in [
+        "security scan",
+        "security audit",
+        "security check",
+        "scan my system",
+        "scan for vulnerabilities",
+        "scan for threats",
+        "scan for malware",
+        "run a scan",
+        "full scan",
+        "environment scan",
+    ])
+
+
 def _strip_fabricated_refs(text: str) -> str:
     """
     Remove task-reference blocks that the model might hallucinate.
@@ -191,6 +208,7 @@ class Orchestrator:
         task_provider: LLMProvider | None = None,
         task_model: str | None = None,
         timezone: str | None = None,
+        exec_timeout: int = 60,
     ):
         self.bus = bus
         self.provider = provider
@@ -217,6 +235,7 @@ class Orchestrator:
             model=_task_model,
             brave_api_key=brave_api_key,
             timezone=timezone,
+            exec_timeout=exec_timeout,
         )
 
         self._running = False
@@ -510,6 +529,19 @@ class Orchestrator:
         message = _strip_fabricated_refs(message)
         
         if intent.action == IntentAction.SPAWN_TASK:
+            desc = (intent.task_description or "").lower()
+            label = (intent.task_label or "").lower()
+            combined = f"{desc} {label}"
+
+            # Intercept security scan requests — route through the deterministic
+            # scan path instead of letting the LLM improvise with the SKILL.md.
+            if _is_security_scan_request(combined):
+                task = self._spawn_security_scan(channel, chat_id)
+                if task:
+                    logger.info(f"Intercepted security scan → deterministic spawn [{task.reference}]")
+                    return message
+                # Fall through to normal spawn if the deterministic path fails
+
             # Create and spawn task
             task = self.registry.create(
                 description=intent.task_description or message,
@@ -553,7 +585,32 @@ class Orchestrator:
         # IntentAction.NONE = pure chat, no modification needed
         
         return message
-    
+
+    def _spawn_security_scan(self, channel: str, chat_id: str) -> Task | None:
+        """Spawn a deterministic security scan using the shared scan builder.
+
+        This ensures chat-triggered scans go through the exact same path as
+        dashboard-triggered scans — same commands, same report format, same
+        issue tracker integration.
+        """
+        from kyber.security.scan import build_scan_description
+
+        try:
+            description, _report_path = build_scan_description()
+
+            task = self.registry.create(
+                description=description,
+                label="Full Security Scan",
+                origin_channel=channel,
+                origin_chat_id=chat_id,
+                complexity="complex",
+            )
+            self.workers.spawn(task)
+            return task
+        except Exception as e:
+            logger.error(f"Failed to spawn deterministic security scan: {e}")
+            return None
+
     async def _completion_loop(self) -> None:
         """
         Background loop that delivers task completions to the user.
