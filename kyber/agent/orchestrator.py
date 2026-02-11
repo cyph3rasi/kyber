@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from loguru import logger
 from kyber.bus.events import InboundMessage, OutboundMessage
 from kyber.bus.queue import MessageBus
 from kyber.providers.base import LLMProvider
+from kyber.providers.history import dicts_to_model_messages
 from kyber.session.manager import SessionManager
 
 from kyber.agent.task_registry import TaskRegistry, Task, TaskStatus
@@ -32,9 +34,23 @@ from kyber.agent.voice import CharacterVoice
 from kyber.agent.context import ContextBuilder
 from kyber.agent.narrator import LiveNarrator
 from kyber.agent.intent import (
-    Intent, IntentAction, AgentResponse, 
+    Intent, IntentAction, AgentResponse,
     RESPOND_TOOL, parse_tool_call, parse_response_content
 )
+
+
+@dataclass
+class ChatDeps:
+    """Dependencies passed to PydanticAI agent via RunContext.
+
+    This is for future use — the orchestrator passes it to the provider,
+    and eventually PydanticAI tools/instructions can access it via
+    ``RunContext[ChatDeps]``.
+    """
+    system_state: str
+    session_key: str | None
+    persona_prompt: str
+    timezone: str | None = None
 
 
 # Action-claiming phrases that require intent validation
@@ -300,7 +316,7 @@ def _looks_like_confirmation_prompt(text: str) -> bool:
 class Orchestrator:
     """
     The main agent orchestrator.
-    
+
     Handles:
     - Message processing with structured intent
     - Task spawning and tracking
@@ -308,7 +324,7 @@ class Orchestrator:
     - Completion notifications (guaranteed, in character)
     - Concurrent chat while tasks run
     """
-    
+
     def __init__(
         self,
         bus: MessageBus,
@@ -563,14 +579,14 @@ class Orchestrator:
             chat_id=msg.chat_id,
             content=final_message,
         )
-    
+
     async def run(self) -> None:
         """
         Main run loop. Processes messages and handles completions.
         """
         self._running = True
         logger.info("Orchestrator started")
-        
+
         # Start the live narrator (replaces voice-based progress for active tasks)
         if self.narrator:
             self.narrator.start()
@@ -582,7 +598,7 @@ class Orchestrator:
         completion_task = asyncio.create_task(self._completion_loop())
         if self.background_progress_updates:
             progress_task = asyncio.create_task(self._progress_loop())
-        
+
         try:
             while self._running:
                 try:
@@ -601,7 +617,7 @@ class Orchestrator:
                 completion_task.cancel()
             if progress_task:
                 progress_task.cancel()
-    
+
     def stop(self) -> None:
         """Stop the orchestrator."""
         self._running = False
@@ -659,7 +675,7 @@ class Orchestrator:
                 chat_id=msg.chat_id,
                 content=f"Sorry, something went wrong: {str(e)}",
             ))
-    
+
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a message using structured intent.
@@ -708,11 +724,21 @@ class Orchestrator:
 
         # Build context with omniscient state
         system_state = self.registry.get_context_summary()
-        messages = self._build_messages(session, msg.content, system_state)
-
-        # Get structured response from LLM
         self._last_user_content = msg.content
-        agent_response = await self._get_structured_response(messages, session_key=msg.session_key)
+
+        # --- PydanticAI native structured output path ---
+        # When the provider supports run_structured(), use it for direct
+        # AgentResponse output (no tool-call parsing needed).
+        if hasattr(self.provider, "run_structured"):
+            agent_response = await self._get_structured_response_native(
+                session, msg.content, system_state,
+            )
+            # Build messages list for honesty validation retry path
+            messages = self._build_messages(session, msg.content, system_state)
+        else:
+            # --- Legacy path (non-PydanticAI providers) ---
+            messages = self._build_messages(session, msg.content, system_state)
+            agent_response = await self._get_structured_response(messages, session_key=msg.session_key)
 
         if not agent_response:
             # Don't save error fallbacks to session history — they pollute
@@ -727,7 +753,7 @@ class Orchestrator:
                 content=f"Sorry, I'm having trouble responding right now. (model: {self.model})",
             )
 
-        # Validate honesty
+        # Validate honesty (retry uses legacy _get_structured_response path)
         agent_response = await self._validate_honesty(agent_response, messages, session_key=msg.session_key)
 
         # Execute intent and get final message
@@ -840,14 +866,20 @@ class Orchestrator:
                 session=session,
             )
         return final_message
-    
+
     def _build_messages(
         self,
         session: Any,
         current_message: str,
         system_state: str,
     ) -> list[dict[str, Any]]:
-        """Build messages with full context from ContextBuilder."""
+        """Build messages with full context from ContextBuilder.
+
+        Legacy path: used by non-PydanticAI providers and as a fallback for
+        honesty-validation retries. When the provider supports
+        ``run_structured()``, the primary flow uses
+        ``_get_structured_response_native()`` instead.
+        """
         # Build the rich system prompt (identity, instructions, bootstrap
         # files incl. SOUL.md persona, memory, skills).
         base_prompt = self.context.build_system_prompt()
@@ -926,17 +958,22 @@ class Orchestrator:
                     content=f"💎 {text}",
                     is_background=True,
                 ))
-            
+
             kwargs["callback"] = _progress_cb
 
         return await self.provider.chat(**kwargs)
-    
+
     async def _get_structured_response(
         self,
         messages: list[dict[str, Any]],
         session_key: str | None = None,
     ) -> AgentResponse | None:
-        """Get structured response from LLM using function calling."""
+        """Get structured response from LLM using function calling.
+
+        Legacy path: used by non-PydanticAI providers that don't support
+        ``run_structured()``. When the provider supports it, the primary flow
+        uses ``_get_structured_response_native()`` instead.
+        """
         try:
             response = await self._provider_chat(
                 messages=messages,
@@ -982,7 +1019,54 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Error getting structured response: {e}")
             return None
-    
+
+    async def _get_structured_response_native(
+        self,
+        session: Any,
+        current_message: str,
+        system_state: str,
+    ) -> AgentResponse | None:
+        """Get structured response using PydanticAI native structured output.
+
+        This is the preferred path when the provider supports ``run_structured()``.
+        It bypasses the legacy ``_build_messages()`` + ``_get_structured_response()``
+        flow and instead:
+        1. Builds an instructions string (system prompt + system state)
+        2. Converts session history to PydanticAI ``ModelMessage`` format
+        3. Calls ``provider.run_structured()`` to get ``AgentResponse`` directly
+
+        Returns:
+            AgentResponse on success, None on failure (same pattern as
+            ``_get_structured_response``).
+        """
+        try:
+            base_prompt = self.context.build_system_prompt()
+            instructions = (
+                f"{base_prompt}\n\n---\n\n"
+                f"## Current System State\n{system_state}\n\n"
+                "## How to Respond\n"
+                "Respond with a natural message and an intent that describes any action to take.\n"
+                "Your message should be natural and in-character. The system will\n"
+                "handle adding task references — you don't need to make them up."
+            )
+
+            # Convert session history to PydanticAI ModelMessage format
+            history_dicts = session.get_history(max_messages=10)
+            message_history = dicts_to_model_messages(history_dicts)
+
+            agent_response = await self.provider.run_structured(
+                instructions=instructions,
+                user_message=current_message,
+                message_history=message_history or None,
+                model=self.model,
+            )
+            return agent_response
+
+        except Exception as e:
+            logger.error(f"Error getting native structured response: {e}")
+            return None
+
+
     async def _validate_honesty(
         self,
         response: AgentResponse,
@@ -991,7 +1075,7 @@ class Orchestrator:
     ) -> AgentResponse:
         """
         Validate that the LLM's claims match its declared intent.
-        
+
         If the message claims an action but intent doesn't declare it,
         force a retry.
         """
@@ -1006,7 +1090,7 @@ class Orchestrator:
             logger.warning(
                 f"Honesty violation: claims action but intent is {response.intent.action}"
             )
-            
+
             # Retry with correction
             messages.append({
                 "role": "assistant",
@@ -1022,13 +1106,13 @@ class Orchestrator:
                     "unless the system is actually spawning a task."
                 ),
             })
-            
+
             retry = await self._get_structured_response(messages, session_key=session_key)
             if retry:
                 return retry
-        
+
         return response
-    
+
     async def _execute_intent(
         self,
         response: AgentResponse,
@@ -1038,7 +1122,7 @@ class Orchestrator:
     ) -> str:
         """
         Execute the declared intent and return the final message.
-        
+
         This is where the system takes over - the LLM declared what it wants,
         now we actually do it and inject proof (references).
         """
@@ -1048,7 +1132,7 @@ class Orchestrator:
         # Never allow hallucinated refs to leak into user-visible output.
         # For spawn_task we will inject the true system-generated ref later.
         message = _strip_fabricated_refs(message)
-        
+
         if intent.action == IntentAction.SPAWN_TASK:
             desc = (intent.task_description or "").lower()
             label = (intent.task_label or "").lower()
@@ -1094,13 +1178,13 @@ class Orchestrator:
             else:
                 self.workers.spawn(task)
                 logger.info(f"Spawned task: {task.label} [{task.reference}]")
-        
+
         elif intent.action == IntentAction.CHECK_STATUS:
             status = self.registry.get_status_for_ref(intent.task_ref)
             status_voiced = await self.voice.speak_status(status)
             status_voiced = _strip_task_refs_for_chat(status_voiced)
             message = status_voiced
-        
+
         elif intent.action == IntentAction.CANCEL_TASK:
             ref = (intent.task_ref or "").strip()
             task = self.registry.get_by_ref(ref) if ref else None
@@ -1120,7 +1204,7 @@ class Orchestrator:
                     else:
                         final_status = refreshed.status.value if refreshed else task.status.value
                         message = f"That task is already {final_status}."
-        
+
         # IntentAction.NONE = pure chat, no modification needed
         safe_message = (message or "").strip()
         if safe_message:
@@ -1240,11 +1324,11 @@ class Orchestrator:
                     logger.error(f"Unexpected error in completion loop for '{task.label}': {e}")
                 else:
                     logger.error(f"Error in completion loop: {e}")
-    
+
     async def _progress_loop(self) -> None:
         """
         Background loop that sends batched progress updates.
-        
+
         The LiveNarrator handles real-time updates for active tasks.
         This loop only fires for tasks that somehow aren't covered by
         the narrator (e.g., tasks spawned before narrator was started),
@@ -1260,11 +1344,11 @@ class Orchestrator:
                     except ValueError:
                         interval = 10.0
                 await asyncio.sleep(interval)
-                
+
                 active_tasks = self.registry.get_active_tasks()
                 if not active_tasks:
                     continue
-                
+
                 # Group by origin (channel:chat_id)
                 by_origin: dict[str, list[Task]] = {}
                 for task in active_tasks:
@@ -1275,7 +1359,7 @@ class Orchestrator:
                     if key not in by_origin:
                         by_origin[key] = []
                     by_origin[key].append(task)
-                
+
                 for origin_key, tasks in by_origin.items():
                     if origin_key == "dashboard:dashboard":
                         continue
@@ -1285,7 +1369,7 @@ class Orchestrator:
                         elapsed = (datetime.now() - last_update).total_seconds()
                         if elapsed < interval * 0.8:
                             continue
-                    
+
                     def _progress_emoji(action: str) -> str:
                         a = (action or "").lower()
                         if any(w in a for w in ("read", "load", "check", "inspect", "look", "review", "scan")):
@@ -1311,7 +1395,7 @@ class Orchestrator:
                             step = f"step {task.iteration}"
                             emoji = _progress_emoji(action)
                             summaries.append(f"{emoji} {task.label} — {action} ({step})")
-                    
+
                     if not summaries:
                         continue
 
@@ -1322,25 +1406,25 @@ class Orchestrator:
 
                     # Use simple template — no LLM voice call
                     update = "\n".join(summaries)
-                    
+
                     parts = origin_key.split(":", 1)
                     channel = parts[0]
                     chat_id = parts[1] if len(parts) > 1 else "direct"
-                    
+
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=channel,
                         chat_id=chat_id,
                         content=update,
                         is_background=True,
                     ))
-                    
+
                     self._last_progress_update[origin_key] = datetime.now()
-                
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in progress loop: {e}")
-    
+
     async def process_direct(
         self,
         content: str,
@@ -1349,7 +1433,7 @@ class Orchestrator:
         chat_id: str = "direct",
     ) -> str:
         """Process a message directly (for CLI or cron usage).
-        
+
         When called from cron with delivery enabled, pass the target
         channel/chat_id so spawned background workers route their
         completions to the correct destination instead of 'cli:direct'.
@@ -1360,6 +1444,6 @@ class Orchestrator:
             chat_id=chat_id,
             content=content,
         )
-        
+
         response = await self._process_message(msg)
         return response.content if response else ""
