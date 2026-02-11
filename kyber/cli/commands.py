@@ -218,7 +218,7 @@ def _create_orchestrator(
     Shared by the ``gateway`` and ``agent`` commands so provider/model
     resolution lives in one place.
     """
-    from kyber.providers.litellm_provider import LiteLLMProvider
+    from kyber.providers.strands_provider import StrandsProvider
     from kyber.agent.orchestrator import Orchestrator
 
     # ── Chat provider ──
@@ -227,24 +227,18 @@ def _create_orchestrator(
     chat_api_base = chat_details.get("api_base")
     chat_provider_name = chat_details.get("provider_name") or config.get_provider_name()
     chat_model = config.get_chat_model()
-    chat_is_bedrock = chat_model.startswith("bedrock/")
-
-    if chat_provider_name and not chat_api_key and not chat_is_bedrock:
-        console.print(f"[red]Error: No API key configured for chat provider {chat_provider_name}.[/red]")
-        console.print(f"Set one in ~/.kyber/.env: KYBER_PROVIDERS__{chat_provider_name.upper()}__API_KEY=your-key")
+    if chat_details.get("is_custom", False) and not chat_api_key:
+        console.print(f"[red]Error: Custom chat provider '{chat_provider_name}' requires an API key.[/red]")
         raise typer.Exit(1)
-
-    if not chat_api_key and not chat_is_bedrock:
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.kyber/.env: KYBER_PROVIDERS__OPENROUTER__API_KEY=your-key")
-        raise typer.Exit(1)
-
-    chat_provider = LiteLLMProvider(
+    chat_provider = StrandsProvider(
         api_key=chat_api_key,
         api_base=chat_api_base,
         default_model=chat_model,
         provider_name=chat_provider_name,
         is_custom=chat_details.get("is_custom", False),
+        workspace=config.workspace_path,
+        exec_timeout=config.tools.exec.timeout,
+        brave_api_key=config.tools.web.search.api_key or None,
     )
 
     # ── Task provider ──
@@ -253,24 +247,19 @@ def _create_orchestrator(
     task_api_key = task_details.get("api_key")
     task_api_base = task_details.get("api_base")
     task_model = config.get_task_model()
-    task_is_bedrock = task_model.startswith("bedrock/")
-
-    if (task_provider_name == chat_provider_name
-        and task_api_key == chat_api_key
-        and task_api_base == chat_api_base):
-        task_provider = chat_provider
-    else:
-        if task_provider_name and not task_api_key and not task_is_bedrock:
-            console.print(f"[red]Error: No API key configured for task provider {task_provider_name}.[/red]")
-            console.print(f"Set one in ~/.kyber/.env: KYBER_PROVIDERS__{task_provider_name.upper()}__API_KEY=your-key")
-            raise typer.Exit(1)
-        task_provider = LiteLLMProvider(
-            api_key=task_api_key,
-            api_base=task_api_base,
-            default_model=task_model,
-            provider_name=task_provider_name,
-            is_custom=task_details.get("is_custom", False),
-        )
+    if task_details.get("is_custom", False) and not task_api_key:
+        console.print(f"[red]Error: Custom task provider '{task_provider_name}' requires an API key.[/red]")
+        raise typer.Exit(1)
+    task_provider = StrandsProvider(
+        api_key=task_api_key,
+        api_base=task_api_base,
+        default_model=task_model,
+        provider_name=task_provider_name,
+        is_custom=task_details.get("is_custom", False),
+        workspace=config.workspace_path,
+        exec_timeout=config.tools.exec.timeout,
+        brave_api_key=config.tools.web.search.api_key or None,
+    )
 
     # ── Persona ──
     workspace = config.workspace_path
@@ -1126,6 +1115,21 @@ def setup_clamav():
     else:
         console.print(f"[green]✓[/green] ClamAV already installed: {shutil.which('clamscan')}")
 
+    # ── Step 1b: Ensure daemon package is installed on Linux ──
+    if system == "Linux" and not shutil.which("clamdscan") and not shutil.which("clamd"):
+        daemon_cmd = None
+        if shutil.which("apt"):
+            daemon_cmd = ["sudo", "apt", "install", "-y", "clamav-daemon"]
+        elif shutil.which("dnf"):
+            daemon_cmd = ["sudo", "dnf", "install", "-y", "clamd"]
+        if daemon_cmd:
+            console.print("[cyan]Installing ClamAV daemon package...[/cyan]")
+            result = sp.run(daemon_cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                console.print("[green]✓[/green] ClamAV daemon installed")
+            else:
+                console.print("[yellow]⚠[/yellow] Could not install daemon package — scans will use clamscan (slower)")
+
     # ── Step 2: Configure freshclam + clamd ──
     _ensure_freshclam_config(system)
     _ensure_clamd_config(system)
@@ -1154,9 +1158,12 @@ def setup_clamav():
 
     # ── Step 6: Verify ──
     console.print("")
-    _verify_clamav_setup(system)
-    console.print(f"\n{__logo__} ClamAV is ready! Scans will use the clamd daemon for fast malware detection.")
-    console.print("[dim]Run [cyan]kyber clamscan --schedule[/cyan] to set up a daily background scan.[/dim]")
+    ok = _verify_clamav_setup(system)
+    if ok:
+        console.print(f"\n{__logo__} ClamAV is ready! Scans will use the clamd daemon for fast malware detection.")
+    else:
+        console.print(f"\n{__logo__} ClamAV is installed but clamd isn't running — scans will fall back to clamscan (slower).")
+        console.print("[dim]You can retry [cyan]kyber setup-clamav[/cyan] or start clamd manually to get faster scans.[/dim]")
 
 
 def _ensure_freshclam_config(system: str):
@@ -1271,6 +1278,7 @@ def _ensure_clamd_config(system: str):
                 needs_write = False
                 new_lines_l: list[str] = []
                 has_socket = False
+                socket_path = "/var/run/clamav/clamd.ctl"
                 for line in lines:
                     stripped = line.strip()
                     if stripped == "Example":
@@ -1279,9 +1287,13 @@ def _ensure_clamd_config(system: str):
                         continue
                     if "LocalSocket" in stripped and not stripped.startswith("#"):
                         has_socket = True
+                        # Extract the configured socket path
+                        parts = stripped.split(None, 1)
+                        if len(parts) == 2:
+                            socket_path = parts[1]
                     new_lines_l.append(line)
                 if not has_socket:
-                    new_lines_l.append("LocalSocket /var/run/clamav/clamd.ctl")
+                    new_lines_l.append(f"LocalSocket {socket_path}")
                     needs_write = True
                 if needs_write:
                     sp.run(
@@ -1289,21 +1301,25 @@ def _ensure_clamd_config(system: str):
                         input="\n".join(new_lines_l) + "\n",
                         capture_output=True, text=True,
                     )
+                # Ensure the socket directory exists with correct ownership
+                _ensure_socket_dir(socket_path)
                 console.print(f"  [green]✓[/green] {conf_path}")
                 return
 
         # No config found — create one
         debian_conf = Path("/etc/clamav/clamd.conf")
+        socket_path = "/var/run/clamav/clamd.ctl"
         sp.run(
             ["sudo", "tee", str(debian_conf)],
             input=(
                 "# Kyber-managed clamd config\n"
-                "LocalSocket /var/run/clamav/clamd.ctl\n"
+                f"LocalSocket {socket_path}\n"
                 "DatabaseDirectory /var/lib/clamav\n"
                 "User clamav\n"
             ),
             capture_output=True, text=True,
         )
+        _ensure_socket_dir(socket_path)
         console.print(f"  [green]✓[/green] Created {debian_conf}")
 
 
@@ -1339,9 +1355,20 @@ def _run_freshclam_once(system: str):
         console.print(f"[yellow]⚠  freshclam warnings:[/yellow]\n  {preview}")
 
 
+def _ensure_socket_dir(socket_path: str):
+    """Ensure the directory for the clamd socket exists with correct ownership."""
+    import subprocess as sp
+
+    sock_dir = str(Path(socket_path).parent)
+    sp.run(["sudo", "mkdir", "-p", sock_dir], capture_output=True, text=True)
+    sp.run(["sudo", "chown", "clamav:clamav", sock_dir], capture_output=True, text=True)
+    sp.run(["sudo", "chmod", "755", sock_dir], capture_output=True, text=True)
+
+
 def _setup_linux_clamav_services():
     """Enable and start ClamAV systemd services."""
     import subprocess as sp
+    import time
 
     console.print("[cyan]Enabling ClamAV services...[/cyan]")
 
@@ -1349,7 +1376,12 @@ def _setup_linux_clamav_services():
         result = sp.run(["sudo", "systemctl", "enable", svc_name], capture_output=True, text=True)
         if result.returncode == 0:
             sp.run(["sudo", "systemctl", "start", svc_name], capture_output=True, text=True)
-            console.print(f"  [green]✓[/green] {svc_name} enabled and started")
+            # Verify it actually started
+            check = sp.run(["systemctl", "is-active", svc_name], capture_output=True, text=True)
+            if check.stdout.strip() == "active":
+                console.print(f"  [green]✓[/green] {svc_name} enabled and started")
+            else:
+                console.print(f"  [yellow]⚠[/yellow] {svc_name} enabled but failed to start")
             break
     else:
         console.print("  [yellow]⚠[/yellow] Could not enable freshclam service")
@@ -1358,7 +1390,21 @@ def _setup_linux_clamav_services():
         result = sp.run(["sudo", "systemctl", "enable", svc_name], capture_output=True, text=True)
         if result.returncode == 0:
             sp.run(["sudo", "systemctl", "start", svc_name], capture_output=True, text=True)
-            console.print(f"  [green]✓[/green] {svc_name} enabled and started")
+            # Give clamd a moment to start — it loads signatures on startup
+            time.sleep(2)
+            check = sp.run(["systemctl", "is-active", svc_name], capture_output=True, text=True)
+            if check.stdout.strip() == "active":
+                console.print(f"  [green]✓[/green] {svc_name} enabled and started")
+            else:
+                # Check why it failed
+                journal = sp.run(
+                    ["journalctl", "-u", svc_name, "-n", "5", "--no-pager", "-q"],
+                    capture_output=True, text=True,
+                )
+                console.print(f"  [yellow]⚠[/yellow] {svc_name} enabled but failed to start")
+                if journal.stdout.strip():
+                    for jline in journal.stdout.strip().splitlines()[-2:]:
+                        console.print(f"    [dim]{jline.strip()}[/dim]")
             break
     else:
         console.print("  [yellow]⚠[/yellow] Could not enable clamd service")
@@ -1376,25 +1422,19 @@ def _setup_macos_clamav_services():
         console.print("  [yellow]⚠[/yellow] Could not auto-start. Run: brew services start clamav")
 
 
-def _verify_clamav_setup(system: str):
-    """Verify ClamAV daemon is running and responsive."""
+def _verify_clamav_setup(system: str) -> bool:
+    """Verify ClamAV daemon is running and responsive. Returns True if clamd is fully working."""
     import shutil
     import subprocess as sp
 
     console.print("[cyan]Verifying setup...[/cyan]")
-
-    db_dir = _find_clamav_db_dir()
-    if db_dir:
-        db_files = [f.name for f in db_dir.iterdir() if f.suffix in (".cvd", ".cld")]
-        if db_files:
-            console.print(f"  [green]✓[/green] Signatures: {', '.join(sorted(db_files))}")
-        else:
-            console.print("  [yellow]⚠[/yellow] No signature databases — clamd may not start")
+    clamd_ok = False
 
     if shutil.which("clamdscan"):
         result = sp.run(["clamdscan", "--ping", "3"], capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             console.print("  [green]✓[/green] clamd is running and responsive")
+            clamd_ok = True
         else:
             console.print("  [yellow]⚠[/yellow] clamd not responding yet — may still be loading signatures")
             console.print("  [dim]Give it a minute, then try: clamdscan --ping 5[/dim]")
@@ -1414,9 +1454,12 @@ def _verify_clamav_setup(system: str):
             result = sp.run(["systemctl", "is-active", svc], capture_output=True, text=True)
             if result.stdout.strip() == "active":
                 console.print(f"  [green]✓[/green] {svc}: active")
+                clamd_ok = True
                 break
         else:
             console.print("  [yellow]⚠[/yellow] clamd service not active")
+
+    return clamd_ok
 
 
 def _find_clamav_db_dir() -> Path | None:

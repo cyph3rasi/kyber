@@ -100,16 +100,6 @@ RESPOND_TOOL = {
                         "task_ref": {
                             "type": "string",
                             "description": "For check_status/cancel_task: the ⚡ or ✅ reference"
-                        },
-                        "complexity": {
-                            "type": "string",
-                            "enum": ["simple", "moderate", "complex"],
-                            "description": (
-                                "For spawn_task: how complex is this task? "
-                                "'simple' = quick lookup, 1-5 tool calls. "
-                                "'moderate' = multi-step work, 5-15 tool calls. "
-                                "'complex' = deep investigation, debugging, large builds, 15+ tool calls."
-                            )
                         }
                     },
                     "required": ["action"]

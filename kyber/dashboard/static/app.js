@@ -947,7 +947,8 @@ function renderTasks() {
   autoWrap.className = 'task-toggle';
   const autoCb = document.createElement('input');
   autoCb.type = 'checkbox';
-  autoCb.checked = sessionStorage.getItem(TASKS_AUTOREFRESH_KEY) === '1';
+  // Default ON for better operator UX.
+  autoCb.checked = sessionStorage.getItem(TASKS_AUTOREFRESH_KEY) !== '0';
   autoCb.addEventListener('change', () => {
     sessionStorage.setItem(TASKS_AUTOREFRESH_KEY, autoCb.checked ? '1' : '0');
     if (tasksPollTimer) {
@@ -958,7 +959,7 @@ function renderTasks() {
       tasksPollTimer = setInterval(() => {
         if (activeSection !== 'tasks') return;
         doRender({ showLoading: false });
-      }, 5000);
+      }, 3000);
       doRender({ showLoading: false });
     }
   });
@@ -972,7 +973,7 @@ function renderTasks() {
 
   const hint = document.createElement('div');
   hint.className = 'tasks-hint';
-  hint.textContent = 'Tip: cancel stops the worker; you will still get a completion notice.';
+  hint.textContent = 'Tip: progress updates follow Agent Settings (single global switch).';
   topRow.appendChild(hint);
 
   contentBody.appendChild(topRow);
@@ -1009,6 +1010,8 @@ function renderTasks() {
       const data = await fetchTasks();
       const active = data.active || [];
       const history = data.history || [];
+      const updatesEnabled = data.background_progress_updates !== false;
+      hint.textContent = `Tip: progress updates are ${updatesEnabled ? 'ON' : 'OFF'} in Agent Settings (global switch).`;
 
       // Active
       activeWrap.innerHTML = '';
@@ -1044,30 +1047,6 @@ function renderTasks() {
           const right = document.createElement('div');
           right.className = 'task-right';
 
-          // Per-task progress toggle
-          const toggleWrap = document.createElement('label');
-          toggleWrap.className = 'task-toggle';
-          const cb = document.createElement('input');
-          cb.type = 'checkbox';
-          cb.checked = !!t.progress_updates_enabled;
-          cb.addEventListener('change', async () => {
-            try {
-              await apiFetch(`${API}/tasks/${encodeURIComponent(ref)}/progress-updates`, {
-                method: 'POST',
-                body: JSON.stringify({ enabled: cb.checked }),
-              });
-              showToast(cb.checked ? 'Progress updates enabled' : 'Progress updates disabled', 'success');
-            } catch {
-              showToast('Failed to update task setting', 'error');
-              cb.checked = !cb.checked;
-            }
-          });
-          const cbText = document.createElement('span');
-          cbText.textContent = '30s updates';
-          toggleWrap.appendChild(cb);
-          toggleWrap.appendChild(cbText);
-          right.appendChild(toggleWrap);
-
           // Cancel button
           const cancelBtn = document.createElement('button');
           cancelBtn.className = 'btn-icon danger';
@@ -1078,8 +1057,8 @@ function renderTasks() {
             try {
               const res = await apiFetch(`${API}/tasks/${encodeURIComponent(ref)}/cancel`, { method: 'POST' });
               const out = await res.json();
-              if (out.ok) showToast('Cancel requested', 'success');
-              else showToast('Cancel failed (may have just finished)', 'error');
+              if (out.ok) showToast(out.message || 'Cancel processed', 'success');
+              else showToast(out.message || 'Cancel failed', 'error');
               await doRender();
             } catch {
               showToast('Cancel request failed', 'error');
@@ -1167,12 +1146,12 @@ function renderTasks() {
   contentBody.appendChild(historyCard.el);
 
   doRender({ showLoading: true });
-  // Default: manual refresh only. Auto-refresh is opt-in to avoid collapsing UI.
+  // Default: auto-refresh ON for responsive task monitoring.
   if (autoCb.checked) {
     tasksPollTimer = setInterval(() => {
       if (activeSection !== 'tasks') return;
       doRender({ showLoading: false });
-    }, 5000);
+    }, 3000);
   }
 }
 
@@ -2309,8 +2288,6 @@ function renderClamscanCard(container, data, runBtn) {
   const duration = latest.duration_seconds || 0;
   const durStr = duration >= 3600 ? `${Math.floor(duration / 3600)}h ${Math.floor((duration % 3600) / 60)}m` : duration >= 60 ? `${Math.floor(duration / 60)}m ${duration % 60}s` : `${duration}s`;
   const infected = latest.infected_files || [];
-  const scannedDirs = (latest.scanned_dirs || []).map(d => d.replace(/^\/Users\/[^/]+/, '~')).join(', ');
-  const scannerType = latest.is_daemon ? 'clamdscan (daemon)' : 'clamscan (standalone)';
   const nextRunStr = nextRun ? new Date(nextRun).toLocaleString() : 'Not scheduled';
 
   let statusHtml = '';
@@ -2322,8 +2299,7 @@ function renderClamscanCard(container, data, runBtn) {
         <div class="malware-status-info">
           <div class="malware-status-title">No Threats Detected</div>
           <div class="malware-status-desc">
-            Last scan completed ${finishedAt} (${durStr}) using ${scannerType}.
-            <br>Scanned: ${scannedDirs || 'standard directories'}
+            Full system scan completed ${finishedAt} (${durStr}).
           </div>
           <div class="malware-status-meta">
             Next scheduled scan: ${nextRunStr}
@@ -2338,7 +2314,7 @@ function renderClamscanCard(container, data, runBtn) {
         <div class="malware-status-info">
           <div class="malware-status-title">${infected.length} Threat${infected.length !== 1 ? 's' : ''} Detected</div>
           <div class="malware-status-desc">
-            Last scan completed ${finishedAt} (${durStr}) using ${scannerType}.
+            Full system scan completed ${finishedAt} (${durStr}).
             <br>ClamAV detected potentially malicious files. Review and take action immediately.
           </div>
           <div class="malware-status-meta">
@@ -2400,15 +2376,13 @@ function renderClamscanCard(container, data, runBtn) {
   // Show scan history if available
   if (history.length > 1) {
     const histDiv = document.createElement('div');
-    histDiv.style.marginTop = '12px';
-    histDiv.style.borderTop = '1px solid var(--border)';
-    histDiv.style.paddingTop = '12px';
-    let histHtml = '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">Recent scans</div>';
+    histDiv.className = 'malware-history';
+    let histHtml = '<div class="malware-history-label">Recent scans</div>';
     for (const h of history.slice(0, 5)) {
       const hDate = h.finished_at ? new Date(h.finished_at).toLocaleString() : h.started_at ? new Date(h.started_at).toLocaleString() : '?';
       const hStatus = h.status === 'clean' ? '✅' : h.status === 'threats_found' ? '🚨' : '⚠️';
       const hThreats = h.threat_count ? ` — ${h.threat_count} threat(s)` : '';
-      histHtml += `<div style="font-size:12px;color:var(--text-tertiary);padding:2px 0;">${hStatus} ${hDate}${hThreats}</div>`;
+      histHtml += `<div class="malware-history-row">${hStatus} ${hDate}${hThreats}</div>`;
     }
     histDiv.innerHTML = histHtml;
     container.appendChild(histDiv);
@@ -2512,16 +2486,26 @@ function renderSecurity() {
         hideScanRunning();
         _secStopPolling();
         if (activeSection === 'security') {
-          try {
-            const data = await fetchSecurityReports();
+          // Small delay + retry: the report file may not be written yet
+          // when the task disappears from the active list.
+          let data = null;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            await new Promise(r => setTimeout(r, attempt === 0 ? 1500 : 2000));
+            try {
+              data = await fetchSecurityReports();
+              if (data && data.latest) break;
+            } catch (_) {}
+          }
+          if (data && data.latest) {
             renderReport(data);
-            if (data && data.latest) {
-              showToast('Security scan complete — report updated', 'success');
-            } else {
-              showToast('Scan finished but no report was generated. The agent may have run out of steps. Try running again.', 'error');
-            }
-          } catch (_) {
-            showToast('Scan finished but failed to load results', 'error');
+            showToast('Security scan complete — report updated', 'success');
+          } else {
+            // Last resort: just re-render whatever we have
+            try {
+              data = await fetchSecurityReports();
+              renderReport(data);
+            } catch (_) {}
+            showToast('Scan finished but no new report was found. Try refreshing.', 'error');
           }
         } else {
           _secNeedsRefresh = true;
@@ -2546,16 +2530,23 @@ function renderSecurity() {
       _secStopPolling();
       // Auto-refresh reports — only if security tab is active (DOM is live).
       if (activeSection === 'security') {
-        try {
-          const data = await fetchSecurityReports();
+        let data = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await new Promise(r => setTimeout(r, attempt === 0 ? 1500 : 2000));
+          try {
+            data = await fetchSecurityReports();
+            if (data && data.latest) break;
+          } catch (_) {}
+        }
+        if (data && data.latest) {
           renderReport(data);
-          if (data && data.latest) {
-            showToast('Security scan complete — report updated', 'success');
-          } else {
-            showToast('Scan finished but no report was generated. The agent may have run out of steps. Try running again.', 'error');
-          }
-        } catch (_) {
-          showToast('Scan finished but failed to load results', 'error');
+          showToast('Security scan complete — report updated', 'success');
+        } else {
+          try {
+            data = await fetchSecurityReports();
+            renderReport(data);
+          } catch (_) {}
+          showToast('Scan finished but no new report was found. Try refreshing.', 'error');
         }
       } else {
         _secNeedsRefresh = true;

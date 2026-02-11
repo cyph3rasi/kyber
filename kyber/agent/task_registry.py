@@ -55,7 +55,7 @@ class Task:
     iteration: int = 0
     # None = unlimited
     max_iterations: int | None = None
-    # Per-task toggle: allow 30s background progress pings for this task.
+    # Per-task toggle: allow 60s background progress pings for this task.
     progress_updates_enabled: bool = True
     
     # Results
@@ -251,9 +251,9 @@ class TaskRegistry:
         return self._tasks.get(task_id)
 
     def get_by_ref(self, ref: str) -> Task | None:
-        """Get a task by reference (⚡abc123 or just abc123)."""
+        """Get a task by reference (⚡abc123, ✅abc123, ❌abc123, or just abc123)."""
         clean_ref = ref.strip()
-        if clean_ref.startswith("⚡") or clean_ref.startswith("✅"):
+        if clean_ref and clean_ref[0] in "⚡✅❌":
             clean_ref = clean_ref[1:]
 
         task_id = self._ref_to_id.get(clean_ref) or self._ref_to_id.get(f"⚡{clean_ref}")
@@ -272,6 +272,8 @@ class TaskRegistry:
         """Mark a task as completed with result."""
         task = self._tasks.get(task_id)
         if task:
+            if task.status == TaskStatus.CANCELLED:
+                return
             task.status = TaskStatus.COMPLETED
             task.completed_at = datetime.now()
             task.result = result
@@ -290,10 +292,12 @@ class TaskRegistry:
         """Mark a task as failed with error."""
         task = self._tasks.get(task_id)
         if task:
+            if task.status == TaskStatus.CANCELLED:
+                return
             task.status = TaskStatus.FAILED
             task.completed_at = datetime.now()
             task.error = error
-            task.completion_reference = make_reference("✅")
+            task.completion_reference = make_reference("❌")
             task.current_action = ""
 
             self._ref_to_id[task.completion_reference] = task_id
@@ -307,7 +311,7 @@ class TaskRegistry:
             task.status = TaskStatus.CANCELLED
             task.completed_at = datetime.now()
             task.error = reason or task.error
-            task.completion_reference = make_reference("✅")
+            task.completion_reference = make_reference("❌")
             task.current_action = ""
             self._ref_to_id[task.completion_reference] = task_id
             self._ref_to_id[task.completion_reference[1:]] = task_id

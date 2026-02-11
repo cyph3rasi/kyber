@@ -21,6 +21,9 @@ class ContextBuilder:
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        # Cache for bootstrap files — avoids re-reading disk on every message.
+        # Maps filename → (mtime, content). Invalidated when mtime changes.
+        self._bootstrap_cache: dict[str, tuple[float, str]] = {}
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """
@@ -183,13 +186,22 @@ Skills with available="false" need dependencies installed first - you can try in
 
     
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """Load bootstrap files from workspace, with mtime-based caching."""
         parts = []
         
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
             if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+                try:
+                    mtime = file_path.stat().st_mtime
+                    cached = self._bootstrap_cache.get(filename)
+                    if cached and cached[0] == mtime:
+                        content = cached[1]
+                    else:
+                        content = file_path.read_text(encoding="utf-8")
+                        self._bootstrap_cache[filename] = (mtime, content)
+                    parts.append(f"## {filename}\n\n{content}")
+                except Exception:
+                    continue
         
         return "\n\n".join(parts) if parts else ""

@@ -134,24 +134,35 @@ class SessionManager:
             return None
     
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
-        path = self._get_session_path(session.key)
-        
-        with open(path, "w") as f:
-            # Write metadata first
-            metadata_line = {
-                "_type": "metadata",
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata
-            }
-            f.write(json.dumps(metadata_line) + "\n")
-            
-            # Write messages
-            for msg in session.messages:
-                f.write(json.dumps(msg) + "\n")
-        
+        """Save a session to disk (non-blocking via thread pool)."""
         self._cache[session.key] = session
+        # Fire-and-forget: write to disk in a background thread so we don't
+        # block the response path on file I/O.
+        import asyncio
+        import concurrent.futures
+        try:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, self._write_session, session)
+        except RuntimeError:
+            # No running event loop (e.g. tests) — write synchronously.
+            self._write_session(session)
+
+    def _write_session(self, session: Session) -> None:
+        """Synchronous session write (called from executor)."""
+        path = self._get_session_path(session.key)
+        try:
+            with open(path, "w") as f:
+                metadata_line = {
+                    "_type": "metadata",
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata
+                }
+                f.write(json.dumps(metadata_line) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to save session {session.key}: {e}")
     
     def delete(self, key: str) -> bool:
         """

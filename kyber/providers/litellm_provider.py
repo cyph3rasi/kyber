@@ -1,6 +1,7 @@
 """LiteLLM provider implementation for multi-provider support."""
 
 import os
+import json
 from typing import Any
 
 import litellm
@@ -244,6 +245,13 @@ class LiteLLMProvider(LLMProvider):
                         parts.append(item)
                     continue
                 if isinstance(item, dict):
+                    # Drop provider-specific reasoning/thinking blocks from
+                    # conversational history to avoid compatibility errors on
+                    # OpenAI-style chat-completions endpoints.
+                    if "reasoningContent" in item:
+                        continue
+                    if item.get("type") == "thinking":
+                        continue
                     # Common block shapes: {"type":"text","text":"..."} or {"text":"..."}
                     txt = item.get("text") or item.get("content")
                     if isinstance(txt, str) and txt.strip():
@@ -260,6 +268,10 @@ class LiteLLMProvider(LLMProvider):
             out = "\n".join(parts).strip()
             return out or None
         if isinstance(content, dict):
+            if "reasoningContent" in content:
+                return None
+            if content.get("type") == "thinking":
+                return None
             txt = content.get("text") or content.get("content")
             if isinstance(txt, str):
                 return txt
@@ -322,51 +334,143 @@ class LiteLLMProvider(LLMProvider):
     
     def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Sanitize messages for provider compatibility.
-        
+
         Some providers (e.g., DeepSeek, certain OpenAI-compatible endpoints) 
         reject messages with certain fields or structures. This method ensures
         all messages conform to a compatible format.
+
+        Common causes of "messages parameter is illegal":
+        - Orphaned tool messages (tool message without preceding assistant tool_calls)
+        - Empty content on assistant messages with tool_calls (some providers want null, not "")
+        - Consecutive messages with the same role
+        - The 'name' field on tool messages (unsupported by some providers)
         """
-        sanitized = []
+        sanitized: list[dict[str, Any]] = []
+
+        def _sanitize_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
+            """Normalize tool call payload into OpenAI-compatible shape."""
+            if not isinstance(raw_tool_calls, list):
+                return []
+            out: list[dict[str, Any]] = []
+            for i, tc in enumerate(raw_tool_calls):
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = tc.get("id")
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else None
+                fn_name = (fn or {}).get("name") or tc.get("name")
+                args = (fn or {}).get("arguments")
+                if args is None:
+                    args = tc.get("arguments")
+                if not fn_name:
+                    continue
+                if not isinstance(args, str):
+                    try:
+                        args = json.dumps(args if args is not None else {})
+                    except Exception:
+                        args = "{}"
+                clean_tc = {
+                    "id": str(tc_id) if tc_id else f"call_{i}",
+                    "type": "function",
+                    "function": {
+                        "name": str(fn_name),
+                        "arguments": args,
+                    },
+                }
+                out.append(clean_tc)
+            return out
+
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
-            tool_calls = msg.get("tool_calls")
-            
+            tool_calls = _sanitize_tool_calls(msg.get("tool_calls"))
+
             # Skip messages without a role
             if not role:
                 logger.debug("Skipping message without role")
                 continue
-            
+
             # Skip empty messages (no content and no tool_calls)
             if not content and not tool_calls and role != "tool":
                 logger.debug(f"Skipping empty {role} message")
                 continue
-            
+
             clean = {"role": role}
-            
+
             if role == "tool":
                 # Tool result messages - must have tool_call_id
                 if not msg.get("tool_call_id"):
                     logger.debug("Skipping tool message without tool_call_id")
                     continue
                 clean["tool_call_id"] = msg["tool_call_id"]
-                clean["content"] = content or ""
-                # Note: Some providers don't support 'name' field on tool messages
-                # We include it if present since most do support it
-                if msg.get("name"):
-                    clean["name"] = msg["name"]
+                clean["content"] = self._normalize_content(content) or ""
             elif role == "assistant" and tool_calls:
-                # Assistant message with tool calls
-                clean["content"] = content or ""
+                # Assistant message with tool calls — some providers want content
+                # to be null/absent rather than empty string when there's no text.
+                norm_content = self._normalize_content(content)
+                if norm_content:
+                    clean["content"] = norm_content
+                else:
+                    clean["content"] = None
                 clean["tool_calls"] = tool_calls
             else:
                 # Regular message (system, user, or assistant without tool_calls)
-                clean["content"] = content or ""
-            
+                clean["content"] = self._normalize_content(content) or ""
+
             sanitized.append(clean)
-        
-        return sanitized
+
+        # Validate tool-calling structure:
+        # assistant(tool_calls) must be followed by matching tool messages.
+        # If the block is incomplete/malformed, drop the whole block.
+        # Some providers reject malformed blocks with "messages parameter is illegal".
+        validated: list[dict[str, Any]] = []
+        i = 0
+        while i < len(sanitized):
+            msg = sanitized[i]
+            if msg["role"] == "assistant" and msg.get("tool_calls"):
+                expected_ids = [
+                    tc.get("id")
+                    for tc in msg.get("tool_calls", [])
+                    if isinstance(tc, dict) and tc.get("id")
+                ]
+                expected_set = set(expected_ids)
+                if not expected_set:
+                    logger.debug("Dropping assistant tool_calls with no ids")
+                    i += 1
+                    continue
+
+                block_tools: list[dict[str, Any]] = []
+                seen_ids: set[str] = set()
+                j = i + 1
+                while j < len(sanitized) and sanitized[j]["role"] == "tool":
+                    tmsg = sanitized[j]
+                    tcid = tmsg.get("tool_call_id")
+                    if tcid in expected_set and tcid not in seen_ids:
+                        block_tools.append(tmsg)
+                        seen_ids.add(tcid)
+                    else:
+                        logger.debug(
+                            "Dropping invalid tool message (unknown/duplicate tool_call_id)"
+                        )
+                    j += 1
+
+                # Keep only complete assistant->tool blocks.
+                if seen_ids == expected_set:
+                    validated.append(msg)
+                    validated.extend(block_tools)
+                else:
+                    logger.debug("Dropping incomplete assistant tool_call block")
+                i = j
+                continue
+
+            if msg["role"] == "tool":
+                logger.debug("Dropping orphaned tool message (no preceding assistant tool_calls)")
+                i += 1
+                continue
+
+            validated.append(msg)
+            i += 1
+
+        return validated
     
     def get_default_model(self) -> str:
         """Get the default model."""

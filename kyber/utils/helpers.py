@@ -85,6 +85,39 @@ def truncate_string(s: str, max_len: int = 100, suffix: str = "...") -> str:
     if len(s) <= max_len:
         return s
     return s[: max_len - len(suffix)] + suffix
+def redact_secrets(s: str) -> str:
+    """Redact strings that look like API keys, tokens, passwords, or credentials.
+
+    Applied to tool outputs before they enter the LLM conversation and to
+    final user-facing messages. Intentionally aggressive — false positives
+    (redacting a non-secret) are far less costly than leaking a real key.
+    """
+    import re
+
+    # Key=value patterns: api_key="...", token: "...", password=..., etc.
+    # Minimum 6 chars for the value to catch short passwords too.
+    s = re.sub(
+        r'(?i)(api[_-]?key|api[_-]?secret|consumer[_-]?key|consumer[_-]?secret'
+        r'|access[_-]?token[_-]?secret|access[_-]?token|token|secret[_-]?key'
+        r'|secret|password|passwd|bearer|authorization|credential'
+        r')\s*[=:"\']\s*["\']?(\S{6,})["\']?',
+        r'\1=***REDACTED***',
+        s,
+    )
+    # Standalone key-like strings: sk-..., xai-..., ghp_..., AKIA..., etc.
+    # Match both - and _ separators (GitHub uses ghp_, AWS uses AKIA directly)
+    s = re.sub(r'\b(sk|key|xai|gsk|pk|rk|ghp|gho|glpat|xoxb|xoxp|AKIA)[_-][A-Za-z0-9_-]{16,}\b', '***REDACTED***', s)
+    # AWS access key IDs (AKIA followed by 16 alphanumeric chars)
+    s = re.sub(r'\bAKIA[A-Z0-9]{16}\b', '***REDACTED***', s)
+    # Long hex strings (40+ chars) that look like tokens/hashes
+    s = re.sub(r'\b[0-9a-fA-F]{40,}\b', '***REDACTED***', s)
+    # Long base64-ish strings (30+ chars) after a key-like label
+    s = re.sub(
+        r'(?i)(?:key|token|secret|password|credential|bearer)\s*[=:"\']\s*["\']?([A-Za-z0-9+/=_-]{30,})["\']?',
+        lambda m: m.group(0).split('=')[0] + '=***REDACTED***' if '=' in m.group(0) else '***REDACTED***',
+        s,
+    )
+    return s
 
 
 def safe_filename(name: str) -> str:

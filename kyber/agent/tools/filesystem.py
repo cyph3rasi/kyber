@@ -5,18 +5,65 @@ from typing import Any
 
 from kyber.agent.tools.base import Tool
 
+# Files that workers must never overwrite or edit directly.
+# These are managed by kyber's own subsystems (cron, config, etc.).
+_PROTECTED_PATTERNS = [
+    "cron/jobs.json",
+    ".kyber/cron/",
+    ".kyber/config",
+    ".kyber/settings",
+]
+
+# Files that workers must never read — they contain secrets that could
+# leak into LLM context and end up in user-facing messages.
+_SENSITIVE_READ_PATTERNS = [
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.secret",
+    "credentials",
+    "id_rsa",
+    "id_ed25519",
+    ".pem",
+    ".key",
+]
+
+
+def _is_protected(path: str) -> bool:
+    """Check if a path matches a protected pattern."""
+    normalized = str(Path(path).expanduser().resolve())
+    for pattern in _PROTECTED_PATTERNS:
+        if pattern in normalized:
+            return True
+    return False
+
+
+def _is_sensitive_read(path: str) -> bool:
+    """Check if a file is too sensitive to read (contains secrets)."""
+    name = Path(path).name.lower()
+    normalized = str(Path(path).expanduser().resolve()).lower()
+    for pattern in _SENSITIVE_READ_PATTERNS:
+        if name == pattern or name.endswith(pattern) or pattern in normalized:
+            return True
+    return False
+
 
 class ReadFileTool(Tool):
     """Tool to read file contents."""
-    
+
+    # Max chars returned to the LLM. Large files bloat context and can end up
+    # dumped verbatim into user-facing messages. The LLM can still work with
+    # the truncated content for diagnosis/editing.
+    MAX_READ_CHARS = 8000
+
     @property
     def name(self) -> str:
         return "read_file"
-    
+
     @property
     def description(self) -> str:
-        return "Read the contents of a file at the given path."
-    
+        return "Read the contents of a file at the given path. Large files are truncated."
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -29,16 +76,23 @@ class ReadFileTool(Tool):
             },
             "required": ["path"]
         }
-    
+
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
+            if _is_sensitive_read(path):
+                return f"Error: {path} is a sensitive file (likely contains secrets). Reading blocked for security."
             file_path = Path(path).expanduser()
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             if not file_path.is_file():
                 return f"Error: Not a file: {path}"
-            
+
             content = file_path.read_text(encoding="utf-8")
+            if len(content) > self.MAX_READ_CHARS:
+                content = (
+                    content[:self.MAX_READ_CHARS]
+                    + f"\n\n... (truncated — file is {len(content)} chars, showing first {self.MAX_READ_CHARS})"
+                )
             return content
         except PermissionError:
             return f"Error: Permission denied: {path}"
@@ -76,6 +130,8 @@ class WriteFileTool(Tool):
     
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
+            if _is_protected(path):
+                return f"Error: {path} is a protected system file. Use the appropriate CLI command instead (e.g., `kyber cron add`)."
             file_path = Path(path).expanduser()
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
@@ -120,6 +176,8 @@ class EditFileTool(Tool):
     
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
+            if _is_protected(path):
+                return f"Error: {path} is a protected system file. Use the appropriate CLI command instead (e.g., `kyber cron add`)."
             file_path = Path(path).expanduser()
             if not file_path.exists():
                 return f"Error: File not found: {path}"

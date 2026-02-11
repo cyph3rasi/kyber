@@ -4,6 +4,7 @@ from typing import Any, Callable, Awaitable
 
 from kyber.agent.tools.base import Tool
 from kyber.bus.events import OutboundMessage
+from kyber.utils.helpers import redact_secrets
 
 
 class MessageTool(Tool):
@@ -76,7 +77,7 @@ class MessageTool(Tool):
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
-            content=content
+            content=redact_secrets(content)
         )
         
         try:

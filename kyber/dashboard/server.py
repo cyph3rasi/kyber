@@ -620,6 +620,47 @@ def create_dashboard_app(config: Config) -> FastAPI:
         except Exception:
             return None
 
+    def _filter_dismissed(data: dict[str, Any]) -> dict[str, Any]:
+        """Remove dismissed findings from a report and recalculate the summary."""
+        from kyber.security.tracker import _fingerprint, _load_tracker
+
+        tracker = _load_tracker()
+        dismissed_fps = {
+            fp for fp, issue in tracker.get("issues", {}).items()
+            if issue.get("status") == "dismissed"
+        }
+        if dismissed_fps and data.get("findings"):
+            data["findings"] = [
+                f for f in data["findings"]
+                if _fingerprint(f) not in dismissed_fps
+            ]
+            remaining = data["findings"]
+            sev_weights = {"critical": 20, "high": 10, "medium": 5, "low": 2}
+            sev_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+            for f in remaining:
+                sev = f.get("severity", "low").lower()
+                if sev in sev_counts:
+                    sev_counts[sev] += 1
+            deductions = sum(sev_counts[s] * w for s, w in sev_weights.items())
+            data["summary"] = {
+                "score": max(0, 100 - deductions),
+                "total_findings": len(remaining),
+                **sev_counts,
+            }
+            # Recalculate per-category finding_count so dismissed findings
+            # are no longer reflected in the category table.
+            if data.get("categories"):
+                cat_counts: dict[str, int] = {}
+                for f in remaining:
+                    cat = f.get("category", "")
+                    cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                for key, info in data["categories"].items():
+                    new_count = cat_counts.get(key, 0)
+                    info["finding_count"] = new_count
+                    if new_count == 0 and info.get("status") in ("warn", "fail"):
+                        info["status"] = "pass"
+        return data
+
     @app.get("/api/security/reports", dependencies=[Depends(_require_token)])
     async def list_security_reports(limit: int = Query(20, ge=1, le=100)) -> JSONResponse:
         """List available security reports, newest first."""
@@ -652,6 +693,9 @@ def create_dashboard_app(config: Config) -> FastAPI:
                     update_tracker(latest)
                     latest.pop("_report_filename", None)
 
+                # Filter out dismissed findings
+                _filter_dismissed(latest)
+
         return JSONResponse({
             "reports": reports,
             "latest": latest,
@@ -673,6 +717,7 @@ def create_dashboard_app(config: Config) -> FastAPI:
         data = _load_security_report(report_path)
         if not data:
             raise HTTPException(status_code=500, detail="Failed to parse report")
+        _filter_dismissed(data)
         return JSONResponse(data)
 
     @app.post("/api/security/scan", dependencies=[Depends(_require_token)])

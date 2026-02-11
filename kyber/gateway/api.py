@@ -3,7 +3,6 @@
 Exposes running/completed tasks for the dashboard:
 - list tasks
 - cancel running tasks
-- toggle per-task progress updates
 
 This runs in the gateway process so it can access the in-memory registry.
 """
@@ -63,7 +62,6 @@ def _task_to_dict(t: Task) -> dict[str, Any]:
         "max_iterations": t.max_iterations,
         "current_action": _redact_secrets(t.current_action),
         "actions_completed": [_redact_secrets(a) for a in t.actions_completed[-10:]],
-        "progress_updates_enabled": t.progress_updates_enabled,
         "result": _redact_secrets(t.result) if t.result else t.result,
         "error": t.error,
     }
@@ -89,6 +87,7 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
             {
                 "active": [_task_to_dict(t) for t in active],
                 "history": [_task_to_dict(t) for t in hist_filtered[::-1]],
+                "background_progress_updates": bool(agent.background_progress_updates),
             }
         )
 
@@ -107,21 +106,36 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
         if not task:
             raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="Task not found")
         if task.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
-            return JSONResponse({"ok": True, "status": task.status.value})
+            return JSONResponse({
+                "ok": True,
+                "status": task.status.value,
+                "message": f"Task already {task.status.value}.",
+            })
         ok = agent.workers.cancel(task.id)
-        if not ok:
-            # Might have just finished.
-            return JSONResponse({"ok": False, "status": task.status.value})
-        return JSONResponse({"ok": True})
+        if ok:
+            return JSONResponse({
+                "ok": True,
+                "status": "cancelling",
+                "message": "Cancel requested.",
+            })
 
-    @app.post("/tasks/{ref}/progress-updates", dependencies=[Depends(require)])
-    async def toggle_progress_updates(ref: str, body: dict[str, Any]) -> JSONResponse:
-        task = agent.registry.get_by_ref(ref)
-        if not task:
-            raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="Task not found")
-        enabled = bool(body.get("enabled", True))
-        task.progress_updates_enabled = enabled
-        return JSONResponse({"ok": True, "progress_updates_enabled": enabled})
+        refreshed = agent.registry.get(task.id)
+        if refreshed and refreshed.status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+            # If a runner handle is missing but state is still active, force-cancel
+            # to avoid leaving the dashboard in a broken "can't cancel" state.
+            agent.registry.mark_cancelled(task.id, "Cancelled by user")
+            return JSONResponse({
+                "ok": True,
+                "status": TaskStatus.CANCELLED.value,
+                "message": "Task marked cancelled.",
+            })
+
+        final_status = refreshed.status.value if refreshed else task.status.value
+        return JSONResponse({
+            "ok": True,
+            "status": final_status,
+            "message": f"Task already {final_status}.",
+        })
 
     @app.post("/tasks/{ref}/redeliver", dependencies=[Depends(require)])
     async def redeliver_task(ref: str) -> JSONResponse:

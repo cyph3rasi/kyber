@@ -5,6 +5,7 @@ No system messages, no robotic status dumps. Everything sounds
 like the character is talking naturally.
 """
 
+import json
 import random
 from typing import Any
 
@@ -159,21 +160,78 @@ class CharacterVoice:
             model=getattr(self, "model", None),
         )
 
+        def _tool_name(tc: Any) -> str:
+            name = getattr(tc, "name", None)
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+            fn = getattr(tc, "function", None)
+            if isinstance(fn, dict):
+                raw = fn.get("name")
+                return str(raw).strip() if raw is not None else ""
+            raw = getattr(fn, "name", None)
+            return str(raw).strip() if raw is not None else ""
+
+        def _tool_args(tc: Any) -> dict[str, Any]:
+            args = getattr(tc, "arguments", None)
+            if args is None:
+                fn = getattr(tc, "function", None)
+                if isinstance(fn, dict):
+                    args = fn.get("arguments")
+                else:
+                    args = getattr(fn, "arguments", None)
+            if isinstance(args, str):
+                try:
+                    decoded = json.loads(args)
+                    if isinstance(decoded, dict):
+                        return decoded
+                except Exception:
+                    return {"raw": args}
+                return {}
+            if isinstance(args, dict):
+                return args
+            return {}
+
+        def _extract_message(args: dict[str, Any]) -> str:
+            for key in ("message", "text", "content"):
+                val = args.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            raw = args.get("raw")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    decoded = json.loads(raw)
+                    if isinstance(decoded, dict):
+                        return _extract_message(decoded)
+                except Exception:
+                    return raw.strip()
+            return ""
+
         if getattr(response, "has_tool_calls", False):
-            # Preferred path: extract the message from the tool call.
+            # Preferred path: extract the message from the `say` tool call.
+            # Some providers return slightly different tool-call shapes, so we
+            # also accept any call carrying a usable message payload.
+            fallback_from_any_tool = ""
             for tc in (getattr(response, "tool_calls", None) or []):
-                if getattr(tc, "name", None) == "say":
-                    args = getattr(tc, "arguments", None) or {}
-                    msg = (args.get("message") or "").strip()
-                    if msg:
-                        result = msg
-                        break
+                name = _tool_name(tc)
+                args = _tool_args(tc)
+                msg = _extract_message(args)
+                if name == "say" and msg:
+                    result = msg
+                    break
+                if msg and not fallback_from_any_tool:
+                    fallback_from_any_tool = msg
             else:
-                # Tool call present but not usable.
-                logger.warning(
-                    f"Voice generation returned tool calls but none usable (count={len(getattr(response, 'tool_calls', []) or [])})."
-                )
-                result = ""
+                result = fallback_from_any_tool
+                if not result:
+                    tool_names = [_tool_name(tc) for tc in (getattr(response, "tool_calls", None) or [])]
+                    logger.warning(
+                        "Voice generation returned tool calls but none usable "
+                        f"(count={len(tool_names)}, names={tool_names})."
+                    )
+                    result = ""
+            if not result:
+                # Fallback to plain text content even if finish_reason=tool_calls.
+                result = (response.content or "").strip()
         else:
             result = (response.content or "").strip()
 
@@ -254,13 +312,6 @@ class CharacterVoice:
                 "Use ONLY the facts provided; do not invent next steps. "
                 "Do NOT use any headers. "
                 "Do NOT say internal tool names (exec/read_file/etc.)."
-            ),
-            (
-                "progress update (background ping). "
-                "Rewrite as the character speaking naturally. "
-                "No headers. No prefixes like 'Progress update:'. "
-                "No internal tool names. Use only facts given. "
-                "1-3 short sentences max."
             ),
             (
                 "progress update (background ping). "

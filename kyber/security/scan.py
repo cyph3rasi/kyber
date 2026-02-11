@@ -71,11 +71,8 @@ def _build_malware_section() -> str:
     if report is None:
         return (
             "\nNo background ClamAV scan results found yet — the initial scan may still be running. "
-            "Add a finding with id \"MAL-000\", category \"malware\", severity \"low\", "
-            "title \"Malware scan in progress — initial background ClamAV scan has not completed yet\", "
-            "remediation \"The daily ClamAV scan runs automatically. Results will be available after the "
-            "first scan completes. If ClamAV is not installed, run `kyber setup-clamav`.\"\n"
-            "Set the malware category to \"status\": \"skip\".\n"
+            "Do NOT add any findings for this. "
+            "Set the malware category to \"checked\": false, \"status\": \"skip\", \"finding_count\": 0.\n"
         )
 
     status = report.get("status", "error")
@@ -276,7 +273,8 @@ missing metadata like licenses, descriptions, or manifest fields — those are n
 
 If skill-scanner finds no issues, set the `skill_scan` category to `"status": "pass"` with `"finding_count": 0`.
 
-If skill-scanner is NOT installed, skip this and add a finding with id "SKL-000", category "skill_scan", severity "medium", title "Skill scanner not installed — skill security scanning disabled", remediation "Run `kyber setup-skillscanner` to enable skill security scanning.".
+If skill-scanner is NOT installed, skip this section entirely. Do NOT add any findings for a missing skill-scanner.
+Set the `skill_scan` category to `"checked": false, "status": "skip", "finding_count": 0`.
 
 ## Step 3: Write the report
 

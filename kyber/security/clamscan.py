@@ -21,68 +21,49 @@ LATEST_PATH = CLAMSCAN_DIR / "latest.json"
 RUNNING_PATH = CLAMSCAN_DIR / "running.json"
 HISTORY_LIMIT = 10
 
-# Directories to scan — same as the old inline scan
-SCAN_DIRS = [
-    Path.home() / "Downloads",
-    Path.home() / "Desktop",
-    Path.home() / "Documents",
-    Path.home() / ".local" / "bin",
-    Path("/tmp"),
-    Path("/var/tmp"),
-]
-
-# Directories to exclude (standalone clamscan only)
+# Directories to exclude from scans
 EXCLUDE_DIRS = [
-    r"^\.git$", "node_modules", r"\.venv", "__pycache__",
-    r"\.cache", r"\.npm", r"\.nvm", "venv", r"\.Trash", "Library",
+    # Virtual / system filesystems
+    "/proc", "/sys", "/dev", "/run", "/snap",
+    # Package / dependency noise
+    "node_modules", r"\.venv", "venv", "__pycache__",
+    r"\.cache", r"\.npm", r"\.nvm",
+    # VCS
+    r"^\.git$",
+    # macOS
+    r"\.Trash", "Library/Caches",
 ]
 
 
 def _find_scanner() -> tuple[str, bool]:
     """Return (binary_path, is_daemon).
 
-    Prefers clamdscan (daemon) over clamscan (standalone).
-    Raises FileNotFoundError if neither is available.
+    Always uses clamscan (standalone) for full system scans because
+    clamdscan delegates to the clamd daemon which doesn't reliably
+    do recursive directory traversal. clamscan -r handles this properly.
+    The scan runs as a background cron job so speed isn't critical.
+
+    Raises FileNotFoundError if clamscan is not available.
     """
     import shutil
-
-    clamdscan = shutil.which("clamdscan")
-    if clamdscan:
-        # Check if daemon is actually running
-        try:
-            result = subprocess.run(
-                ["clamdscan", "--ping", "1"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                return clamdscan, True
-        except Exception:
-            pass
 
     clamscan = shutil.which("clamscan")
     if clamscan:
         return clamscan, False
 
-    raise FileNotFoundError("ClamAV not installed (neither clamdscan nor clamscan found)")
+    raise FileNotFoundError("ClamAV not installed (clamscan not found). Run: kyber setup-clamav")
 
 
 def _build_command(scanner: str, is_daemon: bool) -> list[str]:
-    """Build the clamscan/clamdscan command."""
-    dirs = [str(d) for d in SCAN_DIRS if d.exists()]
-    if not dirs:
-        dirs = [str(Path.home() / "Downloads")]
-
-    if is_daemon:
-        return [scanner, "--multiscan", "--infected", "--no-summary"] + dirs
-    else:
-        cmd = [
-            scanner, "-r", "--infected",
-            "--max-filesize=25M", "--max-scansize=100M",
-        ]
-        for exc in EXCLUDE_DIRS:
-            cmd.append(f"--exclude-dir={exc}")
-        cmd.extend(dirs)
-        return cmd
+    """Build the clamscan command for a full system scan."""
+    cmd = [
+        scanner, "-r", "--infected",
+        "--max-filesize=25M", "--max-scansize=100M",
+    ]
+    for exc in EXCLUDE_DIRS:
+        cmd.append(f"--exclude-dir={exc}")
+    cmd.append("/")
+    return cmd
 
 
 def run_clamscan() -> dict:
@@ -127,7 +108,7 @@ def run_clamscan() -> dict:
 
     report["scanner"] = scanner
     report["is_daemon"] = is_daemon
-    report["scanned_dirs"] = [str(d) for d in SCAN_DIRS if d.exists()]
+    report["scanned_dirs"] = ["/"]
 
     cmd = _build_command(scanner, is_daemon)
     start = time.monotonic()
@@ -163,6 +144,21 @@ def run_clamscan() -> dict:
             report["status"] = "clean"
         elif result.returncode == 1:
             report["status"] = "threats_found"
+        elif result.returncode == 2:
+            # Exit code 2 = "some error condition" — often just permission
+            # denied on a few files. If we got scan output, treat it as a
+            # successful scan with warnings rather than a hard failure.
+            if infected:
+                report["status"] = "threats_found"
+            elif result.stdout.strip():
+                # Scanner ran and produced output — scan worked, some files were skipped
+                report["status"] = "clean"
+                report["error"] = None
+            else:
+                # No output at all — genuine failure
+                stderr_msg = result.stderr.strip()[:500] if result.stderr else ""
+                report["status"] = "error"
+                report["error"] = stderr_msg or f"Exit code {result.returncode}"
         else:
             report["status"] = "error"
             report["error"] = result.stderr.strip()[:500] if result.stderr else f"Exit code {result.returncode}"

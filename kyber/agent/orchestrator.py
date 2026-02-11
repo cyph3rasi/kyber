@@ -11,7 +11,9 @@ The user can always chat while tasks run in the background.
 """
 
 import asyncio
+import inspect
 import json
+import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,6 +30,7 @@ from kyber.agent.task_registry import TaskRegistry, Task, TaskStatus
 from kyber.agent.worker import WorkerPool
 from kyber.agent.voice import CharacterVoice
 from kyber.agent.context import ContextBuilder
+from kyber.agent.narrator import LiveNarrator
 from kyber.agent.intent import (
     Intent, IntentAction, AgentResponse, 
     RESPOND_TOOL, parse_tool_call
@@ -44,16 +47,36 @@ ACTION_PHRASES = [
 ]
 
 
-# Note: don't use \\b word boundaries here; ⚡/✅ aren't "word" chars.
-_TASK_REF_TOKEN_RE = re.compile(r"(?i)^[⚡✅]?[0-9a-f]{8}$")
-_TASK_REF_INLINE_RE = re.compile(r"(?i)[⚡✅][0-9a-f]{8}")
-_TASK_REF_PARENS_RE = re.compile(r"(?i)\\s*\\(\\s*[⚡✅]?[0-9a-f]{8}\\s*\\)\\s*")
+# Note: don't use \\b word boundaries here; ⚡/✅/❌ aren't "word" chars.
+_TASK_REF_TOKEN_RE = re.compile(r"(?i)^[⚡✅❌]?[0-9a-f]{8}$")
+_TASK_REF_INLINE_RE = re.compile(r"(?i)[⚡✅❌][0-9a-f]{8}")
+_TASK_REF_PARENS_RE = re.compile(r"(?i)\\s*\\(\\s*[⚡✅❌]?[0-9a-f]{8}\\s*\\)\\s*")
+_ABS_PATH_RE = re.compile(r"(?:(?:[A-Za-z]:\\\\|/)[^\s\"'`]+)")
+_INLINE_CODE_RE = re.compile(r"`([^`]{1,300})`")
+_FILENAME_HINT_RE = re.compile(
+    r"\b[\w.-]+\.(?:py|js|ts|tsx|jsx|md|txt|json|yaml|yml|toml|html|css|sh|sql)\b",
+    re.IGNORECASE,
+)
+_WORK_REQUEST_CUES = (
+    "fix ", "update ", "change ", "edit ", "create ", "write ", "build ",
+    "implement ", "refactor ", "run ", "execute ", "check ", "review ",
+    "analyze ", "look at ", "open ", "list ", "find ", "search ", "scan ",
+    "install ", "delete ", "remove ", "organize ", "debug ", "resolve ",
+    "improve ", "enhance ", "tell me how big", "show me ", "add ",
+)
+_CONCEPTUAL_QUESTION_CUES = (
+    "what is", "why ", "how does", "how would", "would it", "is it possible",
+    "can it", "could it", "explain", "thoughts on", "what do you think",
+)
+_CONCRETE_ACTION_CUES = (
+    "fix ", "edit ", "update ", "create ", "write ", "run ", "check ",
+    "show me", "tell me", "list ", "find ", "scan ", "review ", "organize ",
+    "delete ", "remove ", "install ", "open ", "add ", "change ",
+)
 
 def _extract_ref(text: str) -> str | None:
-    """Extract a task reference token (⚡deadbeef / ✅deadbeef / deadbeef) from free text."""
-    # Keep it simple and robust: scan tokens split on whitespace/punctuation.
-    # We accept the first plausible token.
-    candidates = re.findall(r"(?i)[⚡✅]?[0-9a-f]{8}", text)
+    """Extract a task reference token (⚡deadbeef / ✅deadbeef / ❌deadbeef / deadbeef) from free text."""
+    candidates = re.findall(r"(?i)[⚡✅❌]?[0-9a-f]{8}", text)
     return candidates[0] if candidates else None
 
 
@@ -68,6 +91,145 @@ def _looks_like_status_request(text: str) -> bool:
         return True
     if s.startswith("ref:"):
         return True
+    return False
+
+
+def _is_truthy_env(value: str | None) -> bool:
+    v = (value or "").strip().lower()
+    return v in {"1", "true", "yes", "on"}
+
+def _is_falsy_env(value: str | None) -> bool:
+    v = (value or "").strip().lower()
+    return v in {"0", "false", "no", "off"}
+
+
+def _looks_like_direct_task_request(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _looks_like_status_request(raw):
+        return False
+
+    s = _normalize_for_match(raw)
+    if not s:
+        return False
+
+    short_smalltalk = {"hi", "hello", "hey", "thanks", "thank you", "good morning", "good night"}
+    if s in short_smalltalk:
+        return False
+
+    if _extract_paths(raw):
+        return True
+    if _FILENAME_HINT_RE.search(raw):
+        return True
+
+    has_work_cue = any(c in s for c in _WORK_REQUEST_CUES)
+    if not has_work_cue:
+        return False
+
+    if raw.endswith("?"):
+        conceptual = any(c in s for c in _CONCEPTUAL_QUESTION_CUES)
+        concrete = any(c in s for c in _CONCRETE_ACTION_CUES)
+        if conceptual and not concrete:
+            return False
+
+    return True
+
+
+def _derive_task_label(text: str) -> str:
+    raw = " ".join((text or "").strip().split())
+    if not raw:
+        return "Requested Task"
+    cleaned = raw.rstrip("?.! ")
+    words = cleaned.split()
+    label = " ".join(words[:6]) if words else "Requested Task"
+    if len(label) > 56:
+        label = label[:55].rstrip() + "…"
+    return label
+
+def _looks_like_follow_up_tweak(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _extract_paths(raw) or _FILENAME_HINT_RE.search(raw):
+        return False
+
+    s = _normalize_for_match(raw)
+    if not s:
+        return False
+
+    tweak_cues = (
+        "tweak", "fix", "change", "update", "adjust", "still", "again",
+        "capped", "limit", "too long", "too short", "character", "cap",
+        "make it", "no longer", "keep", "reduce", "increase",
+    )
+    if any(c in s for c in tweak_cues):
+        return True
+
+    # Very short follow-up statements are often minor tweaks to recent work.
+    return len(s.split()) <= 10
+
+
+def _looks_like_social_acknowledgement(text: str) -> bool:
+    """Detect brief social/praise messages that should not trigger task execution."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _looks_like_status_request(raw):
+        return False
+    if _looks_like_direct_task_request(raw):
+        return False
+    if _extract_paths(raw) or _FILENAME_HINT_RE.search(raw):
+        return False
+    if "?" in raw:
+        return False
+
+    s = _normalize_for_match(raw)
+    if not s:
+        return False
+
+    exact = {
+        "thanks",
+        "thank you",
+        "thx",
+        "nice",
+        "nice work",
+        "good job",
+        "great job",
+        "awesome",
+        "cool",
+        "perfect",
+        "love it",
+        "lets go",
+    }
+    if s in exact:
+        return True
+
+    cues = (
+        "thanks",
+        "thank you",
+        "thx",
+        "nice",
+        "sick",
+        "dope",
+        "fire",
+        "awesome",
+        "great",
+        "cool",
+        "love it",
+        "good stuff",
+        "good job",
+        "well done",
+        "lets go",
+    )
+    if any(c in s for c in cues) and len(s.split()) <= 12:
+        return True
+
+    slang_tokens = {"yo", "yoo", "yooo", "bro", "bruh", "lol", "lmao", "haha", "hehe"}
+    words = set(s.split())
+    if words and words.issubset(slang_tokens | {"that", "thats", "is", "it", "so", "very", "super", "really", "the"}):
+        return True
+
     return False
 
 
@@ -120,7 +282,7 @@ def _strip_fabricated_refs(text: str) -> str:
                     continue
 
         # Case 3: bare "⚡deadbeef" line (common hallucination)
-        if _TASK_REF_TOKEN_RE.fullmatch(stripped) and ("⚡" in stripped or "✅" in stripped):
+        if _TASK_REF_TOKEN_RE.fullmatch(stripped) and ("⚡" in stripped or "✅" in stripped or "❌" in stripped):
             i += 1
             continue
 
@@ -156,8 +318,8 @@ def _strip_task_refs_for_chat(text: str) -> str:
             if after and _TASK_REF_TOKEN_RE.fullmatch(after):
                 continue
 
-        # Drop bare token-only lines like "⚡deadbeef" / "✅deadbeef".
-        if _TASK_REF_TOKEN_RE.fullmatch(stripped) and ("⚡" in stripped or "✅" in stripped):
+        # Drop bare token-only lines like "⚡deadbeef" / "✅deadbeef" / "❌deadbeef".
+        if _TASK_REF_TOKEN_RE.fullmatch(stripped) and ("⚡" in stripped or "✅" in stripped or "❌" in stripped):
             continue
 
         cleaned = _TASK_REF_PARENS_RE.sub(" ", line)
@@ -182,6 +344,83 @@ def _is_only_meta_prefix(text: str) -> bool:
     t = (text or "").strip()
     return t in {"⚡️", "⚡"}
 
+def _extract_paths(text: str) -> list[str]:
+    """Extract absolute filesystem-like paths from free text."""
+    if not text:
+        return []
+    out: list[str] = []
+    for raw in _ABS_PATH_RE.findall(text):
+        path = raw.rstrip(".,;:)]}\"'")
+        if path.startswith(("http://", "https://")):
+            continue
+        if len(path) < 3:
+            continue
+        if path not in out:
+            out.append(path)
+    return out
+
+def _normalize_for_match(text: str) -> str:
+    t = (text or "").lower()
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    return " ".join(t.split())
+
+def _is_affirmative_confirmation(text: str) -> bool:
+    s = _normalize_for_match(text)
+    if not s:
+        return False
+    exact = {
+        "yes", "y", "ok", "okay", "proceed", "continue", "approved",
+        "confirm", "do it", "go ahead", "sounds good", "ship it",
+    }
+    if s in exact:
+        return True
+    phrases = [
+        "please proceed",
+        "go ahead and",
+        "yes proceed",
+        "do it now",
+        "you can proceed",
+        "proceed with it",
+    ]
+    return any(p in s for p in phrases)
+
+def _is_negative_confirmation(text: str) -> bool:
+    s = _normalize_for_match(text)
+    if not s:
+        return False
+    exact = {
+        "no", "n", "stop", "cancel", "dont", "do not",
+        "not now", "hold off", "skip",
+    }
+    if s in exact:
+        return True
+    phrases = [
+        "do not proceed",
+        "dont proceed",
+        "stop that",
+        "cancel that",
+    ]
+    return any(p in s for p in phrases)
+
+def _looks_like_confirmation_prompt(text: str) -> bool:
+    s = (text or "").lower()
+    if not s:
+        return False
+    cues = [
+        "awaiting your approval",
+        "awaiting approval",
+        "ready to proceed",
+        "confirm delete",
+        "confirm cleanup",
+        "confirm before",
+        "should i proceed",
+        "do you want me to proceed",
+        "ready to proceed with cleanup",
+    ]
+    if any(c in s for c in cues):
+        return True
+    return "?" in s and ("proceed" in s or "confirm" in s or "approval" in s)
+
 
 class Orchestrator:
     """
@@ -190,7 +429,7 @@ class Orchestrator:
     Handles:
     - Message processing with structured intent
     - Task spawning and tracking
-    - Progress updates (batched every 30s)
+    - Progress updates (batched every 60s)
     - Completion notifications (guaranteed, in character)
     - Concurrent chat while tasks run
     """
@@ -227,6 +466,24 @@ class Orchestrator:
         self.sessions = SessionManager(workspace)
         self.voice = CharacterVoice(persona_prompt, provider, model=self.model)
         self.context = ContextBuilder(workspace, timezone=timezone)
+        live_updates_env = os.getenv("KYBER_LIVE_UPDATES")
+        # Default ON: users should see active progress, not a long typing indicator.
+        self._live_updates_enabled = not _is_falsy_env(live_updates_env)
+        self.narrator: LiveNarrator | None = None
+        if self._live_updates_enabled:
+            chunk_seconds = 45.0
+            raw_chunk = (os.getenv("KYBER_LIVE_UPDATE_CHUNK_SECONDS", "") or "").strip()
+            if raw_chunk:
+                try:
+                    chunk_seconds = max(10.0, float(raw_chunk))
+                except ValueError:
+                    chunk_seconds = 45.0
+            # Optional live action streaming. Disabled by default for cleaner UX.
+            self.narrator = LiveNarrator(
+                flush_callback=self._send_narration,
+                flush_interval=chunk_seconds,
+            )
+
         self.workers = WorkerPool(
             provider=_task_provider,
             workspace=workspace,
@@ -236,11 +493,201 @@ class Orchestrator:
             brave_api_key=brave_api_key,
             timezone=timezone,
             exec_timeout=exec_timeout,
+            narrator=self.narrator,
         )
 
         self._running = False
         self._last_progress_update: dict[str, datetime] = {}
+        self._last_progress_summary: dict[str, list[str]] = {}
         self._last_user_content: str = ""
+
+    def _use_provider_native_orchestration(self) -> bool:
+        """True when the provider should act as the full orchestrator brain."""
+        probe = getattr(self.provider, "uses_provider_native_orchestration", None)
+        if callable(probe):
+            try:
+                return bool(probe())
+            except Exception:
+                return False
+        return False
+
+    @staticmethod
+    def _session_key(channel: str, chat_id: str) -> str:
+        return f"{channel}:{chat_id}"
+
+    @staticmethod
+    def _extract_inline_code_spans(text: str, limit: int = 12) -> list[str]:
+        spans: list[str] = []
+        for m in _INLINE_CODE_RE.findall(text or ""):
+            s = m.strip()
+            if not s:
+                continue
+            token = f"`{s}`"
+            if token in spans:
+                continue
+            spans.append(token)
+            if len(spans) >= limit:
+                break
+        return spans
+
+    def _remember_paths_in_session(self, session: Any, text: str) -> None:
+        """Update session metadata with recently referenced absolute paths."""
+        paths = _extract_paths(text)
+        if not paths:
+            return
+
+        existing_raw = session.metadata.get("recent_paths")
+        existing = existing_raw if isinstance(existing_raw, list) else []
+        normalized = [str(p) for p in existing if isinstance(p, str)]
+
+        for p in paths:
+            if p in normalized:
+                normalized.remove(p)
+            normalized.append(p)
+
+        session.metadata["recent_paths"] = normalized[-20:]
+
+    def _augment_task_description_with_recent_paths(self, description: str, session: Any | None) -> str:
+        """Inject recent path context so follow-up tasks can skip file rediscovery."""
+        if session is None:
+            return description
+        paths_raw = session.metadata.get("recent_paths")
+        if not isinstance(paths_raw, list):
+            return description
+
+        paths = [str(p) for p in paths_raw if isinstance(p, str)]
+        if not paths:
+            return description
+
+        existing_text = (description or "")
+        if any(p in existing_text for p in paths):
+            return description
+
+        top_paths = paths[-4:]
+        follow_up_mode = _looks_like_follow_up_tweak(existing_text)
+
+        if follow_up_mode:
+            context_block = (
+                "\n\nFollow-up tweak mode (important):\n"
+                "This appears to be a tweak to very recent work.\n"
+                "Start by opening these likely target files directly:\n"
+                + "\n".join(f"- {p}" for p in top_paths)
+                + "\n\nExecution rules:\n"
+                "- Do NOT begin with broad workspace discovery commands.\n"
+                "- Avoid workspace-wide scans (`ls -la <workspace>`, `find <workspace>`, or broad recursive `rg`) "
+                  "unless none of the files above are relevant.\n"
+                "- If one of the files above is relevant, edit it immediately."
+            )
+        else:
+            context_block = (
+                "\n\nConversation context (recent file paths):\n"
+                + "\n".join(f"- {p}" for p in top_paths)
+                + "\n\nIf this is a tweak/fix to recent work, start with those files before broad filesystem discovery."
+            )
+
+        return (description or "") + context_block
+
+    def _build_pending_confirmation(self, task: Task, notification: str) -> dict[str, Any] | None:
+        """Return pending-confirmation metadata if a completion asks for approval."""
+        if not _looks_like_confirmation_prompt(notification):
+            return None
+        return {
+            "created_at": datetime.now().isoformat(),
+            "task_id": task.id,
+            "task_label": task.label,
+            "plan": notification[:12000],
+        }
+
+    def _persist_completion_context(self, task: Task, notification: str) -> None:
+        """Persist completion output into session history for follow-up turns."""
+        key = self._session_key(task.origin_channel, task.origin_chat_id)
+        session = self.sessions.get_or_create(key)
+        session.add_message(
+            "assistant",
+            notification,
+            is_background=True,
+            task_id=task.id,
+            task_status=task.status.value,
+        )
+        self._remember_paths_in_session(session, notification)
+
+        pending = self._build_pending_confirmation(task, notification)
+        if pending:
+            session.metadata["pending_confirmation"] = pending
+
+        self.sessions.save(session)
+
+    async def _maybe_handle_pending_confirmation(
+        self,
+        msg: InboundMessage,
+        session: Any,
+    ) -> OutboundMessage | None:
+        """Handle terse approval/cancellation replies against pending plans."""
+        pending = session.metadata.get("pending_confirmation")
+        if not isinstance(pending, dict):
+            return None
+
+        raw = (msg.content or "").strip()
+        if not raw:
+            return None
+
+        created_at_raw = pending.get("created_at")
+        try:
+            created_at = datetime.fromisoformat(str(created_at_raw))
+        except Exception:
+            created_at = None
+        if created_at and (datetime.now() - created_at) > timedelta(hours=6):
+            session.metadata.pop("pending_confirmation", None)
+            self.sessions.save(session)
+            return None
+
+        if _is_negative_confirmation(raw):
+            session.metadata.pop("pending_confirmation", None)
+            reply = "Understood — I won’t execute that proposed plan."
+            session.add_message("user", msg.content)
+            session.add_message("assistant", reply)
+            self._remember_paths_in_session(session, msg.content or "")
+            self._remember_paths_in_session(session, reply)
+            self.sessions.save(session)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=reply)
+
+        if not _is_affirmative_confirmation(raw):
+            return None
+
+        plan = str(pending.get("plan") or "")
+        task_label = str(pending.get("task_label") or "Approved follow-up")
+        approved_description = (
+            "The user approved the previously proposed plan. Execute it now.\n\n"
+            "Approved plan context from prior task output:\n"
+            f"{plan}\n\n"
+            f"User confirmation: {raw}\n\n"
+            "Carry out the approved changes directly. Do not restart with another broad audit "
+            "unless absolutely required for safety."
+        )
+
+        response = AgentResponse(
+            message="Proceeding with the approved plan now. I’ll report back when it’s done.",
+            intent=Intent(
+                action=IntentAction.SPAWN_TASK,
+                task_description=approved_description,
+                task_label=task_label,
+                complexity="moderate",
+            ),
+        )
+        final_message = await self._execute_intent(response, msg.channel, msg.chat_id, session=session)
+
+        session.metadata.pop("pending_confirmation", None)
+        session.add_message("user", msg.content)
+        session.add_message("assistant", final_message)
+        self._remember_paths_in_session(session, msg.content or "")
+        self._remember_paths_in_session(session, final_message)
+        self.sessions.save(session)
+
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=final_message,
+        )
     
     async def run(self) -> None:
         """
@@ -249,6 +696,10 @@ class Orchestrator:
         self._running = True
         logger.info("Orchestrator started")
         
+        # Start the live narrator (replaces voice-based progress for active tasks)
+        if self.narrator:
+            self.narrator.start()
+
         # Start background tasks.
         # Completion notifications are always delivered (otherwise tasks feel "silent").
         completion_task: asyncio.Task | None = None
@@ -269,6 +720,8 @@ class Orchestrator:
                 except asyncio.TimeoutError:
                     continue
         finally:
+            if self.narrator:
+                self.narrator.stop()
             if completion_task:
                 completion_task.cancel()
             if progress_task:
@@ -277,8 +730,47 @@ class Orchestrator:
     def stop(self) -> None:
         """Stop the orchestrator."""
         self._running = False
+        if self.narrator:
+            self.narrator.stop()
         logger.info("Orchestrator stopping")
-    
+
+    async def _send_narration(self, channel: str, chat_id: str, message: str) -> None:
+        """Callback for the LiveNarrator to send updates via the message bus."""
+        content = message
+        try:
+            must_include = self._extract_inline_code_spans(message)
+            timeout_s = 8.0
+            raw_timeout = (os.getenv("KYBER_NARRATION_VOICE_TIMEOUT_SECONDS", "") or "").strip()
+            if raw_timeout:
+                try:
+                    timeout_s = max(1.0, float(raw_timeout))
+                except ValueError:
+                    timeout_s = 8.0
+            voiced = await asyncio.wait_for(
+                self.voice.speak(
+                    content=message,
+                    context=(
+                        "live task progress update in-character. Keep wording simple for non-technical users. "
+                        "If commands/files are shown in inline code, preserve them exactly."
+                    ),
+                    must_include=must_include or None,
+                    use_llm=True,
+                    strict_llm=True,
+                ),
+                timeout=timeout_s,
+            )
+            if voiced and voiced.strip():
+                content = voiced.strip()
+        except Exception as e:
+            logger.debug(f"Falling back to raw narration message: {e}")
+
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=content,
+            is_background=True,
+        ))
+
     async def _handle_message(self, msg: InboundMessage) -> None:
         """Handle a single inbound message."""
         try:
@@ -308,11 +800,17 @@ class Orchestrator:
 
         session = self.sessions.get_or_create(msg.session_key)
 
+        # Fast-path for approval/cancel follow-ups tied to prior worker output.
+        # This avoids dropping context on terse messages like "proceed".
+        pending_confirmation_out = await self._maybe_handle_pending_confirmation(msg, session)
+        if pending_confirmation_out:
+            return pending_confirmation_out
+
         # Fast-path: status queries should never rely on the model to choose intent,
         # and they should NEVER spawn new work.
         if _looks_like_status_request(msg.content or ""):
             ref = _extract_ref(msg.content or "")
-            status = self.registry.get_status_for_ref(ref)  # if ref=None => all tasks
+            status = self.registry.get_status_for_ref(ref)
             status_voiced = await self.voice.speak_status(status)
             status_voiced = _strip_fabricated_refs(status_voiced)
             status_voiced = _strip_task_refs_for_chat(status_voiced)
@@ -320,11 +818,92 @@ class Orchestrator:
 
             session.add_message("user", msg.content)
             session.add_message("assistant", status_voiced)
+            self._remember_paths_in_session(session, msg.content or "")
+            self._remember_paths_in_session(session, status_voiced)
             self.sessions.save(session)
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 content=status_voiced,
+            )
+
+        if _looks_like_social_acknowledgement(msg.content or ""):
+            reply = await self.voice.speak(
+                content=msg.content or "",
+                context=(
+                    "The user sent a social acknowledgement or praise. "
+                    "Reply briefly in character. Do not start tasks, run tools, or claim new work."
+                ),
+                use_llm=True,
+                strict_llm=True,
+            )
+            reply = (reply or "").strip() or "Appreciate it."
+
+            session.add_message("user", msg.content)
+            session.add_message("assistant", reply)
+            self._remember_paths_in_session(session, msg.content or "")
+            self._remember_paths_in_session(session, reply)
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=reply,
+            )
+
+        if self._use_provider_native_orchestration():
+            final_message = await self._process_with_provider_agent(msg, session)
+            if not final_message:
+                logger.error(
+                    f"No usable response from provider-agent for message from "
+                    f"{msg.channel}:{msg.sender_id} | model={self.model}"
+                )
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Sorry, I'm having trouble responding right now. (model: {self.model})",
+                )
+
+            session.add_message("user", msg.content)
+            session.add_message("assistant", final_message)
+            self._remember_paths_in_session(session, msg.content or "")
+            self._remember_paths_in_session(session, final_message)
+            self.sessions.save(session)
+
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=final_message,
+            )
+
+        # Fast-path for concrete work requests: skip intent-planning LLM call
+        # and execute directly like a native coding session.
+        if _looks_like_direct_task_request(msg.content or ""):
+            direct_response = AgentResponse(
+                message="Working on it.",
+                intent=Intent(
+                    action=IntentAction.SPAWN_TASK,
+                    task_description=msg.content or "",
+                    task_label=_derive_task_label(msg.content or ""),
+                    complexity="moderate",
+                ),
+            )
+            final_message = await self._execute_intent(
+                direct_response,
+                msg.channel,
+                msg.chat_id,
+                session=session,
+            )
+
+            session.add_message("user", msg.content)
+            session.add_message("assistant", final_message)
+            self._remember_paths_in_session(session, msg.content or "")
+            self._remember_paths_in_session(session, final_message)
+            self.sessions.save(session)
+
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=final_message,
             )
 
         # Build context with omniscient state
@@ -333,7 +912,7 @@ class Orchestrator:
 
         # Get structured response from LLM
         self._last_user_content = msg.content
-        agent_response = await self._get_structured_response(messages)
+        agent_response = await self._get_structured_response(messages, session_key=msg.session_key)
 
         if not agent_response:
             # Don't save error fallbacks to session history — they pollute
@@ -349,18 +928,21 @@ class Orchestrator:
             )
 
         # Validate honesty
-        agent_response = await self._validate_honesty(agent_response, messages)
+        agent_response = await self._validate_honesty(agent_response, messages, session_key=msg.session_key)
 
         # Execute intent and get final message
         final_message = await self._execute_intent(
             agent_response,
             msg.channel,
             msg.chat_id,
+            session=session,
         )
 
         # Save to session
         session.add_message("user", msg.content)
         session.add_message("assistant", final_message)
+        self._remember_paths_in_session(session, msg.content or "")
+        self._remember_paths_in_session(session, final_message)
         self.sessions.save(session)
 
         return OutboundMessage(
@@ -368,6 +950,68 @@ class Orchestrator:
             chat_id=msg.chat_id,
             content=final_message,
         )
+
+    def _build_provider_agent_messages(
+        self,
+        session: Any,
+        current_message: str,
+        system_state: str,
+    ) -> list[dict[str, Any]]:
+        """Build conversation context for provider-native orchestration."""
+        base_prompt = self.context.build_system_prompt()
+        system_prompt = (
+            f"{base_prompt}\n\n---\n\n"
+            f"## Current System State\n{system_state}\n\n"
+            "You are the sole orchestrator and executor for this conversation.\n"
+            "Use available tools directly to do work when needed.\n"
+            "Do not ask for permission; execute and report concrete outcomes.\n"
+            "Never invent task references."
+        )
+
+        messages = [{"role": "system", "content": system_prompt}]
+        use_native_ctx = bool(
+            hasattr(self.provider, "uses_native_session_context")
+            and callable(getattr(self.provider, "uses_native_session_context"))
+            and self.provider.uses_native_session_context()
+        )
+        if not use_native_ctx:
+            for h in session.get_history(max_messages=16):
+                messages.append(h)
+        messages.append({"role": "user", "content": current_message})
+        return messages
+
+    async def _process_with_provider_agent(self, msg: InboundMessage, session: Any) -> str | None:
+        """Run a chat turn directly through the provider-native agent."""
+        system_state = self.registry.get_context_summary()
+        messages = self._build_provider_agent_messages(session, msg.content, system_state)
+        self._last_user_content = msg.content
+        try:
+            response = await self._provider_chat(
+                messages=messages,
+                tools=None,
+                model=self.model,
+                session_key=msg.session_key,
+            )
+        except Exception as e:
+            logger.error(f"Provider-agent chat failure: {e}")
+            return None
+
+        if response.finish_reason == "error":
+            logger.error(f"Provider-agent returned error: {response.content}")
+            return None
+
+        final_message = (response.content or "").strip()
+        if not final_message:
+            logger.error(
+                "Provider-agent returned empty response | "
+                f"finish_reason={response.finish_reason} | "
+                f"has_tool_calls={response.has_tool_calls}"
+            )
+            return None
+
+        final_message = _strip_fabricated_refs(final_message)
+        final_message = _strip_task_refs_for_chat(final_message)
+        return final_message
     
     def _build_messages(
         self,
@@ -395,25 +1039,82 @@ class Orchestrator:
 
         messages = [{"role": "system", "content": system_prompt}]
 
-        # Add history
-        for h in session.get_history(max_messages=10):
-            messages.append(h)
+        use_native_ctx = bool(
+            hasattr(self.provider, "uses_native_session_context")
+            and callable(getattr(self.provider, "uses_native_session_context"))
+            and self.provider.uses_native_session_context()
+        )
+        if not use_native_ctx:
+            for h in session.get_history(max_messages=10):
+                messages.append(h)
 
         # Add current message
         messages.append({"role": "user", "content": current_message})
 
         return messages
+
+    async def _provider_chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        session_key: str | None,
+    ) -> Any:
+        supports_session_id = False
+        supports_callback = False
+        try:
+            sig = inspect.signature(self.provider.chat)
+            supports_session_id = "session_id" in sig.parameters
+            supports_callback = "callback" in sig.parameters
+        except Exception:
+            supports_session_id = False
+            supports_callback = False
+
+        kwargs = {
+            "messages": messages,
+            "tools": tools,
+            "model": model,
+        }
+        if supports_session_id:
+            kwargs["session_id"] = session_key
+
+        if supports_callback and not tools:
+            # Create a callback that publishes updates to the bus
+            # extracting channel/chat_id from session_key if possible
+            channel, chat_id = "dashboard", "dashboard"
+            if session_key and ":" in session_key:
+                parts = session_key.split(":", 1)
+                channel, chat_id = parts[0], parts[1]
+
+            async def _progress_cb(msg: str) -> None:
+                text = (msg or "").strip()
+                # Hide internal orchestration/voice function-tool calls from users.
+                if re.search(r"(?i)\busing tool:\s*`?(respond|say)`?\b", text):
+                    return
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=f"⚡️ {text}",
+                    is_background=True,
+                ))
+            
+            kwargs["callback"] = _progress_cb
+
+        return await self.provider.chat(**kwargs)
     
     async def _get_structured_response(
         self,
         messages: list[dict[str, Any]],
+        session_key: str | None = None,
     ) -> AgentResponse | None:
         """Get structured response from LLM using function calling."""
         try:
-            response = await self.provider.chat(
+            response = await self._provider_chat(
                 messages=messages,
                 tools=[RESPOND_TOOL],
                 model=self.model,
+                session_key=session_key,
             )
 
             # Detect provider errors returned as content
@@ -425,24 +1126,11 @@ class Orchestrator:
                 for tc in response.tool_calls:
                     if tc.name == "respond":
                         return parse_tool_call(tc)
-                # Tool calls present but none named "respond" — the model
-                # tried to invoke worker tools directly (common with weaker
-                # models).  Treat this as an implicit spawn_task intent so
-                # the request isn't silently dropped.
                 tool_names = [tc.name for tc in (response.tool_calls or [])]
                 logger.warning(
-                    f"LLM returned tool calls but none named 'respond': {tool_names} — "
-                    f"auto-wrapping as spawn_task"
+                    f"LLM returned tool calls but none named 'respond': {tool_names}"
                 )
-                return AgentResponse(
-                    message="On it — working on that now.",
-                    intent=Intent(
-                        action=IntentAction.SPAWN_TASK,
-                        task_description=self._last_user_content or "Execute the requested task",
-                        task_label="Requested task",
-                        complexity="moderate",
-                    ),
-                )
+                return None
 
             # Fallback: LLM didn't use the tool, treat as pure chat
             if response.content:
@@ -468,6 +1156,7 @@ class Orchestrator:
         self,
         response: AgentResponse,
         messages: list[dict[str, Any]],
+        session_key: str | None = None,
     ) -> AgentResponse:
         """
         Validate that the LLM's claims match its declared intent.
@@ -503,7 +1192,7 @@ class Orchestrator:
                 ),
             })
             
-            retry = await self._get_structured_response(messages)
+            retry = await self._get_structured_response(messages, session_key=session_key)
             if retry:
                 return retry
         
@@ -514,6 +1203,7 @@ class Orchestrator:
         response: AgentResponse,
         channel: str,
         chat_id: str,
+        session: Any | None = None,
     ) -> str:
         """
         Execute the declared intent and return the final message.
@@ -533,6 +1223,11 @@ class Orchestrator:
             label = (intent.task_label or "").lower()
             combined = f"{desc} {label}"
 
+            task_description = self._augment_task_description_with_recent_paths(
+                intent.task_description or message,
+                session,
+            )
+
             # Intercept security scan requests — route through the deterministic
             # scan path instead of letting the LLM improvise with the SKILL.md.
             if _is_security_scan_request(combined):
@@ -544,18 +1239,19 @@ class Orchestrator:
 
             # Create and spawn task
             task = self.registry.create(
-                description=intent.task_description or message,
+                description=task_description,
                 label=intent.task_label or "Task",
                 origin_channel=channel,
                 origin_chat_id=chat_id,
                 complexity=intent.complexity,
             )
 
-            # If the orchestrator is not running its background loops (common in
-            # one-shot CLI usage), "spawning" a background task is a lie: the
-            # event loop will exit and cancel the worker. In that case, execute
-            # inline and return the completion payload directly.
-            if not self._running:
+            # UX default: run inline so the experience feels like a normal
+            # foreground coding session (immediate result, no async refs).
+            # Keep dashboard-triggered tasks in background mode.
+            run_inline = channel != "dashboard"
+
+            if run_inline:
                 await self.workers.run_inline(task)
                 if task.status == TaskStatus.COMPLETED:
                     result = task.result or "Task completed."
@@ -566,21 +1262,33 @@ class Orchestrator:
                 logger.info(f"Inline-completed task: {task.label} [{task.reference}]")
             else:
                 self.workers.spawn(task)
-
-                # Never show internal refs in chat.
-
                 logger.info(f"Spawned task: {task.label} [{task.reference}]")
         
         elif intent.action == IntentAction.CHECK_STATUS:
-            # Get status and inject into message
             status = self.registry.get_status_for_ref(intent.task_ref)
             status_voiced = await self.voice.speak_status(status)
             status_voiced = _strip_task_refs_for_chat(status_voiced)
             message = status_voiced
         
         elif intent.action == IntentAction.CANCEL_TASK:
-            # TODO: Implement task cancellation
-            message = f"{message}\n\n(Task cancellation not yet implemented)"
+            ref = (intent.task_ref or "").strip()
+            task = self.registry.get_by_ref(ref) if ref else None
+            if not task:
+                message = "I couldn't find that task to cancel."
+            elif task.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+                message = f"That task is already {task.status.value}."
+            else:
+                ok = self.workers.cancel(task.id)
+                if ok:
+                    message = "Cancel requested."
+                else:
+                    refreshed = self.registry.get(task.id)
+                    if refreshed and refreshed.status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+                        self.registry.mark_cancelled(task.id, "Cancelled by user")
+                        message = "Task marked cancelled."
+                    else:
+                        final_status = refreshed.status.value if refreshed else task.status.value
+                        message = f"That task is already {final_status}."
         
         # IntentAction.NONE = pure chat, no modification needed
         
@@ -615,114 +1323,60 @@ class Orchestrator:
         """
         Background loop that delivers task completions to the user.
 
-        The worker already speaks in the bot's voice — its result is the
-        message. This loop just delivers it (and may append refs if configured).
+        Uses templates for all notifications — zero LLM voice calls.
         """
-        # If voice generation fails, do not send canned output; retry later.
-        pending: list[tuple[Task, int, datetime]] = []  # (task, attempts, retry_at)
-
         while self._running:
             try:
                 task: Task | None = None
-                now = datetime.now()
 
-                # Prefer retrying pending completions that are ready.
-                if pending:
-                    pending.sort(key=lambda x: x[2])
-                    if pending[0][2] <= now:
-                        task, attempts, _ = pending.pop(0)
-                    else:
-                        # Wait up to 1s or until next retry time.
-                        wait_s = min(1.0, max(0.0, (pending[0][2] - now).total_seconds()))
-                        task = await asyncio.wait_for(self.workers.get_completion(), timeout=wait_s)
-                        attempts = 0
-                else:
-                    task = await asyncio.wait_for(self.workers.get_completion(), timeout=1.0)
-                    attempts = 0
+                task = await asyncio.wait_for(self.workers.get_completion(), timeout=1.0)
 
                 ref = task.completion_reference or "✅"
 
                 try:
                     if task.status == TaskStatus.COMPLETED:
-                        # Deliver the worker's own final answer verbatim.
-                        # The worker already runs its own _final_is_unusable() check
-                        # (which includes looks_like_prompt_leak). Re-checking here
-                        # is redundant and actively harmful: legitimate task results
-                        # with quoted strings, markdown, etc. get falsely flagged,
-                        # causing the completion to be re-voiced (slow) or dropped.
+                        # Worker result IS the final answer — already in character voice
+                        # from the persona prompt. Send it directly.
                         base = (task.result or "").strip()
-                        if base:
-                            notification = base
-                        else:
-                            # Worker produced empty result — generate a short summary.
-                            notification = await self.voice.speak(
-                                content=f"Finished {task.label}.",
-                                context="task completion (background ping). Be natural, 1 sentence.",
-                                strict_llm=True,
-                            )
+                        if not base:
+                            import random
+                            templates = [
+                                "Done! Finished up {label}.",
+                                "All set — {label} is wrapped up.",
+                                "Got it done — {label}.",
+                            ]
+                            base = random.choice(templates).format(label=task.label)
+                        notification = base
                     else:
-                        # For failures/cancellations, generate voice from a rich factual payload.
-                        # This avoids the common "only the ✅ref" failure mode and gives the
-                        # model more to say without inventing details.
-                        status_payload = task.to_full_summary()
-
-                        def _has_substance(text: str) -> bool:
-                            t = (text or "").strip()
-                            if not t:
-                                return False
-                            body = t.replace(ref, "").strip()
-                            return bool(body)
-
-                        must = None
-                        notification = await self.voice.speak(
-                            content=status_payload,
-                            context=(
-                                "background task completion (failed or cancelled). "
-                                "Speak naturally in character. "
-                                "Be honest about failure/cancellation. "
-                                "Use only the facts provided. "
-                                "Do NOT output only the receipt."
-                            ),
-                            must_include=must,
-                            strict_llm=True,
-                        )
-                        if not _has_substance(notification):
-                            # One retry with more explicit constraints.
-                            notification = await self.voice.speak(
-                                content=status_payload,
-                                context=(
-                                    "background task completion (failed or cancelled). "
-                                    "Write 1-2 short sentences with substance (not only the receipt). "
-                                    "Mention the task label and the status (failed/cancelled). "
-                                    "Use only the facts provided."
-                                ),
-                                must_include=must,
-                                strict_llm=True,
+                        # Failures/cancellations — short template, no LLM call
+                        import random
+                        if task.status == TaskStatus.FAILED:
+                            error = task.error or "unknown error"
+                            fail_templates = [
+                                "❌ {label} failed — {error}",
+                                "❌ Hit a problem with {label}: {error}",
+                                "❌ {label} didn't make it — {error}",
+                            ]
+                            notification = random.choice(fail_templates).format(
+                                label=task.label, error=error,
                             )
+                        elif task.status == TaskStatus.CANCELLED:
+                            notification = f"🚫 {task.label} was cancelled."
+                        else:
+                            notification = f"{task.label} — {task.status.value}"
                 except Exception as e:
-                    # Requeue for retry. Exponential backoff up to 60s.
-                    delay = min(60.0, 2.0 ** min(6, attempts))
-                    retry_at = datetime.now() + timedelta(seconds=delay)
-                    pending.append((task, attempts + 1, retry_at))
-                    logger.error(
-                        f"Voice failed for completion '{task.label}' "
-                        f"(attempt {attempts + 1}), retrying in {delay:.1f}s: {e}"
-                    )
-                    continue
+                    # Template-based notifications shouldn't fail, but just in case
+                    logger.error(f"Failed to build notification for '{task.label}': {e}")
+                    notification = f"Task '{task.label}' — {task.status.value}"
 
-                notification = _prefix_meta(notification)
                 notification = _strip_task_refs_for_chat(notification)
-                if not notification.strip() or _is_only_meta_prefix(notification):
-                    # Don't lose the completion — requeue for retry so voice
-                    # gets another chance to produce usable output.
-                    delay = min(60.0, 2.0 ** min(6, attempts))
-                    retry_at = datetime.now() + timedelta(seconds=delay)
-                    pending.append((task, attempts + 1, retry_at))
-                    logger.error(
-                        f"Completion notification became empty after stripping refs for '{task.label}' "
-                        f"(attempt {attempts + 1}), retrying in {delay:.1f}s"
-                    )
-                    continue
+                if not notification.strip():
+                    notification = f"Task '{task.label}' — {task.status.value}"
+
+                # Persist completion outputs into conversation history so terse
+                # follow-ups ("proceed", "do it") still have full context.
+                self._persist_completion_context(task, notification)
+
                 try:
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=task.origin_channel,
@@ -731,14 +1385,7 @@ class Orchestrator:
                         is_background=True,
                     ))
                 except Exception as e:
-                    # publish_outbound failed — requeue so we don't lose the completion.
-                    delay = min(60.0, 2.0 ** min(6, attempts))
-                    retry_at = datetime.now() + timedelta(seconds=delay)
-                    pending.append((task, attempts + 1, retry_at))
-                    logger.error(
-                        f"Failed to publish completion for '{task.label}' "
-                        f"(attempt {attempts + 1}), retrying in {delay:.1f}s: {e}"
-                    )
+                    logger.error(f"Failed to publish completion for '{task.label}': {e}")
                     continue
 
                 logger.info(f"Sent completion notification for: {task.label}")
@@ -748,16 +1395,8 @@ class Orchestrator:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                # CRITICAL: If we have a task that was popped from the queue but
-                # couldn't be processed, requeue it so it's not lost forever.
                 if task is not None:
-                    delay = min(60.0, 2.0 ** min(6, attempts))
-                    retry_at = datetime.now() + timedelta(seconds=delay)
-                    pending.append((task, attempts + 1, retry_at))
-                    logger.error(
-                        f"Unexpected error in completion loop for '{task.label}' "
-                        f"(attempt {attempts + 1}), requeueing in {delay:.1f}s: {e}"
-                    )
+                    logger.error(f"Unexpected error in completion loop for '{task.label}': {e}")
                 else:
                     logger.error(f"Error in completion loop: {e}")
     
@@ -765,13 +1404,21 @@ class Orchestrator:
         """
         Background loop that sends batched progress updates.
         
-        Every 30 seconds, if there are active tasks with meaningful progress,
-        send an update to the user.
+        The LiveNarrator handles real-time updates for active tasks.
+        This loop only fires for tasks that somehow aren't covered by
+        the narrator (e.g., tasks spawned before narrator was started),
+        and uses simple templates instead of LLM voice generation.
         """
         while self._running:
             try:
-                # Not configurable: progress pings are every 30 seconds.
-                await asyncio.sleep(30.0)
+                interval = 10.0
+                raw_interval = (os.getenv("KYBER_PROGRESS_UPDATE_INTERVAL_SECONDS", "") or "").strip()
+                if raw_interval:
+                    try:
+                        interval = max(3.0, float(raw_interval))
+                    except ValueError:
+                        interval = 10.0
+                await asyncio.sleep(interval)
                 
                 active_tasks = self.registry.get_active_tasks()
                 if not active_tasks:
@@ -780,78 +1427,61 @@ class Orchestrator:
                 # Group by origin (channel:chat_id)
                 by_origin: dict[str, list[Task]] = {}
                 for task in active_tasks:
+                    # Skip tasks the narrator is already covering
+                    if self.narrator.is_narrating(task.id):
+                        continue
                     key = f"{task.origin_channel}:{task.origin_chat_id}"
                     if key not in by_origin:
                         by_origin[key] = []
                     by_origin[key].append(task)
                 
-                # Send progress update to each origin
                 for origin_key, tasks in by_origin.items():
-                    # Dashboard-originated tasks don't need chat progress updates —
-                    # the dashboard polls /tasks for live status already.
                     if origin_key == "dashboard:dashboard":
                         continue
 
-                    # Check if we should send (avoid spamming)
                     last_update = self._last_progress_update.get(origin_key)
                     if last_update:
                         elapsed = (datetime.now() - last_update).total_seconds()
-                        if elapsed < 30.0 * 0.9:
+                        if elapsed < interval * 0.8:
                             continue
                     
-                    # Build summaries
+                    def _progress_emoji(action: str) -> str:
+                        a = (action or "").lower()
+                        if any(w in a for w in ("read", "load", "check", "inspect", "look", "review", "scan")):
+                            return "📖"
+                        if any(w in a for w in ("write", "create", "save", "generate", "add")):
+                            return "✏️"
+                        if any(w in a for w in ("edit", "update", "modify", "fix", "patch", "replace")):
+                            return "🔧"
+                        if any(w in a for w in ("run", "exec", "install", "build", "deploy", "test")):
+                            return "🏃"
+                        if any(w in a for w in ("search", "find", "query")):
+                            return "🔍"
+                        if any(w in a for w in ("fetch", "download", "open", "browse", "url")):
+                            return "🌐"
+                        if any(w in a for w in ("send", "post", "publish", "notify", "message")):
+                            return "💬"
+                        return "⚙️"
+
                     summaries = []
                     for task in tasks:
-                        if not task.progress_updates_enabled:
-                            continue
                         if task.status == TaskStatus.RUNNING:
-                            if task.current_action:
-                                action = task.current_action
-                            elif task.actions_completed:
-                                action = f"just finished {task.actions_completed[-1]}"
-                            else:
-                                action = "getting started"
-                            if task.max_iterations:
-                                step = f"step {task.iteration}/{task.max_iterations}"
-                            else:
-                                step = f"step {task.iteration}"
-                            summaries.append(
-                                f"{task.label} — {action} — {step}"
-                            )
+                            action = task.current_action or "working..."
+                            step = f"step {task.iteration}"
+                            emoji = _progress_emoji(action)
+                            summaries.append(f"{emoji} {task.label} — {action} ({step})")
                     
                     if not summaries:
                         continue
+
+                    prev_summaries = self._last_progress_summary.get(origin_key)
+                    if prev_summaries == summaries:
+                        continue
+                    self._last_progress_summary[origin_key] = summaries
+
+                    # Use simple template — no LLM voice call
+                    update = "\n".join(summaries)
                     
-                    # Generate in-character update.
-                    # Wrap in a timeout so a slow/hanging LLM call can't block
-                    # the entire progress loop and starve subsequent ticks.
-                    try:
-                        update = await asyncio.wait_for(
-                            self.voice.speak_progress(summaries),
-                            timeout=20.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.error(
-                            f"Voice timed out for progress update to {origin_key} "
-                            f"(summaries={summaries!r})"
-                        )
-                        continue
-                    except Exception as e:
-                        # Voice failed even after internal retries — log the full
-                        # context so we can diagnose what the LLM actually returned.
-                        logger.error(
-                            f"Voice failed for progress update to {origin_key} "
-                            f"(summaries={summaries!r}): {e}"
-                        )
-                        continue
-                    update = _strip_task_refs_for_chat(update)
-                    if not update.strip() or _is_only_meta_prefix(_prefix_meta(update)):
-                        # Don't send empty updates; treat as a voice failure for this tick.
-                        logger.error(f"Progress update became empty after stripping refs to {origin_key}")
-                        continue
-                    update = _prefix_meta(update)
-                    
-                    # Parse origin
                     parts = origin_key.split(":", 1)
                     channel = parts[0]
                     chat_id = parts[1] if len(parts) > 1 else "direct"
@@ -864,7 +1494,6 @@ class Orchestrator:
                     ))
                     
                     self._last_progress_update[origin_key] = datetime.now()
-                    logger.debug(f"Sent progress update to {origin_key}")
                 
             except asyncio.CancelledError:
                 break

@@ -31,6 +31,9 @@ class ExecTool(Tool):
             r">\s*/dev/sd",                  # write to disk
             r"\b(shutdown|reboot|poweroff)\b",  # system power
             r":\(\)\s*\{.*\};\s*:",          # fork bomb
+            r"\bcrontab\s+-[re]\b",          # crontab -r (remove all), crontab -e (edit)
+            r">\s*.*cron/jobs\.json\b",      # redirect overwrite cron/jobs.json
+            r"\brm\s+.*cron/jobs\.json\b",   # rm cron/jobs.json
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace

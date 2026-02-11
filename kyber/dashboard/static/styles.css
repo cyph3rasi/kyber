@@ -1091,6 +1091,33 @@ body {
   color: var(--accent);
 }
 
+.malware-status-meta {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-top: 8px;
+}
+
+.malware-history {
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.malware-history-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.malware-history-row {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  padding: 2px 0;
+}
+
 .malware-findings {
   margin-top: 12px;
   border-top: 1px solid var(--border);
