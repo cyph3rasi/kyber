@@ -726,18 +726,24 @@ class Orchestrator:
         system_state = self.registry.get_context_summary()
         self._last_user_content = msg.content
 
+        # Always build messages (needed for honesty validation and legacy fallback)
+        messages = self._build_messages(session, msg.content, system_state)
+
         # --- PydanticAI native structured output path ---
         # When the provider supports run_structured(), use it for direct
         # AgentResponse output (no tool-call parsing needed).
+        agent_response = None
         if hasattr(self.provider, "run_structured"):
             agent_response = await self._get_structured_response_native(
                 session, msg.content, system_state,
             )
-            # Build messages list for honesty validation retry path
-            messages = self._build_messages(session, msg.content, system_state)
-        else:
-            # --- Legacy path (non-PydanticAI providers) ---
-            messages = self._build_messages(session, msg.content, system_state)
+            if not agent_response:
+                logger.warning(
+                    "Native structured output failed, falling back to legacy path"
+                )
+
+        if not agent_response:
+            # Legacy path — used by non-PydanticAI providers or as fallback
             agent_response = await self._get_structured_response(messages, session_key=msg.session_key)
 
         if not agent_response:
