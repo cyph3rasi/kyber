@@ -115,7 +115,7 @@ kyber gateway
 
 ## Providers
 
-Kyber supports multiple LLM providers through LiteLLM. You can pin a specific provider so it won't fall back to another key when multiple are configured.
+Kyber supports multiple LLM providers through PydanticAI. You can pin a specific provider so it won't fall back to another key when multiple are configured.
 
 Supported providers: `openrouter`, `openai`, `anthropic`, `deepseek`, `gemini`, `groq`, plus any OpenAI-compatible endpoint via custom providers
 
@@ -445,7 +445,7 @@ kyber/
 ├── cron/           Scheduled task service
 ├── dashboard/      Secure local web UI
 ├── heartbeat/      Proactive wake-ups
-├── providers/      LLM provider integration (LiteLLM)
+├── providers/      LLM provider integration (PydanticAI)
 ├── session/        Conversation state management
 ├── skills/         Built-in skill definitions
 ├── skillhub/       Skill installation and management

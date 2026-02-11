@@ -83,7 +83,15 @@ class LiveNarrator:
 
     def unregister_task(self, task_id: str) -> None:
         """Clean up when a task completes."""
-        self._buffers.pop(task_id, None)
+        actions = self._buffers.pop(task_id, [])
+        origin = self._origins.get(task_id)
+        if actions and origin:
+            channel, chat_id = origin
+            if channel != "dashboard":
+                message = self._format_actions(actions)
+                if message:
+                    asyncio.create_task(self._send_safe(channel, chat_id, message, task_id))
+
         self._origins.pop(task_id, None)
         self._labels.pop(task_id, None)
         self._intro_sent.discard(task_id)

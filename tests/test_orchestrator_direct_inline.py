@@ -29,18 +29,38 @@ class SequenceProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
+        tool_choice: Any | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> LLMResponse:
-        self.calls.append(
-            {"messages": messages, "tools": tools, "model": model, "max_tokens": max_tokens}
-        )
+        self.calls.append({
+            "messages": messages,
+            "tools": tools,
+            "model": model,
+            "tool_choice": tool_choice,
+            "max_tokens": max_tokens,
+        })
         if not self._responses:
             return LLMResponse(content="(no more stubbed responses)")
         return self._responses.pop(0)
 
     def get_default_model(self) -> str:
         return "stub-model"
+
+    async def execute_task(
+        self,
+        *,
+        task_description: str,
+        persona_prompt: str,
+        timezone: str | None = None,
+        workspace: Path | None = None,
+        callback: Any | None = None,
+    ) -> str:
+        _ = (task_description, persona_prompt, timezone, workspace, callback)
+        if not self._responses:
+            return "(no more stubbed responses)"
+        response = self._responses.pop(0)
+        return (response.content or "").strip()
 
 
 @pytest.mark.asyncio

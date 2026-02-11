@@ -81,8 +81,13 @@ async def test_execute_intent_spawn_task_strips_model_ref_and_injects_real_ref(t
     out = await agent._execute_intent(resp, channel="discord", chat_id="123")
 
     assert "deadbeef" not in out
-    # Refs are now internal-only (not shown in chat). Ensure the spawned task exists in registry.
+    # Refs are now internal-only (not shown in chat). Depending on execution
+    # mode, the task may still be active or already completed inline.
     active = agent.registry.get_active_tasks()
-    assert len(active) == 1
-    assert active[0].label == "Investigate"
-    assert active[0].reference.startswith("⚡")
+    if active:
+        assert len(active) == 1
+        assert active[0].label == "Investigate"
+        assert active[0].reference.startswith("⚡")
+    else:
+        history = agent.registry.get_history(limit=5)
+        assert any(t.label == "Investigate" for t in history)

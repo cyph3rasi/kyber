@@ -5,6 +5,8 @@ The LLM declares what it wants to happen, the system executes.
 This prevents hallucination - the LLM can't claim actions it didn't declare.
 """
 
+import json
+import re
 from enum import Enum
 from typing import Any
 from pydantic import BaseModel, Field
@@ -113,8 +115,6 @@ RESPOND_TOOL = {
 
 def parse_tool_call(tool_call: Any) -> AgentResponse:
     """Parse a tool call response into AgentResponse."""
-    import json
-
     if hasattr(tool_call, 'arguments'):
         args = tool_call.arguments
         if isinstance(args, str):
@@ -138,8 +138,16 @@ def parse_tool_call(tool_call: Any) -> AgentResponse:
     if not isinstance(intent_data, dict):
         intent_data = {}
 
+    action_raw = intent_data.get("action", "none")
+    if isinstance(action_raw, str):
+        action_raw = action_raw.strip().lower()
+    try:
+        action = IntentAction(action_raw)
+    except Exception:
+        action = IntentAction.NONE
+
     intent = Intent(
-        action=IntentAction(intent_data.get("action", "none")),
+        action=action,
         task_description=intent_data.get("task_description"),
         task_label=intent_data.get("task_label"),
         task_ref=intent_data.get("task_ref"),
@@ -150,3 +158,33 @@ def parse_tool_call(tool_call: Any) -> AgentResponse:
         message=args.get("message", ""),
         intent=intent,
     )
+
+
+def parse_response_content(content: str) -> AgentResponse | None:
+    """
+    Parse a raw assistant content string into AgentResponse when it contains
+    a JSON envelope (e.g., {"message": "...", "intent": {...}}).
+    """
+    text = (content or "").strip()
+    if not text:
+        return None
+
+    candidates = [text]
+    fence = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE)
+    if fence:
+        fenced_obj = (fence.group(1) or "").strip()
+        if fenced_obj:
+            candidates.insert(0, fenced_obj)
+
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and ("message" in payload or "intent" in payload):
+            try:
+                return parse_tool_call(payload)
+            except Exception:
+                continue
+
+    return None

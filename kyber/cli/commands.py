@@ -218,7 +218,7 @@ def _create_orchestrator(
     Shared by the ``gateway`` and ``agent`` commands so provider/model
     resolution lives in one place.
     """
-    from kyber.providers.strands_provider import StrandsProvider
+    from kyber.providers.pydantic_provider import PydanticAIProvider
     from kyber.agent.orchestrator import Orchestrator
 
     # ── Chat provider ──
@@ -230,7 +230,7 @@ def _create_orchestrator(
     if chat_details.get("is_custom", False) and not chat_api_key:
         console.print(f"[red]Error: Custom chat provider '{chat_provider_name}' requires an API key.[/red]")
         raise typer.Exit(1)
-    chat_provider = StrandsProvider(
+    chat_provider = PydanticAIProvider(
         api_key=chat_api_key,
         api_base=chat_api_base,
         default_model=chat_model,
@@ -250,7 +250,7 @@ def _create_orchestrator(
     if task_details.get("is_custom", False) and not task_api_key:
         console.print(f"[red]Error: Custom task provider '{task_provider_name}' requires an API key.[/red]")
         raise typer.Exit(1)
-    task_provider = StrandsProvider(
+    task_provider = PydanticAIProvider(
         api_key=task_api_key,
         api_base=task_api_base,
         default_model=task_model,
@@ -408,7 +408,12 @@ def gateway(
     # Create heartbeat service
     async def on_heartbeat(prompt: str) -> str:
         """Execute heartbeat through the agent."""
-        return await agent.process_direct(prompt, session_key="heartbeat")
+        return await agent.process_direct(
+            prompt,
+            session_key="internal:heartbeat",
+            channel="internal",
+            chat_id="heartbeat",
+        )
     
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,

@@ -67,6 +67,25 @@ def _task_to_dict(t: Task) -> dict[str, Any]:
     }
 
 
+def _is_dashboard_visible_task(t: Task) -> bool:
+    """Filter internal/system maintenance tasks from dashboard task views."""
+    ch = (t.origin_channel or "").strip().lower()
+    chat = (t.origin_chat_id or "").strip().lower()
+    label = (t.label or "").strip().lower()
+    desc = (t.description or "").strip().lower()
+
+    if ch in {"internal", "system"}:
+        return False
+    # Backward-compatible filtering for older heartbeat entries.
+    if "heartbeat" in label:
+        return False
+    if "heartbeat.md" in desc and "heartbeat_ok" in desc:
+        return False
+    if chat == "heartbeat" and ch in {"cli", "internal", "system"}:
+        return False
+    return True
+
+
 def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     require = _require_token(token)
@@ -77,8 +96,8 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
 
     @app.get("/tasks", dependencies=[Depends(require)])
     async def list_tasks() -> JSONResponse:
-        active = agent.registry.get_active_tasks()
-        history = agent.registry.get_history(limit=100)
+        active = [t for t in agent.registry.get_active_tasks() if _is_dashboard_visible_task(t)]
+        history = [t for t in agent.registry.get_history(limit=100) if _is_dashboard_visible_task(t)]
         # Only include completed-ish statuses in history response.
         hist_filtered = [
             t for t in history if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
@@ -154,8 +173,8 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
 
         # Keep this lightweight: deliver the stored in-character output verbatim.
         # Add the lightning prefix for consistency with completion pings.
-        if not payload.startswith("⚡️"):
-            payload = "⚡️ " + payload
+        if not payload.startswith(("⚡️", "💎")):
+            payload = "💎 " + payload
 
         await agent.bus.publish_outbound(
             OutboundMessage(

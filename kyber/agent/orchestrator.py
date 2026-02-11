@@ -33,7 +33,7 @@ from kyber.agent.context import ContextBuilder
 from kyber.agent.narrator import LiveNarrator
 from kyber.agent.intent import (
     Intent, IntentAction, AgentResponse, 
-    RESPOND_TOOL, parse_tool_call
+    RESPOND_TOOL, parse_tool_call, parse_response_content
 )
 
 
@@ -57,41 +57,6 @@ _FILENAME_HINT_RE = re.compile(
     r"\b[\w.-]+\.(?:py|js|ts|tsx|jsx|md|txt|json|yaml|yml|toml|html|css|sh|sql)\b",
     re.IGNORECASE,
 )
-_WORK_REQUEST_CUES = (
-    "fix ", "update ", "change ", "edit ", "create ", "write ", "build ",
-    "implement ", "refactor ", "run ", "execute ", "check ", "review ",
-    "analyze ", "look at ", "open ", "list ", "find ", "search ", "scan ",
-    "install ", "delete ", "remove ", "organize ", "debug ", "resolve ",
-    "improve ", "enhance ", "tell me how big", "show me ", "add ",
-)
-_CONCEPTUAL_QUESTION_CUES = (
-    "what is", "why ", "how does", "how would", "would it", "is it possible",
-    "can it", "could it", "explain", "thoughts on", "what do you think",
-)
-_CONCRETE_ACTION_CUES = (
-    "fix ", "edit ", "update ", "create ", "write ", "run ", "check ",
-    "show me", "tell me", "list ", "find ", "scan ", "review ", "organize ",
-    "delete ", "remove ", "install ", "open ", "add ", "change ",
-)
-
-def _extract_ref(text: str) -> str | None:
-    """Extract a task reference token (⚡deadbeef / ✅deadbeef / ❌deadbeef / deadbeef) from free text."""
-    candidates = re.findall(r"(?i)[⚡✅❌]?[0-9a-f]{8}", text)
-    return candidates[0] if candidates else None
-
-
-def _looks_like_status_request(text: str) -> bool:
-    s = (text or "").strip().lower()
-    if not s:
-        return False
-    # Keep this conservative; if it triggers, we will never spawn work.
-    if s.startswith(("status", "progress", "update")):
-        return True
-    if " status" in s or "progress" in s or "update" in s:
-        return True
-    if s.startswith("ref:"):
-        return True
-    return False
 
 
 def _is_truthy_env(value: str | None) -> bool:
@@ -102,50 +67,6 @@ def _is_falsy_env(value: str | None) -> bool:
     v = (value or "").strip().lower()
     return v in {"0", "false", "no", "off"}
 
-
-def _looks_like_direct_task_request(text: str) -> bool:
-    raw = (text or "").strip()
-    if not raw:
-        return False
-    if _looks_like_status_request(raw):
-        return False
-
-    s = _normalize_for_match(raw)
-    if not s:
-        return False
-
-    short_smalltalk = {"hi", "hello", "hey", "thanks", "thank you", "good morning", "good night"}
-    if s in short_smalltalk:
-        return False
-
-    if _extract_paths(raw):
-        return True
-    if _FILENAME_HINT_RE.search(raw):
-        return True
-
-    has_work_cue = any(c in s for c in _WORK_REQUEST_CUES)
-    if not has_work_cue:
-        return False
-
-    if raw.endswith("?"):
-        conceptual = any(c in s for c in _CONCEPTUAL_QUESTION_CUES)
-        concrete = any(c in s for c in _CONCRETE_ACTION_CUES)
-        if conceptual and not concrete:
-            return False
-
-    return True
-
-
-def _derive_task_label(text: str) -> str:
-    raw = " ".join((text or "").strip().split())
-    if not raw:
-        return "Requested Task"
-    cleaned = raw.rstrip("?.! ")
-    words = cleaned.split()
-    label = " ".join(words[:6]) if words else "Requested Task"
-    if len(label) > 56:
-        label = label[:55].rstrip() + "…"
-    return label
 
 def _looks_like_follow_up_tweak(text: str) -> bool:
     raw = (text or "").strip()
@@ -168,69 +89,23 @@ def _looks_like_follow_up_tweak(text: str) -> bool:
 
     # Very short follow-up statements are often minor tweaks to recent work.
     return len(s.split()) <= 10
-
-
-def _looks_like_social_acknowledgement(text: str) -> bool:
-    """Detect brief social/praise messages that should not trigger task execution."""
-    raw = (text or "").strip()
+def _looks_like_deferred_execution_promise(text: str) -> bool:
+    """
+    Detect promises to do work later ("I'll spawn a task/sub-agent...")
+    so we can force immediate follow-through.
+    """
+    raw = (text or "").strip().lower()
     if not raw:
         return False
-    if _looks_like_status_request(raw):
-        return False
-    if _looks_like_direct_task_request(raw):
-        return False
-    if _extract_paths(raw) or _FILENAME_HINT_RE.search(raw):
-        return False
-    if "?" in raw:
-        return False
 
-    s = _normalize_for_match(raw)
-    if not s:
-        return False
-
-    exact = {
-        "thanks",
-        "thank you",
-        "thx",
-        "nice",
-        "nice work",
-        "good job",
-        "great job",
-        "awesome",
-        "cool",
-        "perfect",
-        "love it",
-        "lets go",
-    }
-    if s in exact:
-        return True
-
-    cues = (
-        "thanks",
-        "thank you",
-        "thx",
-        "nice",
-        "sick",
-        "dope",
-        "fire",
-        "awesome",
-        "great",
-        "cool",
-        "love it",
-        "good stuff",
-        "good job",
-        "well done",
-        "lets go",
+    future_cues = ("i'll", "i will", "let me", "going to", "gonna")
+    launch_cues = ("spawn", "spin up", "start", "kick off", "launch", "run")
+    unit_cues = ("task", "sub-agent", "sub agent", "agent")
+    return (
+        any(c in raw for c in future_cues)
+        and any(c in raw for c in launch_cues)
+        and any(c in raw for c in unit_cues)
     )
-    if any(c in s for c in cues) and len(s.split()) <= 12:
-        return True
-
-    slang_tokens = {"yo", "yoo", "yooo", "bro", "bruh", "lol", "lmao", "haha", "hehe"}
-    words = set(s.split())
-    if words and words.issubset(slang_tokens | {"that", "thats", "is", "it", "so", "very", "super", "really", "the"}):
-        return True
-
-    return False
 
 
 def _is_security_scan_request(text: str) -> bool:
@@ -335,14 +210,14 @@ def _prefix_meta(text: str) -> str:
     """Prefix system/meta updates so they visually differ from normal chat."""
     t = (text or "").lstrip()
     if not t:
-        return "⚡️"
-    if t.startswith("⚡"):
+        return "💎"
+    if t.startswith(("⚡", "💎")):
         return t
-    return f"⚡️ {t}"
+    return f"💎 {t}"
 
 def _is_only_meta_prefix(text: str) -> bool:
     t = (text or "").strip()
-    return t in {"⚡️", "⚡"}
+    return t in {"⚡️", "⚡", "💎"}
 
 def _extract_paths(text: str) -> list[str]:
     """Extract absolute filesystem-like paths from free text."""
@@ -767,7 +642,7 @@ class Orchestrator:
         await self.bus.publish_outbound(OutboundMessage(
             channel=channel,
             chat_id=chat_id,
-            content=content,
+            content=_prefix_meta(content),
             is_background=True,
         ))
 
@@ -806,50 +681,6 @@ class Orchestrator:
         if pending_confirmation_out:
             return pending_confirmation_out
 
-        # Fast-path: status queries should never rely on the model to choose intent,
-        # and they should NEVER spawn new work.
-        if _looks_like_status_request(msg.content or ""):
-            ref = _extract_ref(msg.content or "")
-            status = self.registry.get_status_for_ref(ref)
-            status_voiced = await self.voice.speak_status(status)
-            status_voiced = _strip_fabricated_refs(status_voiced)
-            status_voiced = _strip_task_refs_for_chat(status_voiced)
-            status_voiced = _prefix_meta(status_voiced)
-
-            session.add_message("user", msg.content)
-            session.add_message("assistant", status_voiced)
-            self._remember_paths_in_session(session, msg.content or "")
-            self._remember_paths_in_session(session, status_voiced)
-            self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=status_voiced,
-            )
-
-        if _looks_like_social_acknowledgement(msg.content or ""):
-            reply = await self.voice.speak(
-                content=msg.content or "",
-                context=(
-                    "The user sent a social acknowledgement or praise. "
-                    "Reply briefly in character. Do not start tasks, run tools, or claim new work."
-                ),
-                use_llm=True,
-                strict_llm=True,
-            )
-            reply = (reply or "").strip() or "Appreciate it."
-
-            session.add_message("user", msg.content)
-            session.add_message("assistant", reply)
-            self._remember_paths_in_session(session, msg.content or "")
-            self._remember_paths_in_session(session, reply)
-            self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=reply,
-            )
-
         if self._use_provider_native_orchestration():
             final_message = await self._process_with_provider_agent(msg, session)
             if not final_message:
@@ -862,37 +693,6 @@ class Orchestrator:
                     chat_id=msg.chat_id,
                     content=f"Sorry, I'm having trouble responding right now. (model: {self.model})",
                 )
-
-            session.add_message("user", msg.content)
-            session.add_message("assistant", final_message)
-            self._remember_paths_in_session(session, msg.content or "")
-            self._remember_paths_in_session(session, final_message)
-            self.sessions.save(session)
-
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=final_message,
-            )
-
-        # Fast-path for concrete work requests: skip intent-planning LLM call
-        # and execute directly like a native coding session.
-        if _looks_like_direct_task_request(msg.content or ""):
-            direct_response = AgentResponse(
-                message="Working on it.",
-                intent=Intent(
-                    action=IntentAction.SPAWN_TASK,
-                    task_description=msg.content or "",
-                    task_label=_derive_task_label(msg.content or ""),
-                    complexity="moderate",
-                ),
-            )
-            final_message = await self._execute_intent(
-                direct_response,
-                msg.channel,
-                msg.chat_id,
-                session=session,
-            )
 
             session.add_message("user", msg.content)
             session.add_message("assistant", final_message)
@@ -965,6 +765,7 @@ class Orchestrator:
             "You are the sole orchestrator and executor for this conversation.\n"
             "Use available tools directly to do work when needed.\n"
             "Do not ask for permission; execute and report concrete outcomes.\n"
+            "Never promise future work like 'I'll spawn a task' unless you execute it in this same turn.\n"
             "Never invent task references."
         )
 
@@ -1001,6 +802,9 @@ class Orchestrator:
             return None
 
         final_message = (response.content or "").strip()
+        parsed = parse_response_content(final_message)
+        if parsed is not None and (parsed.message or "").strip():
+            final_message = parsed.message.strip()
         if not final_message:
             logger.error(
                 "Provider-agent returned empty response | "
@@ -1011,6 +815,30 @@ class Orchestrator:
 
         final_message = _strip_fabricated_refs(final_message)
         final_message = _strip_task_refs_for_chat(final_message)
+        if _looks_like_deferred_execution_promise(final_message):
+            logger.warning(
+                "Provider-agent promised deferred execution; forcing immediate follow-through task"
+            )
+            forced = AgentResponse(
+                message="On it.",
+                intent=Intent(
+                    action=IntentAction.SPAWN_TASK,
+                    task_description=(
+                        "Follow through on this commitment and complete the work now.\n\n"
+                        f"User message:\n{msg.content or ''}\n\n"
+                        f"Assistant promise:\n{final_message}\n\n"
+                        "Execute the promised changes immediately and report concrete outcomes."
+                    ),
+                    task_label="Follow-through task",
+                    complexity="moderate",
+                ),
+            )
+            return await self._execute_intent(
+                forced,
+                msg.channel,
+                msg.chat_id,
+                session=session,
+            )
         return final_message
     
     def _build_messages(
@@ -1095,7 +923,7 @@ class Orchestrator:
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=channel,
                     chat_id=chat_id,
-                    content=f"⚡️ {text}",
+                    content=f"💎 {text}",
                     is_background=True,
                 ))
             
@@ -1134,6 +962,9 @@ class Orchestrator:
 
             # Fallback: LLM didn't use the tool, treat as pure chat
             if response.content:
+                parsed = parse_response_content(response.content)
+                if parsed is not None:
+                    return parsed
                 return AgentResponse(
                     message=response.content,
                     intent=Intent(action=IntentAction.NONE),
@@ -1291,8 +1122,18 @@ class Orchestrator:
                         message = f"That task is already {final_status}."
         
         # IntentAction.NONE = pure chat, no modification needed
-        
-        return message
+        safe_message = (message or "").strip()
+        if safe_message:
+            return safe_message
+
+        # Hard safety net: never return empty user-facing content.
+        if intent.action == IntentAction.SPAWN_TASK:
+            return "Working on it."
+        if intent.action == IntentAction.CHECK_STATUS:
+            return "I couldn't fetch task status right now."
+        if intent.action == IntentAction.CANCEL_TASK:
+            return "I couldn't process that cancel request right now."
+        return "Sorry, I had trouble generating a response just now. Please try again."
 
     def _spawn_security_scan(self, channel: str, chat_id: str) -> Task | None:
         """Spawn a deterministic security scan using the shared scan builder.

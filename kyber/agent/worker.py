@@ -8,6 +8,7 @@ The completion queue guarantees the user gets notified.
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import platform
@@ -102,7 +103,7 @@ class Worker:
             return True
         if any(tok in lower for tok in ["tool call", "tool_calls", "system prompt", "developer message"]):
             return True
-        if lower.startswith("error calling llm:") or "litellm." in lower or "badrequest" in lower.replace(" ", ""):
+        if lower.startswith("error calling llm:") or "pydantic_ai" in lower or "badrequest" in lower.replace(" ", ""):
             return True
         # Bot should never ask for permission — it should just do the work.
         if any(phrase in lower for phrase in [
@@ -319,11 +320,39 @@ class Worker:
         if not callable(execute_task):
             raise RuntimeError("Task provider does not implement execute_task().")
 
+        kwargs: dict[str, Any] = {}
+        try:
+            sig = inspect.signature(execute_task)
+            supports_callback = "callback" in sig.parameters
+        except Exception:
+            supports_callback = False
+
+        if supports_callback:
+            progress_step = max(1, int(self.task.iteration))
+
+            async def _progress_cb(msg: str) -> None:
+                nonlocal progress_step
+                text = (msg or "").strip()
+                if not text:
+                    return
+                progress_step += 1
+                self.registry.update_progress(
+                    self.task.id,
+                    iteration=progress_step,
+                    current_action=text,
+                    action_completed=text,
+                )
+                if self.narrator:
+                    self.narrator.narrate(self.task.id, text)
+
+            kwargs["callback"] = _progress_cb
+
         result = await execute_task(
             task_description=self.task.description,
             persona_prompt=self.persona_prompt,
             timezone=self.timezone,
             workspace=self.workspace,
+            **kwargs,
         )
         result = redact_secrets(result)
         if self._result_is_unusable(result):

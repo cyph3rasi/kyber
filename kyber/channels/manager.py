@@ -130,6 +130,12 @@ class ChannelManager:
         async def _try_send(msg: OutboundMessage, attempts: int = 1) -> None:
             if msg.channel in _SILENT_CHANNELS:
                 return  # silently drop — no chat channel to deliver to
+            if not (msg.content or "").strip():
+                logger.warning(
+                    f"Dropping empty outbound payload for {msg.channel}:{msg.chat_id} "
+                    f"(attempt {attempts})"
+                )
+                return
             channel = self.channels.get(msg.channel)
             if not channel:
                 raise PermanentDeliveryError(f"Unknown channel: {msg.channel}")
