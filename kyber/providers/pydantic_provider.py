@@ -11,19 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from pydantic import BaseModel, Field
 
+from kyber.agent.intent import AgentResponse
 from kyber.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from kyber.agent.tools.shell import ExecTool
 from kyber.agent.tools.web import WebFetchTool, WebSearchTool
 from kyber.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-
-
-class _ToolEnvelope(BaseModel):
-    """Structured tool-call envelope produced by the model."""
-
-    name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
 class PydanticAIProvider(LLMProvider):
@@ -183,8 +176,19 @@ class PydanticAIProvider(LLMProvider):
                 provider=OpenAIProvider(base_url=self.api_base, api_key=self.api_key),
             )
 
+        # Use native OpenRouterModel for OpenRouter (proper API routing).
+        if provider_name == "openrouter":
+            from pydantic_ai.models.openrouter import OpenRouterModel
+            from pydantic_ai.providers.openrouter import OpenRouterProvider
+
+            return OpenRouterModel(
+                model_id,
+                provider=OpenRouterProvider(api_key=self.api_key),
+            )
+
+        # For all other known providers, use the native string format
+        # that PydanticAI resolves automatically.
         provider_prefix = {
-            "openrouter": "openrouter",
             "openai": "openai",
             "anthropic": "anthropic",
             "deepseek": "deepseek",
@@ -210,6 +214,8 @@ class PydanticAIProvider(LLMProvider):
                 "overloaded",
                 "connection",
                 "temporarily unavailable",
+                "literal_error",
+                "finish_reason",
             ]
         )
 
@@ -232,7 +238,8 @@ class PydanticAIProvider(LLMProvider):
         raise RuntimeError(f"PydanticAI call failed: {last_error}")
 
     @staticmethod
-    def _to_prompt(messages: list[dict[str, Any]]) -> tuple[str | None, str]:
+    def _flatten_messages(messages: list[dict[str, Any]]) -> tuple[str | None, str]:
+        """Extract system prompt and flatten conversation messages into a user prompt string."""
         system_parts: list[str] = []
         convo_parts: list[str] = []
 
@@ -276,167 +283,72 @@ class PydanticAIProvider(LLMProvider):
         messages: list[dict[str, Any]],
         max_tokens: int | None,
         temperature: float,
+        message_history: list | None = None,
     ) -> str:
         from pydantic_ai import Agent
 
         model = self._build_model(selected_model)
-        system_prompt, prompt = self._to_prompt(messages)
+        system_prompt, prompt = self._flatten_messages(messages)
         agent = Agent(model, instructions=system_prompt or "")
         result = await self._run_with_retries(
             lambda: agent.run(
                 prompt,
+                message_history=message_history,
                 model_settings=self._model_settings(max_tokens=max_tokens, temperature=temperature),
             )
         )
         return self._extract_content(result.output)
 
-    async def _run_tool_selection(
+    async def run_structured(
         self,
         *,
-        selected_model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        max_tokens: int | None,
-        temperature: float,
-    ) -> _ToolEnvelope:
+        instructions: str,
+        user_message: str,
+        message_history: list | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> AgentResponse:
+        """Run the LLM with structured output, returning AgentResponse directly.
+
+        This is the primary interface for the orchestrator. It uses PydanticAI's
+        native structured output with ``output_type=AgentResponse`` and built-in
+        validation + retry/reflection.
+
+        Args:
+            instructions: System prompt (delivered via PydanticAI ``instructions``).
+            user_message: The user's message to respond to.
+            message_history: Optional PydanticAI ``ModelMessage`` list for conversation context.
+            model: Model identifier override.
+            max_tokens: Maximum response tokens.
+            temperature: Sampling temperature.
+
+        Returns:
+            AgentResponse with ``message`` and ``intent`` fields.
+        """
         from pydantic_ai import Agent
+        from pydantic_ai.usage import UsageLimits
 
-        model = self._build_model(selected_model)
-        system_prompt, prompt = self._to_prompt(messages)
+        selected = (model or self.default_model or "").strip()
+        if not selected:
+            raise RuntimeError("No model configured for run_structured.")
 
-        tool_lines: list[str] = []
-        names: list[str] = []
-        for t in tools:
-            fn = t.get("function", {})
-            name = str(fn.get("name") or "").strip()
-            if not name:
-                continue
-            names.append(name)
-            desc = str(fn.get("description") or "").strip()
-            params = fn.get("parameters")
-            tool_lines.append(f"- {name}: {desc}\n  parameters schema: {params}")
-
-        if not names:
-            raise RuntimeError("No tool definitions provided.")
-
-        instructions = (
-            (system_prompt + "\n\n" if system_prompt else "")
-            + "You must select exactly one tool and provide valid arguments.\n"
-            + "Return structured output with:\n"
-            + "- name: selected tool name\n"
-            + "- arguments: JSON object of arguments for that tool\n"
-            + f"Allowed tools:\n{chr(10).join(tool_lines)}"
+        built_model = self._build_model(selected)
+        agent = Agent(
+            built_model,
+            output_type=AgentResponse,
+            retries=2,
+            instructions=instructions,
         )
-
-        agent = Agent(model, instructions=instructions, output_type=_ToolEnvelope)
         result = await self._run_with_retries(
             lambda: agent.run(
-                prompt,
+                user_message,
+                message_history=message_history,
                 model_settings=self._model_settings(max_tokens=max_tokens, temperature=temperature),
+                usage_limits=UsageLimits(response_tokens_limit=max_tokens),
             )
         )
-        out = result.output
-        if out.name not in names:
-            raise RuntimeError(f"Model selected unknown tool '{out.name}', allowed={names}")
-        if not isinstance(out.arguments, dict):
-            raise RuntimeError("Model returned non-object tool arguments.")
-        return out
-
-    @staticmethod
-    def _tool_parameters_schema(
-        tools: list[dict[str, Any]],
-        tool_name: str,
-    ) -> dict[str, Any] | None:
-        for t in tools:
-            fn = t.get("function", {})
-            name = str(fn.get("name") or "").strip()
-            if name == tool_name:
-                params = fn.get("parameters")
-                if isinstance(params, dict):
-                    return params
-        return None
-
-    @classmethod
-    def _validate_tool_arguments(
-        cls,
-        value: Any,
-        schema: dict[str, Any] | None,
-        *,
-        path: str = "arguments",
-    ) -> list[str]:
-        if not isinstance(schema, dict):
-            return []
-
-        errors: list[str] = []
-        schema_type = schema.get("type")
-        if schema_type == "object":
-            if not isinstance(value, dict):
-                return [f"{path} must be an object"]
-            required = schema.get("required") or []
-            properties = schema.get("properties") or {}
-
-            for key in required:
-                if key not in value:
-                    errors.append(f"{path}.{key} is required")
-                    continue
-                v = value.get(key)
-                if isinstance(v, str) and not v.strip():
-                    errors.append(f"{path}.{key} must be non-empty")
-
-            if isinstance(properties, dict):
-                for key, prop_schema in properties.items():
-                    if key not in value:
-                        continue
-                    errors.extend(
-                        cls._validate_tool_arguments(
-                            value[key],
-                            prop_schema if isinstance(prop_schema, dict) else None,
-                            path=f"{path}.{key}",
-                        )
-                    )
-            return errors
-
-        if schema_type == "array":
-            if not isinstance(value, list):
-                return [f"{path} must be an array"]
-            item_schema = schema.get("items")
-            if isinstance(item_schema, dict):
-                for i, item in enumerate(value):
-                    errors.extend(
-                        cls._validate_tool_arguments(
-                            item,
-                            item_schema,
-                            path=f"{path}[{i}]",
-                        )
-                    )
-            return errors
-
-        if schema_type == "string":
-            if not isinstance(value, str):
-                return [f"{path} must be a string"]
-            if not value.strip():
-                return [f"{path} must be non-empty"]
-            enum = schema.get("enum")
-            if isinstance(enum, list) and value not in enum:
-                return [f"{path} must be one of {enum}"]
-            return []
-
-        if schema_type == "integer":
-            if not isinstance(value, int):
-                return [f"{path} must be an integer"]
-            return []
-
-        if schema_type == "number":
-            if not isinstance(value, (int, float)):
-                return [f"{path} must be a number"]
-            return []
-
-        if schema_type == "boolean":
-            if not isinstance(value, bool):
-                return [f"{path} must be a boolean"]
-            return []
-
-        return []
+        return result.output
 
     async def chat(
         self,
@@ -456,57 +368,41 @@ class PydanticAIProvider(LLMProvider):
 
         try:
             if tools:
-                env = await self._run_tool_selection(
-                    selected_model=selected,
-                    messages=messages,
-                    tools=tools,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
+                # Use PydanticAI structured output with AgentResponse instead of
+                # the old _ToolEnvelope workaround. PydanticAI handles validation
+                # and retry/reflection natively.
+                from pydantic_ai import Agent
+
+                built_model = self._build_model(selected)
+                system_prompt, prompt = self._flatten_messages(messages)
+                agent = Agent(
+                    built_model,
+                    output_type=AgentResponse,
+                    retries=2,
+                    instructions=system_prompt or "",
                 )
-
-                schema = self._tool_parameters_schema(tools, env.name)
-                validation_errors = self._validate_tool_arguments(env.arguments, schema)
-                if validation_errors:
-                    logger.warning(
-                        "PydanticAI produced invalid tool args for "
-                        f"'{env.name}': {validation_errors}"
+                result = await self._run_with_retries(
+                    lambda: agent.run(
+                        prompt,
+                        model_settings=self._model_settings(
+                            max_tokens=max_tokens, temperature=temperature
+                        ),
                     )
-                    # For orchestrator's core respond-tool, fall back to a plain
-                    # text generation and wrap it as a no-op respond intent.
-                    if env.name == "respond":
-                        fallback_text = (
-                            await self._run_text(
-                                selected_model=selected,
-                                messages=messages,
-                                max_tokens=max_tokens,
-                                temperature=temperature,
-                            )
-                        ).strip()
-                        if not fallback_text:
-                            fallback_text = (
-                                "Sorry, I had trouble generating a response just now. "
-                                "Please try again."
-                            )
-                        env = _ToolEnvelope(
-                            name="respond",
-                            arguments={
-                                "message": fallback_text,
-                                "intent": {"action": "none"},
-                            },
-                        )
-                    else:
-                        raise RuntimeError(
-                            f"Model returned invalid arguments for tool '{env.name}': "
-                            f"{'; '.join(validation_errors)}"
-                        )
+                )
+                agent_response: AgentResponse = result.output
 
+                # Convert AgentResponse back to LLMResponse with a ToolCallRequest
+                # for backward compatibility with the orchestrator.
                 return LLMResponse(
                     content=None,
                     tool_calls=[
                         ToolCallRequest(
                             id=f"call_{uuid.uuid4().hex[:10]}",
-                            name=env.name,
-                            arguments=env.arguments,
+                            name="respond",
+                            arguments={
+                                "message": agent_response.message,
+                                "intent": agent_response.intent.model_dump(),
+                            },
                         )
                     ],
                     finish_reason="tool_calls",

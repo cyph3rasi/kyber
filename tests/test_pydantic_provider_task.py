@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kyber.agent.intent import AgentResponse, Intent, IntentAction
 from kyber.providers.pydantic_provider import PydanticAIProvider
 
 
@@ -42,22 +44,21 @@ async def test_execute_task_routes_to_task_agent(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_chat_with_tools_returns_tool_call(monkeypatch) -> None:
+    """chat() with tools uses AgentResponse structured output and wraps it as a ToolCallRequest."""
     p = _provider()
 
-    async def _tool_selection(
-        *,
-        selected_model: str,
-        messages: list[dict],
-        tools: list[dict],
-        max_tokens: int | None,
-        temperature: float,
-    ):
-        _ = (selected_model, messages, tools, max_tokens, temperature)
-        from kyber.providers.pydantic_provider import _ToolEnvelope
+    # Mock _run_with_retries to return a fake AgentRunResult with AgentResponse output.
+    fake_response = AgentResponse(
+        message="hi",
+        intent=Intent(action=IntentAction.NONE),
+    )
+    fake_result = MagicMock()
+    fake_result.output = fake_response
 
-        return _ToolEnvelope(name="respond", arguments={"message": "hi", "intent": {"action": "none"}})
+    async def _fake_retries(call, *, retries=3):
+        return fake_result
 
-    monkeypatch.setattr(p, "_run_tool_selection", _tool_selection)
+    monkeypatch.setattr(p, "_run_with_retries", _fake_retries)
 
     response = await p.chat(
         messages=[{"role": "user", "content": "hello"}],
@@ -73,25 +74,13 @@ async def test_chat_with_tools_returns_tool_call(monkeypatch) -> None:
     assert response.has_tool_calls is True
     assert response.tool_calls[0].name == "respond"
     assert response.tool_calls[0].arguments.get("message") == "hi"
+    assert response.tool_calls[0].arguments.get("intent", {}).get("action") == "none"
 
 
 @pytest.mark.asyncio
-async def test_chat_with_invalid_respond_args_falls_back_to_text(monkeypatch) -> None:
+async def test_chat_without_tools_returns_text(monkeypatch) -> None:
+    """chat() without tools uses _run_text and returns plain text."""
     p = _provider()
-
-    async def _tool_selection(
-        *,
-        selected_model: str,
-        messages: list[dict],
-        tools: list[dict],
-        max_tokens: int | None,
-        temperature: float,
-    ):
-        _ = (selected_model, messages, tools, max_tokens, temperature)
-        from kyber.providers.pydantic_provider import _ToolEnvelope
-
-        # Missing required "message" field.
-        return _ToolEnvelope(name="respond", arguments={"intent": {"action": "none"}})
 
     async def _run_text(
         *,
@@ -99,35 +88,44 @@ async def test_chat_with_invalid_respond_args_falls_back_to_text(monkeypatch) ->
         messages: list[dict],
         max_tokens: int | None,
         temperature: float,
+        message_history=None,
     ) -> str:
-        _ = (selected_model, messages, max_tokens, temperature)
-        return "fallback response"
+        return "plain text response"
 
-    monkeypatch.setattr(p, "_run_tool_selection", _tool_selection)
     monkeypatch.setattr(p, "_run_text", _run_text)
+
+    response = await p.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        model="openai:gpt-5-mini",
+    )
+
+    assert response.has_tool_calls is False
+    assert response.content == "plain text response"
+    assert response.finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_chat_with_tools_error_returns_error_response(monkeypatch) -> None:
+    """chat() returns an error LLMResponse when the agent call fails."""
+    p = _provider()
+
+    async def _fake_retries(call, *, retries=3):
+        raise RuntimeError("model exploded")
+
+    monkeypatch.setattr(p, "_run_with_retries", _fake_retries)
 
     response = await p.chat(
         messages=[{"role": "user", "content": "hello"}],
         tools=[
             {
                 "type": "function",
-                "function": {
-                    "name": "respond",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "message": {"type": "string"},
-                            "intent": {"type": "object"},
-                        },
-                        "required": ["message", "intent"],
-                    },
-                },
+                "function": {"name": "respond", "parameters": {"type": "object"}},
             }
         ],
         model="openai:gpt-5-mini",
     )
 
-    assert response.has_tool_calls is True
-    assert response.tool_calls[0].name == "respond"
-    assert response.tool_calls[0].arguments.get("message") == "fallback response"
-    assert response.tool_calls[0].arguments.get("intent", {}).get("action") == "none"
+    assert response.has_tool_calls is False
+    assert "Error calling LLM" in (response.content or "")
+    assert response.finish_reason == "error"
