@@ -337,7 +337,7 @@ class PydanticAIProvider(LLMProvider):
         agent = Agent(
             built_model,
             output_type=AgentResponse,
-            retries=2,
+            retries=3,
             instructions=instructions,
         )
         result = await self._run_with_retries(
@@ -378,7 +378,7 @@ class PydanticAIProvider(LLMProvider):
                 agent = Agent(
                     built_model,
                     output_type=AgentResponse,
-                    retries=2,
+                    retries=3,
                     instructions=system_prompt or "",
                 )
                 result = await self._run_with_retries(
