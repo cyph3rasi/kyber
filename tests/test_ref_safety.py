@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kyber.agent.intent import AgentResponse, Intent, IntentAction
+from kyber.agent.intent import AgentResponse, IntentAction
 from kyber.agent.orchestrator import Orchestrator, _strip_fabricated_refs
 from kyber.bus.queue import MessageBus
 from kyber.providers.base import LLMProvider, LLMResponse
@@ -47,7 +47,7 @@ async def test_execute_intent_none_strips_refs(tmp_path: Path) -> None:
 
     resp = AgentResponse(
         message="sure.\n\nRef: ⚡e8c47a9d",
-        intent=Intent(action=IntentAction.NONE),
+        action=IntentAction.NONE,
     )
     out = await agent._execute_intent(resp, channel="discord", chat_id="123")
     assert "Ref:" not in out
@@ -71,12 +71,10 @@ async def test_execute_intent_spawn_task_strips_model_ref_and_injects_real_ref(t
 
     resp = AgentResponse(
         message="I'll investigate.\n\nRef: ⚡deadbeef",
-        intent=Intent(
-            action=IntentAction.SPAWN_TASK,
-            task_description="Investigate.",
-            task_label="Investigate",
-            complexity="simple",
-        ),
+        action=IntentAction.SPAWN_TASK,
+        task_description="Investigate.",
+        task_label="Investigate",
+        complexity="simple",
     )
     out = await agent._execute_intent(resp, channel="discord", chat_id="123")
 

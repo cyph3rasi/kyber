@@ -558,12 +558,10 @@ class Orchestrator:
 
         response = AgentResponse(
             message="Proceeding with the approved plan now. I’ll report back when it’s done.",
-            intent=Intent(
-                action=IntentAction.SPAWN_TASK,
-                task_description=approved_description,
-                task_label=task_label,
-                complexity="moderate",
-            ),
+            action=IntentAction.SPAWN_TASK,
+            task_description=approved_description,
+            task_label=task_label,
+            complexity="moderate",
         )
         final_message = await self._execute_intent(response, msg.channel, msg.chat_id, session=session)
 
@@ -738,8 +736,12 @@ class Orchestrator:
                 session, msg.content, system_state,
             )
             if not agent_response:
+                user_msg_preview = (msg.content or "")[:100]
                 logger.warning(
-                    "Native structured output failed, falling back to legacy path"
+                    f"Native structured output failed, falling back to legacy path | "
+                    f"model={self.model} | "
+                    f"sender={msg.sender_id} | "
+                    f"user_message_preview='{user_msg_preview}'"
                 )
 
         if not agent_response:
@@ -853,17 +855,15 @@ class Orchestrator:
             )
             forced = AgentResponse(
                 message="On it.",
-                intent=Intent(
-                    action=IntentAction.SPAWN_TASK,
-                    task_description=(
-                        "Follow through on this commitment and complete the work now.\n\n"
-                        f"User message:\n{msg.content or ''}\n\n"
-                        f"Assistant promise:\n{final_message}\n\n"
-                        "Execute the promised changes immediately and report concrete outcomes."
-                    ),
-                    task_label="Follow-through task",
-                    complexity="moderate",
+                action=IntentAction.SPAWN_TASK,
+                task_description=(
+                    "Follow through on this commitment and complete the work now.\n\n"
+                    f"User message:\n{msg.content or ''}\n\n"
+                    f"Assistant promise:\n{final_message}\n\n"
+                    "Execute the promised changes immediately and report concrete outcomes."
                 ),
+                task_label="Follow-through task",
+                complexity="moderate",
             )
             return await self._execute_intent(
                 forced,
@@ -1010,7 +1010,7 @@ class Orchestrator:
                     return parsed
                 return AgentResponse(
                     message=response.content,
-                    intent=Intent(action=IntentAction.NONE),
+                    action=IntentAction.NONE,
                 )
 
             logger.error(
@@ -1069,7 +1069,22 @@ class Orchestrator:
             return agent_response
 
         except Exception as e:
-            logger.error(f"Error getting native structured response: {e}")
+            # Enhanced logging for validation failures
+            error_msg = str(e)
+            user_msg_preview = (current_message or "")[:100]
+            logger.error(
+                f"Error getting native structured response: {error_msg} | "
+                f"model={self.model} | "
+                f"user_message_preview='{user_msg_preview}'"
+            )
+            # Log full details at debug level
+            logger.debug(
+                f"Native structured response failure details:\n"
+                f"  Model: {self.model}\n"
+                f"  Error: {error_msg}\n"
+                f"  User message: {current_message}\n"
+                f"  Exception type: {type(e).__name__}"
+            )
             return None
 
 

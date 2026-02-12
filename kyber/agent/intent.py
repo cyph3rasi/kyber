@@ -21,7 +21,11 @@ class IntentAction(str, Enum):
 
 
 class Intent(BaseModel):
-    """Structured intent extracted from LLM response."""
+    """Structured intent extracted from LLM response.
+
+    DEPRECATED: This class is kept for backward compatibility with legacy parsing.
+    New code should use the flattened AgentResponse fields directly.
+    """
     action: IntentAction = Field(
         default=IntentAction.NONE,
         description="What action the system should take"
@@ -50,14 +54,46 @@ class Intent(BaseModel):
 
 
 class AgentResponse(BaseModel):
-    """Structured response from the LLM."""
+    """Structured response from the LLM.
+
+    Flattened schema for better structured output reliability.
+    Intent fields are now direct properties instead of nested.
+    """
     message: str = Field(
         description="Natural language response to send to the user"
     )
-    intent: Intent = Field(
-        default_factory=Intent,
-        description="What the LLM wants the system to do"
+    # Intent fields (flattened from nested Intent object)
+    action: IntentAction = Field(
+        default=IntentAction.NONE,
+        description="Action: none, spawn_task, check_status, cancel_task"
     )
+    task_description: str | None = Field(
+        default=None,
+        description="For spawn_task: what the task should do"
+    )
+    task_label: str | None = Field(
+        default=None,
+        description="For spawn_task: short label"
+    )
+    task_ref: str | None = Field(
+        default=None,
+        description="For check_status/cancel_task: the reference"
+    )
+    complexity: str | None = Field(
+        default=None,
+        description="For spawn_task: simple, moderate, or complex"
+    )
+
+    @property
+    def intent(self) -> Intent:
+        """Backward compatibility property for legacy code accessing response.intent."""
+        return Intent(
+            action=self.action,
+            task_description=self.task_description,
+            task_label=self.task_label,
+            task_ref=self.task_ref,
+            complexity=self.complexity,
+        )
 
 
 # Tool definition for function calling
@@ -114,7 +150,10 @@ RESPOND_TOOL = {
 
 
 def parse_tool_call(tool_call: Any) -> AgentResponse:
-    """Parse a tool call response into AgentResponse."""
+    """Parse a tool call response into AgentResponse.
+
+    Handles both legacy nested format (with 'intent' object) and direct format.
+    """
     if hasattr(tool_call, 'arguments'):
         args = tool_call.arguments
         if isinstance(args, str):
@@ -129,6 +168,7 @@ def parse_tool_call(tool_call: Any) -> AgentResponse:
     if not isinstance(args, dict):
         args = {}
 
+    # Check if this is legacy nested format with 'intent' object
     intent_data = args.get("intent", {})
     if isinstance(intent_data, str):
         try:
@@ -138,7 +178,8 @@ def parse_tool_call(tool_call: Any) -> AgentResponse:
     if not isinstance(intent_data, dict):
         intent_data = {}
 
-    action_raw = intent_data.get("action", "none")
+    # Parse action (from intent object or direct field)
+    action_raw = intent_data.get("action", "none") if intent_data else args.get("action", "none")
     if isinstance(action_raw, str):
         action_raw = action_raw.strip().lower()
     try:
@@ -146,17 +187,27 @@ def parse_tool_call(tool_call: Any) -> AgentResponse:
     except Exception:
         action = IntentAction.NONE
 
-    intent = Intent(
-        action=action,
-        task_description=intent_data.get("task_description"),
-        task_label=intent_data.get("task_label"),
-        task_ref=intent_data.get("task_ref"),
-        complexity=intent_data.get("complexity"),
-    )
+    # Extract fields (prefer intent object if present, otherwise direct fields)
+    if intent_data:
+        # Legacy nested format
+        task_description = intent_data.get("task_description")
+        task_label = intent_data.get("task_label")
+        task_ref = intent_data.get("task_ref")
+        complexity = intent_data.get("complexity")
+    else:
+        # Direct flattened format
+        task_description = args.get("task_description")
+        task_label = args.get("task_label")
+        task_ref = args.get("task_ref")
+        complexity = args.get("complexity")
 
     return AgentResponse(
         message=args.get("message", ""),
-        intent=intent,
+        action=action,
+        task_description=task_description,
+        task_label=task_label,
+        task_ref=task_ref,
+        complexity=complexity,
     )
 
 
