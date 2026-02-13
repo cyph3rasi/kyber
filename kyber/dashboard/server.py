@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import platform
 import secrets
@@ -60,7 +61,8 @@ def _restart_gateway_service() -> tuple[bool, str]:
             subprocess.run(
                 ["systemctl", "--user", "restart", "kyber-gateway.service"],
                 capture_output=True, timeout=15, check=True,
-            )
+    )
+
         else:
             return False, f"Unsupported platform: {system}"
     except subprocess.CalledProcessError as e:
@@ -68,6 +70,37 @@ def _restart_gateway_service() -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
     return True, "Gateway service restarted"
+
+
+_CHATGPT_SUBSCRIPTION_LOGIN_LOCK = asyncio.Lock()
+_CHATGPT_SUBSCRIPTION_LOGIN_STATE = {
+    "task": None,
+    "last_error": None,
+    "auth_url": None,
+}
+
+
+def _is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        with Path("/proc/version").open(encoding="utf-8", errors="ignore") as fh:
+            return "microsoft" in fh.read().lower()
+    except Exception:
+        return False
+
+
+def _open_url_in_wsl(url: str) -> bool:
+    try:
+        subprocess.Popen(
+            ["cmd.exe", "/C", "start", "", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"WSL browser launch failed: {e}")
+        return False
 
 
 def _restart_dashboard_service() -> tuple[bool, str]:
@@ -186,6 +219,147 @@ async def fetch_provider_models(provider: str, api_key: str, api_base: str | Non
         base = api_base
 
     return await _fetch_models_openai_compat(base, api_key)
+
+
+def _chatgpt_subscription_models() -> list[str]:
+    """Return OpenHands-supported ChatGPT subscription models."""
+    try:
+        from openhands.sdk.llm.auth.openai import OPENAI_CODEX_MODELS
+        return sorted(str(m) for m in OPENAI_CODEX_MODELS)
+    except Exception:
+        # Safe fallback based on OpenHands docs.
+        return sorted(
+            [
+                "gpt-5.1-codex-max",
+                "gpt-5.1-codex-mini",
+                "gpt-5.2",
+                "gpt-5.2-codex",
+            ]
+        )
+
+
+async def _run_chatgpt_subscription_login_task(_model: str, force_login: bool) -> None:
+    """Run ChatGPT subscription login in a background task."""
+    error: str | None = None
+    try:
+        import openhands.sdk.llm.auth.openai as openai_auth
+        from openhands.sdk.llm.auth.openai import OpenAISubscriptionAuth
+
+        # First check for valid credentials when not forcing a fresh login.
+        if not force_login:
+            existing_auth = OpenAISubscriptionAuth()
+            existing_creds = await existing_auth.refresh_if_needed()
+            if existing_creds is not None and not existing_creds.is_expired():
+                logger.info("Using existing ChatGPT subscription credentials.")
+                error = None
+                async with _CHATGPT_SUBSCRIPTION_LOGIN_LOCK:
+                    _CHATGPT_SUBSCRIPTION_LOGIN_STATE["last_error"] = None
+                return
+
+        preferred_ports: list[int] = []
+        env_ports = os.getenv("OPENAI_SUBSCRIPTION_OAUTH_PORTS", "")
+        if env_ports.strip():
+            for raw in env_ports.split(","):
+                value = raw.strip()
+                try:
+                    preferred_ports.append(int(value))
+                except ValueError:
+                    logger.warning(
+                        "Ignoring invalid ChatGPT OAuth port value in OPENAI_SUBSCRIPTION_OAUTH_PORTS: "
+                        f"{value!r}"
+                    )
+        if not preferred_ports:
+            preferred_ports = list(range(1455, 1466))
+
+        last_port_error: str | None = None
+        wsl_env = _is_wsl()
+
+        for port in sorted(set(preferred_ports)):
+            auth = OpenAISubscriptionAuth(oauth_port=port)
+            if force_login:
+                auth.logout()
+
+            original_open = openai_auth.webbrowser.open
+            auth_url = None
+
+            def _open(url, *args, **kwargs):  # type: ignore[override]
+                nonlocal auth_url
+                auth_url = str(url)
+                _CHATGPT_SUBSCRIPTION_LOGIN_STATE["auth_url"] = auth_url
+                return _open_with_fallback(url, *args, **kwargs)
+
+            def _open_with_fallback(url, *args, **kwargs):
+                if wsl_env:
+                    return _open_url_in_wsl(url)
+                return bool(original_open(url, *args, **kwargs))
+
+            openai_auth.webbrowser.open = _open  # type: ignore[assignment]
+            try:
+                await auth.login(open_browser=True)
+                async with _CHATGPT_SUBSCRIPTION_LOGIN_LOCK:
+                    if auth_url:
+                        _CHATGPT_SUBSCRIPTION_LOGIN_STATE["auth_url"] = auth_url
+                error = None
+                async with _CHATGPT_SUBSCRIPTION_LOGIN_LOCK:
+                    _CHATGPT_SUBSCRIPTION_LOGIN_STATE["last_error"] = None
+                return
+            except RuntimeError as login_error:
+                message = str(login_error)
+                last_port_error = message
+                if "address already in use" in message.lower():
+                    logger.warning(
+                        f"ChatGPT OAuth callback port {port} is unavailable, trying next port."
+                    )
+                    continue
+                raise
+            finally:
+                openai_auth.webbrowser.open = original_open  # type: ignore[assignment]
+        error = (
+            "Unable to start ChatGPT OAuth callback server. "
+            f"{last_port_error or 'All candidate ports were unavailable.'}"
+        )
+    except Exception as e:
+        logger.warning(f"ChatGPT subscription login worker failed: {e}")
+        error = str(e)
+    async with _CHATGPT_SUBSCRIPTION_LOGIN_LOCK:
+        if error is not None:
+            _CHATGPT_SUBSCRIPTION_LOGIN_STATE["last_error"] = error
+        else:
+            _CHATGPT_SUBSCRIPTION_LOGIN_STATE["last_error"] = None
+        _CHATGPT_SUBSCRIPTION_LOGIN_STATE["task"] = None
+
+
+async def _get_chatgpt_subscription_login_state() -> dict[str, Any]:
+    async with _CHATGPT_SUBSCRIPTION_LOGIN_LOCK:
+        task = _CHATGPT_SUBSCRIPTION_LOGIN_STATE["task"]
+        if task is not None and task.done():
+            _CHATGPT_SUBSCRIPTION_LOGIN_STATE["task"] = None
+            task = None
+        return {
+            "in_progress": bool(task),
+            "error": _CHATGPT_SUBSCRIPTION_LOGIN_STATE["last_error"],
+            "authUrl": _CHATGPT_SUBSCRIPTION_LOGIN_STATE["auth_url"],
+        }
+
+
+async def _start_chatgpt_subscription_login_task(model: str, force_login: bool) -> bool:
+    """Start a login task if one is not already running.
+
+    Returns:
+        True if a new task started, False if login is already in progress.
+    """
+    async with _CHATGPT_SUBSCRIPTION_LOGIN_LOCK:
+        existing = _CHATGPT_SUBSCRIPTION_LOGIN_STATE["task"]
+        if existing is not None and not existing.done():
+            return False
+
+        _CHATGPT_SUBSCRIPTION_LOGIN_STATE["last_error"] = None
+        _CHATGPT_SUBSCRIPTION_LOGIN_STATE["auth_url"] = None
+        _CHATGPT_SUBSCRIPTION_LOGIN_STATE["task"] = asyncio.create_task(
+            _run_chatgpt_subscription_login_task(_model=model, force_login=force_login),
+            name="chatgpt-subscription-login",
+        )
+        return True
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -448,19 +622,128 @@ def create_dashboard_app(config: Config) -> FastAPI:
         status = 200 if ok else 502
         return JSONResponse({"ok": ok, "message": msg}, status_code=status)
 
+    @app.get("/api/providers/chatgpt-subscription/status", dependencies=[Depends(_require_token)])
+    @app.get("/api/providers/chatgpt_subscription/status", dependencies=[Depends(_require_token)])
+    async def chatgpt_subscription_status() -> JSONResponse:
+        """Return OAuth auth state for ChatGPT Plus/Pro subscription login."""
+        try:
+            from openhands.sdk.llm.auth.openai import OpenAISubscriptionAuth
+
+            auth = OpenAISubscriptionAuth()
+            creds = await auth.refresh_if_needed()
+            authenticated = bool(creds is not None and not creds.is_expired())
+            login_state = await _get_chatgpt_subscription_login_state()
+            return JSONResponse(
+                {
+                    "authenticated": authenticated,
+                    "models": _chatgpt_subscription_models(),
+                    "loginInProgress": login_state["in_progress"],
+                    "loginError": login_state["error"],
+                    "authUrl": login_state.get("authUrl"),
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to read ChatGPT subscription status: {e}")
+            return JSONResponse(
+                {
+                    "authenticated": False,
+                    "models": _chatgpt_subscription_models(),
+                    "loginInProgress": False,
+                    "loginError": str(e),
+                    "authUrl": None,
+                }
+            )
+
+    @app.post("/api/providers/chatgpt-subscription/login", dependencies=[Depends(_require_token)])
+    @app.post("/api/providers/chatgpt_subscription/login", dependencies=[Depends(_require_token)])
+    async def chatgpt_subscription_login(body: dict[str, Any] | None = None) -> JSONResponse:
+        """Run OpenHands OAuth login for ChatGPT Plus/Pro subscription access."""
+        body = body or {}
+        model = str(body.get("model", "") or "gpt-5.2-codex").strip()
+        force_login = bool(body.get("forceLogin", False))
+        allowed = set(_chatgpt_subscription_models())
+        if model not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported subscription model: {model}",
+            )
+
+        try:
+            started = await _start_chatgpt_subscription_login_task(
+                model=model, force_login=force_login
+            )
+            if not started:
+                login_state = await _get_chatgpt_subscription_login_state()
+                return JSONResponse(
+                    {
+                        "authenticated": False,
+                        "models": sorted(allowed),
+                        "loginInProgress": True,
+                        "loginError": login_state["error"],
+                        "authUrl": login_state.get("authUrl"),
+                        "message": "ChatGPT login is already in progress.",
+                    },
+                    status_code=409,
+                )
+
+            status = await _get_chatgpt_subscription_login_state()
+            return JSONResponse(
+                {
+                    "authenticated": False,
+                    "model": model,
+                    "models": sorted(allowed),
+                    "loginInProgress": status["in_progress"],
+                    "loginError": status["error"],
+                    "authUrl": status.get("authUrl"),
+                    "message": "ChatGPT login started. Complete authorization in your browser.",
+                },
+                status_code=202,
+            )
+        except Exception as e:
+            logger.warning(f"ChatGPT subscription login failed: {e}")
+            return JSONResponse(
+                {
+                    "authenticated": False,
+                    "error": str(e),
+                    "models": sorted(allowed),
+                    "loginInProgress": False,
+                    "loginError": str(e),
+                    "authUrl": None,
+                },
+                status_code=500,
+            )
+
+    @app.post("/api/providers/chatgpt-subscription/logout", dependencies=[Depends(_require_token)])
+    @app.post("/api/providers/chatgpt_subscription/logout", dependencies=[Depends(_require_token)])
+    async def chatgpt_subscription_logout() -> JSONResponse:
+        """Remove cached OAuth credentials for ChatGPT subscription login."""
+        try:
+            from openhands.sdk.llm.auth.openai import OpenAISubscriptionAuth
+
+            auth = OpenAISubscriptionAuth()
+            removed = bool(auth.logout())
+            return JSONResponse({"ok": True, "removed": removed})
+        except Exception as e:
+            logger.warning(f"Failed to clear ChatGPT subscription credentials: {e}")
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
     @app.get("/api/providers/{provider_name}/models", dependencies=[Depends(_require_token)])
     async def get_provider_models(
         provider_name: str,
-        api_key: str = Query(..., alias="apiKey"),
+        api_key: str | None = Query(None, alias="apiKey"),
         api_base: str | None = Query(None, alias="apiBase"),
     ) -> JSONResponse:
         """Fetch available models for a provider."""
         try:
+            if provider_name.strip().lower() in {"chatgpt-subscription", "chatgpt_subscription"}:
+                return JSONResponse({"models": _chatgpt_subscription_models()})
+            if not (api_key or "").strip():
+                raise ValueError("apiKey is required")
             # Normalize empty string to None
             if api_base is not None:
                 api_base = api_base.strip() or None
             logger.info(f"Fetching models for {provider_name}, api_base={api_base!r}")
-            models = await fetch_provider_models(provider_name, api_key, api_base)
+            models = await fetch_provider_models(provider_name, api_key or "", api_base)
             return JSONResponse({"models": models})
         except Exception as e:
             logger.warning(f"Failed to fetch models for {provider_name}: {e}")

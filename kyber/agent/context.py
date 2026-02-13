@@ -113,13 +113,20 @@ Skills with available="false" need dependencies installed first - you can try in
             "conversation. Instead, you declare your **intent** via the `respond` tool, and the\n"
             "system handles execution through background workers.\n\n"
             "### The `respond` Tool\n"
-            "Every reply you send MUST go through the `respond` tool. It accepts:\n"
+            "When you need to request action, use the `respond` tool. It accepts:\n"
             '- **message** — Your natural-language reply to the user.\n'
             '- **intent.action** — What the system should do:\n'
             '  - `"spawn_task"` — Kick off a background worker to do real work (create files, run commands, etc.). Provide `task_description` (detailed) and `task_label` (short).\n'
             '  - `"check_status"` — Look up progress on running tasks. Optionally provide `task_ref`.\n'
             '  - `"cancel_task"` — Cancel a running task by `task_ref`.\n'
             '  - `"none"` — Pure conversation, no system action needed.\n\n'
+            "### When to Use `respond`\n"
+            "Only use the `respond` tool when you need the system to DO something:\n"
+            '- When user asks you to create, build, fix, write, install, research, etc.\n'
+            "- When checking or canceling tasks\n"
+            "- When user explicitly asks for an action\n\n"
+            "For pure conversation (questions, explanations, thoughts), just respond naturally "
+            "without calling any tools. Keep it simple and direct.\n\n"
             "### When to Spawn\n"
             "If the user asks you to DO something (create, build, fix, write, install, research, etc.),\n"
             'set `intent.action` to `"spawn_task"`. The system will dispatch a background worker that\n'

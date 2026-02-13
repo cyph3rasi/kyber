@@ -2,7 +2,6 @@
 
 from kyber.agent.orchestrator import Orchestrator
 from kyber.agent.task_registry import TaskRegistry, Task, TaskStatus
-from kyber.agent.worker import Worker, WorkerPool
 from kyber.agent.voice import CharacterVoice
 from kyber.agent.intent import Intent, IntentAction, AgentResponse
 from kyber.agent.context import ContextBuilder
@@ -14,8 +13,6 @@ __all__ = [
     "TaskRegistry",
     "Task",
     "TaskStatus",
-    "Worker",
-    "WorkerPool",
     "CharacterVoice",
     "Intent",
     "IntentAction",

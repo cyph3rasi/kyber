@@ -43,14 +43,12 @@ class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.kyber/workspace"
     provider: str = "openrouter"  # Which provider to use (references a key in providers or custom name)
-    chat_provider: str = ""  # Provider for conversational replies (empty = use default provider)
-    task_provider: str = ""  # Provider for background workers/tasks (empty = use default provider)
     max_tokens: int = 8192
     temperature: float = 0.7
     timezone: str = ""  # User timezone (e.g. "America/New_York"). Empty = system local time.
-    # Background outbound messages (progress pings + completion notifications).
-    # If false, tasks still run, but users only see updates when they ask for status.
-    background_progress_updates: bool = True
+    # Deprecated: progress pings are intentionally disabled in opinionated mode.
+    # Tasks acknowledge start and chime when complete.
+    background_progress_updates: bool = False
 
 
 class AgentsConfig(BaseModel):
@@ -62,9 +60,7 @@ class ProviderConfig(BaseModel):
     """LLM provider configuration."""
     api_key: str = ""
     api_base: str | None = None
-    model: str = ""  # Selected model for this provider (legacy / fallback)
-    chat_model: str = ""  # Model used for conversational replies
-    task_model: str = ""  # Model used for background workers/tasks
+    model: str = ""  # Selected model for this provider
 
 
 class CustomProviderConfig(BaseModel):
@@ -72,9 +68,12 @@ class CustomProviderConfig(BaseModel):
     name: str = ""
     api_base: str = ""
     api_key: str = ""
-    model: str = ""  # Selected model for this provider (legacy / fallback)
-    chat_model: str = ""  # Model used for conversational replies
-    task_model: str = ""  # Model used for background workers/tasks
+    model: str = ""  # Selected model for this provider
+
+
+class ChatGPTSubscriptionProviderConfig(BaseModel):
+    """ChatGPT Plus/Pro subscription provider configuration."""
+    model: str = "gpt-5.2-codex"
 
 
 class ProvidersConfig(BaseModel):
@@ -85,11 +84,22 @@ class ProvidersConfig(BaseModel):
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+    chatgpt_subscription: ChatGPTSubscriptionProviderConfig = Field(
+        default_factory=ChatGPTSubscriptionProviderConfig
+    )
     custom: list[CustomProviderConfig] = Field(default_factory=list)
 
 
 # Built-in provider names (order matters for fallback detection)
-BUILTIN_PROVIDERS = ["openrouter", "deepseek", "anthropic", "openai", "gemini", "groq"]
+BUILTIN_PROVIDERS = [
+    "openrouter",
+    "deepseek",
+    "anthropic",
+    "openai",
+    "gemini",
+    "groq",
+    "chatgpt_subscription",
+]
 
 
 class GatewayConfig(BaseModel):
@@ -174,6 +184,8 @@ class Config(BaseSettings):
         """Get API key for the active provider."""
         preferred = self._preferred_provider()
         if preferred:
+            if preferred == "chatgpt_subscription":
+                return None
             # Check built-in providers first
             provider = getattr(self.providers, preferred, None)
             if provider and isinstance(provider, ProviderConfig):
@@ -186,7 +198,7 @@ class Config(BaseSettings):
         # Fallback: first built-in with a key
         for name in BUILTIN_PROVIDERS:
             prov = getattr(self.providers, name)
-            if prov.api_key:
+            if getattr(prov, "api_key", ""):
                 return prov.api_key
         return None
     
@@ -194,6 +206,8 @@ class Config(BaseSettings):
         """Get API base URL for the active provider."""
         preferred = self._preferred_provider()
         if preferred:
+            if preferred == "chatgpt_subscription":
+                return None
             # Check custom providers
             cp = self._find_custom_provider(preferred)
             if cp:
@@ -218,7 +232,7 @@ class Config(BaseSettings):
             return None
         for name in BUILTIN_PROVIDERS:
             prov = getattr(self.providers, name)
-            if prov.api_key:
+            if getattr(prov, "api_key", ""):
                 return name
         return None
 
@@ -226,6 +240,9 @@ class Config(BaseSettings):
         """Get the model from the active provider's config."""
         preferred = self._preferred_provider()
         if preferred:
+            if preferred == "chatgpt_subscription":
+                model = (self.providers.chatgpt_subscription.model or "").strip()
+                return model or "gpt-5.2-codex"
             # Check built-in
             provider = getattr(self.providers, preferred, None)
             if provider and isinstance(provider, ProviderConfig) and provider.model:
@@ -237,7 +254,7 @@ class Config(BaseSettings):
         # Fallback: first built-in with a key and model set
         for name in BUILTIN_PROVIDERS:
             prov = getattr(self.providers, name)
-            if prov.api_key and prov.model:
+            if getattr(prov, "api_key", "") and getattr(prov, "model", ""):
                 return prov.model
         return "openrouter/google/gemini-3-flash-preview"
 
@@ -248,109 +265,45 @@ class Config(BaseSettings):
             return False
         return self._find_custom_provider(preferred) is not None
 
-    # ── Role-based provider/model resolution ──
-
-    def _resolve_provider_details(self, provider_name: str) -> dict:
-        """Resolve api_key, api_base, is_custom, and provider_name for a given provider."""
-        name = provider_name.strip().lower()
-        if not name:
-            return {}
-        # Check custom providers
-        cp = self._find_custom_provider(name)
-        if cp:
-            return {
-                "provider_name": name,
-                "api_key": cp.api_key or None,
-                "api_base": cp.api_base or None,
-                "is_custom": True,
-            }
-        # Check built-in
-        prov = getattr(self.providers, name, None)
-        if prov and isinstance(prov, ProviderConfig):
-            api_base = prov.api_base
-            if name == "openrouter":
-                api_base = api_base or "https://openrouter.ai/api/v1"
-            return {
-                "provider_name": name,
-                "api_key": prov.api_key or None,
-                "api_base": api_base,
-                "is_custom": False,
-            }
-        return {}
-
-    def _get_model_for_role(self, provider_name: str, role: str) -> str:
-        """Get the model for a specific role (chat or task) from a provider.
-
-        Falls back: role-specific model → legacy ``model`` field → empty string.
-        """
-        name = provider_name.strip().lower()
-        if not name:
-            return ""
-        cp = self._find_custom_provider(name)
-        if cp:
-            if role == "chat":
-                return cp.chat_model or cp.model or ""
-            return cp.task_model or cp.model or ""
-        prov = getattr(self.providers, name, None)
-        if prov and isinstance(prov, ProviderConfig):
-            if role == "chat":
-                return prov.chat_model or prov.model or ""
-            return prov.task_model or prov.model or ""
-        return ""
-
-    def get_chat_provider_name(self) -> str | None:
-        """Return the provider name to use for chat (conversational) responses."""
-        explicit = (self.agents.defaults.chat_provider or "").strip().lower()
-        return explicit or self.get_provider_name()
-
-    def get_task_provider_name(self) -> str | None:
-        """Return the provider name to use for background tasks/workers."""
-        explicit = (self.agents.defaults.task_provider or "").strip().lower()
-        return explicit or self.get_provider_name()
-
-    def get_chat_model(self) -> str:
-        """Get the model to use for chat responses."""
-        prov = self.get_chat_provider_name()
-        if prov:
-            m = self._get_model_for_role(prov, "chat")
-            if m:
-                return m
-        return self.get_model()
-
-    def get_task_model(self) -> str:
-        """Get the model to use for background tasks/workers."""
-        prov = self.get_task_provider_name()
-        if prov:
-            m = self._get_model_for_role(prov, "task")
-            if m:
-                return m
-        return self.get_model()
-
-    def get_chat_provider_details(self) -> dict:
-        """Get full provider details (api_key, api_base, etc.) for chat."""
-        prov = self.get_chat_provider_name()
-        if prov:
-            details = self._resolve_provider_details(prov)
-            if details:
-                details["model"] = self.get_chat_model()
-                return details
-        # Fallback to default
-        return {
-            "provider_name": self.get_provider_name(),
-            "api_key": self.get_api_key(),
-            "api_base": self.get_api_base(),
-            "is_custom": self.is_custom_provider(),
-            "model": self.get_model(),
-        }
-
-    def get_task_provider_details(self) -> dict:
-        """Get full provider details (api_key, api_base, etc.) for tasks."""
-        prov = self.get_task_provider_name()
-        if prov:
-            details = self._resolve_provider_details(prov)
-            if details:
-                details["model"] = self.get_task_model()
-                return details
+    def get_provider_details(self) -> dict:
+        """Get full provider details (api_key, api_base, model, etc.) for the active provider."""
+        prov_name = self.get_provider_name()
+        if prov_name:
+            name = prov_name.strip().lower()
+            if name == "chatgpt_subscription":
+                return {
+                    # Runtime provider remains OpenAI; auth happens via OpenHands OAuth.
+                    "provider_name": "openai",
+                    "configured_provider_name": "chatgpt_subscription",
+                    "api_key": None,
+                    "api_base": None,
+                    "is_custom": False,
+                    "is_subscription": True,
+                    "model": self.get_model(),
+                }
+            # Check custom providers
+            cp = self._find_custom_provider(name)
+            if cp:
+                return {
+                    "provider_name": name,
+                    "api_key": cp.api_key or None,
+                    "api_base": cp.api_base or None,
+                    "is_custom": True,
+                    "model": cp.model or self.get_model(),
+                }
+            # Check built-in
+            prov = getattr(self.providers, name, None)
+            if prov and isinstance(prov, ProviderConfig):
+                api_base = prov.api_base
+                if name == "openrouter":
+                    api_base = api_base or "https://openrouter.ai/api/v1"
+                return {
+                    "provider_name": name,
+                    "api_key": prov.api_key or None,
+                    "api_base": api_base,
+                    "is_custom": False,
+                    "model": prov.model or self.get_model(),
+                }
         # Fallback to default
         return {
             "provider_name": self.get_provider_name(),

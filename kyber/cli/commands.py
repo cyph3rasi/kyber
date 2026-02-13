@@ -1,7 +1,10 @@
 """CLI commands for kyber."""
 
 import asyncio
+import errno
 import platform
+import socket
+from contextlib import suppress
 from pathlib import Path
 
 import typer
@@ -218,44 +221,25 @@ def _create_orchestrator(
     Shared by the ``gateway`` and ``agent`` commands so provider/model
     resolution lives in one place.
     """
-    from kyber.providers.pydantic_provider import PydanticAIProvider
+    from kyber.providers.openhands_provider import OpenHandsProvider
     from kyber.agent.orchestrator import Orchestrator
 
-    # ── Chat provider ──
-    chat_details = config.get_chat_provider_details()
-    chat_api_key = chat_details.get("api_key")
-    chat_api_base = chat_details.get("api_base")
-    chat_provider_name = chat_details.get("provider_name") or config.get_provider_name()
-    chat_model = config.get_chat_model()
-    if chat_details.get("is_custom", False) and not chat_api_key:
-        console.print(f"[red]Error: Custom chat provider '{chat_provider_name}' requires an API key.[/red]")
+    # ── Provider ──
+    details = config.get_provider_details()
+    api_key = details.get("api_key")
+    api_base = details.get("api_base")
+    provider_name = details.get("provider_name") or config.get_provider_name()
+    model = config.get_model()
+    if details.get("is_custom", False) and not api_key:
+        console.print(f"[red]Error: Custom provider '{provider_name}' requires an API key.[/red]")
         raise typer.Exit(1)
-    chat_provider = PydanticAIProvider(
-        api_key=chat_api_key,
-        api_base=chat_api_base,
-        default_model=chat_model,
-        provider_name=chat_provider_name,
-        is_custom=chat_details.get("is_custom", False),
-        workspace=config.workspace_path,
-        exec_timeout=config.tools.exec.timeout,
-        brave_api_key=config.tools.web.search.api_key or None,
-    )
-
-    # ── Task provider ──
-    task_details = config.get_task_provider_details()
-    task_provider_name = task_details.get("provider_name") or chat_provider_name
-    task_api_key = task_details.get("api_key")
-    task_api_base = task_details.get("api_base")
-    task_model = config.get_task_model()
-    if task_details.get("is_custom", False) and not task_api_key:
-        console.print(f"[red]Error: Custom task provider '{task_provider_name}' requires an API key.[/red]")
-        raise typer.Exit(1)
-    task_provider = PydanticAIProvider(
-        api_key=task_api_key,
-        api_base=task_api_base,
-        default_model=task_model,
-        provider_name=task_provider_name,
-        is_custom=task_details.get("is_custom", False),
+    provider = OpenHandsProvider(
+        api_key=api_key,
+        api_base=api_base,
+        default_model=model,
+        provider_name=provider_name,
+        is_custom=details.get("is_custom", False),
+        subscription_mode=details.get("is_subscription", False),
         workspace=config.workspace_path,
         exec_timeout=config.tools.exec.timeout,
         brave_api_key=config.tools.web.search.api_key or None,
@@ -271,15 +255,13 @@ def _create_orchestrator(
     # ── Orchestrator ──
     return Orchestrator(
         bus=bus,
-        provider=chat_provider,
+        provider=provider,
         workspace=workspace,
         persona_prompt=persona,
-        model=chat_model,
+        model=model,
         brave_api_key=config.tools.web.search.api_key or None,
         background_progress_updates=background_progress_updates,
         task_history_path=task_history_path,
-        task_provider=task_provider,
-        task_model=task_model,
         timezone=config.agents.defaults.timezone or None,
         exec_timeout=config.tools.exec.timeout,
     )
@@ -288,6 +270,83 @@ def _create_orchestrator(
 # ============================================================================
 # Gateway / Server
 # ============================================================================
+
+
+def _can_bind(host: str, port: int) -> tuple[bool, str]:
+    """Check whether host:port can be bound without consuming it."""
+    try:
+        addrs = socket.getaddrinfo(
+            host,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+            flags=socket.AI_PASSIVE,
+        )
+    except socket.gaierror:
+        return False, "invalid_host"
+
+    in_use = False
+    for family, socktype, proto, _, sockaddr in addrs:
+        with socket.socket(family, socktype, proto) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(sockaddr)
+                return True, "ok"
+            except OSError as exc:
+                if exc.errno == errno.EADDRINUSE:
+                    in_use = True
+                continue
+
+    if in_use:
+        return False, "in_use"
+    return False, "bind_failed"
+
+
+def _suppress_websocket_deprecation_noise() -> None:
+    """Suppress known deprecation noise from uvicorn websocket backends."""
+    import warnings
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r"websockets\.legacy is deprecated.*",
+        category=DeprecationWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"websockets\.server\.WebSocketServerProtocol is deprecated",
+        category=DeprecationWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"parameter 'timeout' of type 'float' is deprecated, please use 'timeout=ClientWSTimeout\(ws_close=\.\.\.\)'",
+        category=DeprecationWarning,
+    )
+
+
+def _select_uvicorn_ws_backend() -> str:
+    """Use wsproto when available; otherwise fall back to websockets."""
+    import importlib.util
+
+    return "wsproto" if importlib.util.find_spec("wsproto") is not None else "websockets"
+
+
+def _warn_if_openhands_runtime_unusable(console_obj=console) -> None:
+    """Best-effort OpenHands runtime preflight.
+
+    This must never terminate gateway startup; otherwise user services can
+    enter restart loops due to a pre-existing ownership mismatch in
+    ~/.openhands on WSL/VPS hosts.
+    """
+    from kyber.utils.openhands_runtime import ensure_openhands_runtime_dirs
+
+    try:
+        ensure_openhands_runtime_dirs()
+    except Exception as e:
+        console_obj.print(f"[yellow]⚠[/yellow] OpenHands runtime preflight failed: {e}")
+        console_obj.print(
+            "[yellow]Gateway will continue running, but OpenHands chat/tasks may fail until this is fixed.[/yellow]"
+        )
 
 
 @app.command()
@@ -305,6 +364,9 @@ def gateway(
     from kyber.heartbeat.service import HeartbeatService
     from kyber.gateway.api import create_gateway_app
     
+    _suppress_websocket_deprecation_noise()
+    ws_backend = _select_uvicorn_ws_backend()
+
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
@@ -326,6 +388,25 @@ def gateway(
         config.gateway.port = int(port)
         save_config(config)
 
+    bind_ok, bind_reason = _can_bind(config.gateway.host, port)
+    if not bind_ok:
+        if bind_reason == "in_use":
+            console.print(
+                f"[red]✗[/red] Could not start gateway API on "
+                f"{config.gateway.host}:{port} (address already in use)."
+            )
+        elif bind_reason == "invalid_host":
+            console.print(
+                f"[red]✗[/red] Could not start gateway API on "
+                f"{config.gateway.host}:{port} (invalid host)."
+            )
+        else:
+            console.print(
+                f"[red]✗[/red] Could not start gateway API on "
+                f"{config.gateway.host}:{port}."
+            )
+        raise typer.Exit(1)
+
     console.print(f"{__logo__} Starting kyber gateway on port {port}...")
 
     # Ensure dashboard auth token exists (used for gateway task API auth).
@@ -343,6 +424,9 @@ def gateway(
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "memory").mkdir(exist_ok=True)
     (workspace / "skills").mkdir(exist_ok=True)
+
+    # Best-effort preflight: never block startup (prevents service bootloops).
+    _warn_if_openhands_runtime_unusable()
     
     # Create components
     bus = MessageBus()
@@ -436,9 +520,14 @@ def gateway(
     
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
 
-    async def run():
+    async def run() -> int:
+        api_server = None
+        api_task: asyncio.Task | None = None
+        agent_task: asyncio.Task | None = None
+        channels_task: asyncio.Task | None = None
         try:
-            # Start local gateway API for dashboard task management.
+            # Start local gateway API for dashboard task management first.
+            # If bind fails, avoid starting channels/cron/heartbeat.
             import uvicorn
             api_app = create_gateway_app(agent, config.dashboard.auth_token)
             api_config = uvicorn.Config(
@@ -447,25 +536,64 @@ def gateway(
                 port=port,
                 log_level="warning",
                 access_log=False,
+                ws=ws_backend,
             )
             api_server = uvicorn.Server(api_config)
             api_task = asyncio.create_task(api_server.serve())
 
+            # Wait until the API either starts or fails.
+            while not api_server.started and not api_task.done():
+                await asyncio.sleep(0.05)
+            if api_task.done():
+                try:
+                    await api_task
+                except SystemExit:
+                    pass
+                console.print(
+                    f"[red]✗[/red] Could not start gateway API on "
+                    f"{config.gateway.host}:{port} (address already in use)."
+                )
+                return 1
+
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-                api_task,
-            )
+
+            agent_task = asyncio.create_task(agent.run())
+            channels_task = asyncio.create_task(channels.start_all())
+            await asyncio.gather(agent_task, channels_task, api_task)
+            return 0
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+            return 0
+        except SystemExit as exc:
+            code = int(exc.code) if isinstance(exc.code, int) else 1
+            if code != 0:
+                console.print(
+                    f"[red]✗[/red] Could not start gateway API on "
+                    f"{config.gateway.host}:{port} (address already in use)."
+                )
+            return code
+        finally:
             heartbeat.stop()
             cron.stop()
             agent.stop()
-            await channels.stop_all()
-    
-    asyncio.run(run())
+            if api_server is not None:
+                api_server.should_exit = True
+
+            with suppress(Exception):
+                await channels.stop_all()
+
+            for task in (agent_task, channels_task, api_task):
+                if task is None:
+                    continue
+                if not task.done():
+                    task.cancel()
+                with suppress(asyncio.CancelledError, SystemExit):
+                    await task
+
+    exit_code = asyncio.run(run())
+    if exit_code:
+        raise typer.Exit(exit_code)
 
 
 
@@ -525,7 +653,6 @@ def dashboard(
 ):
     """Start the kyber web dashboard."""
     import secrets
-    import uvicorn
 
     from kyber.config.loader import load_config, save_config
     from kyber.dashboard.server import create_dashboard_app
@@ -534,6 +661,10 @@ def dashboard(
 
     config = load_config()
     dash = config.dashboard
+
+    _suppress_websocket_deprecation_noise()
+    ws_backend = _select_uvicorn_ws_backend()
+    import uvicorn
 
     if host:
         dash.host = host
@@ -562,7 +693,14 @@ def dashboard(
         console.print(f"  Token: [dim]{masked}[/dim]  (run with --show-token to reveal)")
     console.print(f"  Open:  {url}")
     # Dashboard is chatty when polling; keep access logs off by default.
-    uvicorn.run(app, host=dash.host, port=dash.port, log_level="warning", access_log=False)
+    uvicorn.run(
+        app,
+        host=dash.host,
+        port=dash.port,
+        log_level="warning",
+        access_log=False,
+        ws=ws_backend,
+    )
 
 
 # ============================================================================
@@ -961,10 +1099,7 @@ def status():
 
     if config_path.exists():
         console.print(f"Provider: {config.get_provider_name() or 'not set'}")
-        chat_prov = config.get_chat_provider_name()
-        task_prov = config.get_task_provider_name()
-        console.print(f"Chat: {chat_prov or 'default'} / {config.get_chat_model()}")
-        console.print(f"Tasks: {task_prov or 'default'} / {config.get_task_model()}")
+        console.print(f"Model: {config.get_model()}")
         
         # Check API keys
         has_openrouter = bool(config.providers.openrouter.api_key)
@@ -1062,6 +1197,11 @@ def setup_skillscanner():
         console.print("[green]✓[/green] Package installed (skill-scanner may require a shell restart to appear in PATH)")
 
     console.print(f"\n{__logo__} Skill scanner is ready! The security scan will now include skill security checks.")
+
+
+# ============================================================================
+# OpenCode Setup
+# ============================================================================
 
 
 # ============================================================================

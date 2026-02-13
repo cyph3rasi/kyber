@@ -12,7 +12,7 @@ One install command, pick your provider, and you're chatting. No bloat, no confi
 
 - 💎 Set up in under a minute — one command installs, configures, and runs
 - Never locks up — concurrent message handling means the bot keeps responding, even during long tasks
-- Background subagents — kick off complex work without blocking the conversation, with live progress
+- Background subagents — kick off complex work without blocking the conversation
 - Works with the providers you already use (OpenRouter, Anthropic, OpenAI, Gemini, DeepSeek, Groq, or any OpenAI-compatible endpoint)
 - Split providers — use one model for chat and a different one for background tasks
 - Chat where you already are — Discord, Telegram, and WhatsApp out of the box
@@ -287,13 +287,12 @@ Kyber handles long-running tasks without blocking the conversation. Every incomi
 
 **Status tracking:**
 
-All background tasks are tracked with:
-- Current step number
-- Elapsed time
-- What tool is currently running
-- Recent completed actions
+Background execution is intentionally quiet:
+- You get a kickoff acknowledgment when the task starts
+- The chat stays free for normal conversation while work runs
+- You get a completion message when done (or a failure/cancel notice)
 
-Ask the bot "what's the status?" or "how's that task going?" and it will check the tracker and respond immediately.
+Ask the bot "what's the status?" or "how's that task going?" anytime for an on-demand check.
 
 ---
 

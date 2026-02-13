@@ -102,29 +102,29 @@ RESPOND_TOOL = {
     "function": {
         "name": "respond",
         "description": (
-            "Respond to the user and optionally request an action. "
-            "Use this for EVERY response. If you want to start a task, "
-            "set intent.action to 'spawn_task' and provide task_description. "
-            "If the user asks about status, set intent.action to 'check_status'."
+            "Request an action from the system. Only use this when you need the system to "
+            "DO something (spawn a task, check status, cancel a task). "
+            "For pure conversation (questions, explanations, thoughts), just respond naturally "
+            "without calling any tools."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "message": {
                     "type": "string",
-                    "description": "Your natural language response to the user"
+                    "description": "Your acknowledgmenent message to send before starting the action"
                 },
                 "intent": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["none", "spawn_task", "check_status", "cancel_task"],
+                            "enum": ["spawn_task", "check_status", "cancel_task"],
                             "description": (
                                 "What action to take. Use 'spawn_task' when the user wants "
                                 "you to DO something (create, build, fix, write, install, etc.). "
                                 "Use 'check_status' when they ask about progress or status. "
-                                "Use 'none' for pure conversation."
+                                "Use 'cancel_task' when they want to cancel something."
                             )
                         },
                         "task_description": {

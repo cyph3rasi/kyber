@@ -1,6 +1,9 @@
 """Session management for conversation history."""
 
 import json
+import os
+import tempfile
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -69,6 +72,8 @@ class SessionManager:
         self.workspace = workspace
         self.sessions_dir = ensure_dir(Path.home() / ".kyber" / "sessions")
         self._cache: dict[str, Session] = {}
+        self._write_locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
     
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -108,20 +113,41 @@ class SessionManager:
             messages = []
             metadata = {}
             created_at = None
+            malformed_lines = 0
             
             with open(path) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
-                    
-                    data = json.loads(line)
-                    
+
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        malformed_lines += 1
+                        continue
+
+                    if not isinstance(data, dict):
+                        malformed_lines += 1
+                        continue
+
                     if data.get("_type") == "metadata":
-                        metadata = data.get("metadata", {})
-                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
+                        metadata_raw = data.get("metadata", {})
+                        metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
+                        created_raw = data.get("created_at")
+                        if created_raw:
+                            try:
+                                created_at = datetime.fromisoformat(str(created_raw))
+                            except Exception:
+                                created_at = None
                     else:
                         messages.append(data)
+
+            if malformed_lines:
+                logger.warning(
+                    f"Session {key} contained {malformed_lines} malformed line(s); "
+                    "loaded remaining valid entries."
+                )
             
             return Session(
                 key=key,
@@ -139,7 +165,6 @@ class SessionManager:
         # Fire-and-forget: write to disk in a background thread so we don't
         # block the response path on file I/O.
         import asyncio
-        import concurrent.futures
         try:
             loop = asyncio.get_running_loop()
             loop.run_in_executor(None, self._write_session, session)
@@ -147,20 +172,55 @@ class SessionManager:
             # No running event loop (e.g. tests) — write synchronously.
             self._write_session(session)
 
+    def _get_write_lock(self, key: str) -> threading.Lock:
+        with self._locks_guard:
+            lock = self._write_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._write_locks[key] = lock
+            return lock
+
     def _write_session(self, session: Session) -> None:
         """Synchronous session write (called from executor)."""
         path = self._get_session_path(session.key)
+        lock = self._get_write_lock(session.key)
         try:
-            with open(path, "w") as f:
-                metadata_line = {
-                    "_type": "metadata",
-                    "created_at": session.created_at.isoformat(),
-                    "updated_at": session.updated_at.isoformat(),
-                    "metadata": session.metadata
-                }
-                f.write(json.dumps(metadata_line) + "\n")
-                for msg in session.messages:
-                    f.write(json.dumps(msg) + "\n")
+            with lock:
+                tmp_file = None
+                tmp_path: str | None = None
+                try:
+                    tmp_file = tempfile.NamedTemporaryFile(
+                        mode="w",
+                        dir=str(path.parent),
+                        prefix=f"{path.name}.",
+                        suffix=".tmp",
+                        delete=False,
+                        encoding="utf-8",
+                    )
+                    tmp_path = tmp_file.name
+
+                    metadata_line = {
+                        "_type": "metadata",
+                        "created_at": session.created_at.isoformat(),
+                        "updated_at": session.updated_at.isoformat(),
+                        "metadata": session.metadata,
+                    }
+                    tmp_file.write(json.dumps(metadata_line) + "\n")
+                    for msg in session.messages:
+                        tmp_file.write(json.dumps(msg) + "\n")
+                    tmp_file.flush()
+                    os.fsync(tmp_file.fileno())
+                    tmp_file.close()
+                    os.replace(tmp_path, path)
+                finally:
+                    if tmp_file is not None and not tmp_file.closed:
+                        tmp_file.close()
+                    if tmp_path:
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.unlink(tmp_path)
+                        except Exception:
+                            pass
         except Exception as e:
             logger.warning(f"Failed to save session {session.key}: {e}")
     

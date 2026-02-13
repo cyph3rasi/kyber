@@ -246,6 +246,55 @@ class TaskRegistry:
 
         return task
 
+    def find_active_duplicate(
+        self,
+        *,
+        label: str,
+        description: str,
+        origin_channel: str,
+        origin_chat_id: str,
+        similarity_threshold: float = 0.9,
+    ) -> Task | None:
+        """Find a currently active task with a very similar label+description."""
+
+        def _normalize(value: str) -> str:
+            import re
+            text = (value or "").lower().strip()
+            text = re.sub(r"\s+", " ", text)
+            return text[:3000]
+
+        def _similar(a: str, b: str) -> float:
+            from difflib import SequenceMatcher
+            if not a or not b:
+                return 0.0
+            return SequenceMatcher(None, a, b).ratio()
+
+        norm_label = _normalize(label)
+        norm_desc = _normalize(description)
+        if not norm_label:
+            norm_label = "task"
+
+        for task in self.get_active_tasks():
+            if task.origin_channel != origin_channel or task.origin_chat_id != origin_chat_id:
+                continue
+
+            task_label = _normalize(task.label)
+            if not task_label:
+                task_label = "task"
+
+            if _similar(norm_label, task_label) < 0.75:
+                continue
+
+            task_desc = _normalize(task.description)
+            if norm_desc and task_desc:
+                if _similar(norm_desc, task_desc) >= similarity_threshold:
+                    return task
+                if norm_desc in task_desc or task_desc in norm_desc:
+                    if len(norm_desc) > 40 or len(task_desc) > 40:
+                        return task
+
+        return None
+
     def get(self, task_id: str) -> Task | None:
         """Get a task by ID."""
         return self._tasks.get(task_id)

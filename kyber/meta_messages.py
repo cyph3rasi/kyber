@@ -132,36 +132,36 @@ def tool_action_hint(tool_name: str) -> str:
     """Friendly, non-technical hint for the LLM about what's next."""
     tool = (tool_name or "").strip()
     mapping: dict[str, str] = {
-        "read_file": "check the file",
-        "list_dir": "scan the folder",
-        "write_file": "write the update",
+        "read_file": "read the file",
+        "list_dir": "scan the directory",
+        "write_file": "write the file",
         "edit_file": "apply the edit",
-        "exec": "run a quick command",
-        "web_search": "look it up",
-        "web_fetch": "pull up that page",
-        "message": "send the message",
-        "spawn": "kick it off in the background",
-        "task_status": "check progress",
+        "exec": "run a command",
+        "web_search": "search the web",
+        "web_fetch": "fetch the page",
+        "message": "send a message",
+        "spawn": "kick it off",
+        "task_status": "check status",
     }
-    return mapping.get(tool, "keep going")
+    return mapping.get(tool, "continue")
 
 
 def build_tool_status_text(tool_name: str) -> str:
     """Deterministic status update template (safe fallback)."""
     tool = (tool_name or "").strip()
     mapping: dict[str, str] = {
-        "read_file": "On it, checking the relevant file next.",
-        "list_dir": "Taking a quick look through the folder next.",
-        "write_file": "Making that change now.",
-        "edit_file": "Applying the edit now.",
-        "exec": "Running a quick command to confirm things.",
-        "web_search": "Looking that up now.",
-        "web_fetch": "Pulling that page up now.",
-        "message": "Sending that over now.",
-        "spawn": "Kicking this off in the background now.",
-        "task_status": "Checking on progress now.",
+        "read_file": "checking the relevant file now.",
+        "list_dir": "looking through the folder now.",
+        "write_file": "writing the file changes now.",
+        "edit_file": "applying the edit to the file now.",
+        "exec": "running a command to confirm now.",
+        "web_search": "searching the web for you now.",
+        "web_fetch": "pulling up the page content now.",
+        "message": "sending the message for you now.",
+        "spawn": "kicking off the background work now.",
+        "task_status": "checking on the task progress now.",
     }
-    return mapping.get(tool, "On it, working on that now.")
+    return mapping.get(tool, "working on the task for you now.")
 
 
 def describe_tool_action(tool_name: str, tense: str = "present") -> str:

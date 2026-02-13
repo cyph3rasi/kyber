@@ -130,7 +130,7 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
                 "status": task.status.value,
                 "message": f"Task already {task.status.value}.",
             })
-        ok = agent.workers.cancel(task.id)
+        ok = agent._cancel_task(task.id)
         if ok:
             return JSONResponse({
                 "ok": True,
@@ -172,9 +172,6 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
             return JSONResponse({"ok": False, "detail": "No output to deliver"})
 
         # Keep this lightweight: deliver the stored in-character output verbatim.
-        # Add the lightning prefix for consistency with completion pings.
-        if not payload.startswith(("⚡️", "💎")):
-            payload = "💎 " + payload
 
         await agent.bus.publish_outbound(
             OutboundMessage(
@@ -230,7 +227,7 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
             origin_chat_id="dashboard",
             complexity="complex",
         )
-        agent.workers.spawn(task)
+        agent._spawn_task(task)
 
         return JSONResponse({
             "ok": True,

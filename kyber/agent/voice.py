@@ -5,7 +5,6 @@ No system messages, no robotic status dumps. Everything sounds
 like the character is talking naturally.
 """
 
-import json
 import random
 from typing import Any
 
@@ -13,20 +12,7 @@ from loguru import logger
 
 from kyber.meta_messages import looks_like_prompt_leak, looks_like_robotic_meta
 
-VOICE_SAY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "say",
-        "description": "Return the exact user-facing message to send.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "message": {"type": "string", "description": "The user-facing message."},
-            },
-            "required": ["message"],
-        },
-    },
-}
+
 
 
 class CharacterVoice:
@@ -127,9 +113,11 @@ class CharacterVoice:
     ) -> str:
         """Use LLM to generate in-character message.
 
-        NOTE: We use tool-calling (say(message=...)) for maximum compatibility
-        with providers that sometimes return empty `message.content` on text-only
-        turns (e.g., when they emit separate "reasoning_content").
+        Uses plain-text mode (no tool-calling) so the provider can route
+        directly through its text generation path.  Previous tool-calling
+        approach (``say(message=...)``) was incompatible with the PydanticAI
+        provider which converts tool calls into AgentResponse structured
+        output, yielding ``respond`` instead of ``say``.
         """
         system = f"""You are speaking as this character:
 
@@ -146,7 +134,7 @@ class CharacterVoice:
             system += f"\n- You MUST include these exact strings somewhere in your response: {must_include}"
         system += "\n- Never fabricate task references like 'Ref: ⚡...'. Only include references that already appear in the provided content."
 
-        system += "\n- You MUST respond by calling the `say` tool with the final user-facing message. Do not include any other text."
+        system += "\n- Respond ONLY with the final user-facing message. No preamble, no labels, no tool syntax."
 
         user_msg = f"Convey this naturally, in character:\n\n{content}\n\nContext: {context or 'general message'}"
 
@@ -155,91 +143,15 @@ class CharacterVoice:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_msg},
             ],
-            tools=[VOICE_SAY_TOOL],
-            tool_choice={"type": "function", "function": {"name": "say"}},
             model=getattr(self, "model", None),
         )
 
-        def _tool_name(tc: Any) -> str:
-            name = getattr(tc, "name", None)
-            if isinstance(name, str) and name.strip():
-                return name.strip()
-            fn = getattr(tc, "function", None)
-            if isinstance(fn, dict):
-                raw = fn.get("name")
-                return str(raw).strip() if raw is not None else ""
-            raw = getattr(fn, "name", None)
-            return str(raw).strip() if raw is not None else ""
-
-        def _tool_args(tc: Any) -> dict[str, Any]:
-            args = getattr(tc, "arguments", None)
-            if args is None:
-                fn = getattr(tc, "function", None)
-                if isinstance(fn, dict):
-                    args = fn.get("arguments")
-                else:
-                    args = getattr(fn, "arguments", None)
-            if isinstance(args, str):
-                try:
-                    decoded = json.loads(args)
-                    if isinstance(decoded, dict):
-                        return decoded
-                except Exception:
-                    return {"raw": args}
-                return {}
-            if isinstance(args, dict):
-                return args
-            return {}
-
-        def _extract_message(args: dict[str, Any]) -> str:
-            for key in ("message", "text", "content"):
-                val = args.get(key)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-            raw = args.get("raw")
-            if isinstance(raw, str) and raw.strip():
-                try:
-                    decoded = json.loads(raw)
-                    if isinstance(decoded, dict):
-                        return _extract_message(decoded)
-                except Exception:
-                    return raw.strip()
-            return ""
-
-        if getattr(response, "has_tool_calls", False):
-            # Preferred path: extract the message from the `say` tool call.
-            # Some providers return slightly different tool-call shapes, so we
-            # also accept any call carrying a usable message payload.
-            fallback_from_any_tool = ""
-            for tc in (getattr(response, "tool_calls", None) or []):
-                name = _tool_name(tc)
-                args = _tool_args(tc)
-                msg = _extract_message(args)
-                if name == "say" and msg:
-                    result = msg
-                    break
-                if msg and not fallback_from_any_tool:
-                    fallback_from_any_tool = msg
-            else:
-                result = fallback_from_any_tool
-                if not result:
-                    tool_names = [_tool_name(tc) for tc in (getattr(response, "tool_calls", None) or [])]
-                    logger.warning(
-                        "Voice generation returned tool calls but none usable "
-                        f"(count={len(tool_names)}, names={tool_names})."
-                    )
-                    result = ""
-            if not result:
-                # Fallback to plain text content even if finish_reason=tool_calls.
-                result = (response.content or "").strip()
-        else:
-            result = (response.content or "").strip()
+        result = (response.content or "").strip()
 
         if not result:
             logger.warning(
                 f"Voice generation returned empty content | "
-                f"finish_reason={getattr(response, 'finish_reason', None)!r} | "
-                f"tool_calls={len(getattr(response, 'tool_calls', []) or [])}"
+                f"finish_reason={getattr(response, 'finish_reason', None)!r}"
             )
 
         # Verify must_include strings are present — but only if we actually

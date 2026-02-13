@@ -1,6 +1,6 @@
 """LLM provider abstraction module."""
 
 from kyber.providers.base import LLMProvider, LLMResponse
-from kyber.providers.pydantic_provider import PydanticAIProvider
+from kyber.providers.openhands_provider import OpenHandsProvider
 
-__all__ = ["LLMProvider", "LLMResponse", "PydanticAIProvider"]
+__all__ = ["LLMProvider", "LLMResponse", "OpenHandsProvider"]

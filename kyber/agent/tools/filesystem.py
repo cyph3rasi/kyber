@@ -51,10 +51,9 @@ def _is_sensitive_read(path: str) -> bool:
 class ReadFileTool(Tool):
     """Tool to read file contents."""
 
-    # Max chars returned to the LLM. Large files bloat context and can end up
-    # dumped verbatim into user-facing messages. The LLM can still work with
-    # the truncated content for diagnosis/editing.
-    MAX_READ_CHARS = 8000
+    # Safety cap for accidental binary-file reads.  500 KB covers any
+    # reasonable source file; the agent should prefer grep for huge files.
+    MAX_READ_CHARS = 500_000
 
     @property
     def name(self) -> str:
@@ -62,7 +61,7 @@ class ReadFileTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Read the contents of a file at the given path. Large files are truncated."
+        return "Read the contents of a file at the given path."
 
     @property
     def parameters(self) -> dict[str, Any]:

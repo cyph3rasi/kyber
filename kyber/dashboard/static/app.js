@@ -79,6 +79,10 @@ const SECTIONS = {
     title: 'Dashboard',
     desc: 'Dashboard access, auth token, and allowed hosts.',
   },
+  arcade: {
+    title: 'Arcade',
+    desc: 'Take a break with some retro games.',
+  },
   json: {
     title: 'Raw JSON',
     desc: 'View and edit the full configuration as JSON.',
@@ -86,6 +90,16 @@ const SECTIONS = {
 };
 
 const BUILTIN_PROVIDERS = ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'gemini'];
+const SUBSCRIPTION_OPENAI_MODELS = [
+  'gpt-5.2',
+  'gpt-5.2-codex',
+  'gpt-5.1-codex-max',
+  'gpt-5.1-codex-mini',
+];
+const CHATGPT_SUB_PROVIDER_VALUE = 'chatgpt_subscription';
+const CHATGPT_SUB_PROVIDER_KEY = 'chatgptSubscription';
+const CHATGPT_SUBSCRIPTION_POLL_INTERVAL_MS = 1200;
+const CHATGPT_SUBSCRIPTION_POLL_MAX_ATTEMPTS = 40;
 
 // ── Helpers ──
 function showToast(msg, type = 'info') {
@@ -145,6 +159,10 @@ function markClean() {
   configSnapshot = JSON.stringify(config);
   saveBtn.disabled = true;
   saveBtn.classList.add('disabled');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ── API ──
@@ -276,6 +294,7 @@ function renderSection() {
   if (activeSection === 'skills') { renderSkills(); finishRender(); return; }
   if (activeSection === 'cron') { renderCron(); finishRender(); return; }
   if (activeSection === 'security') { renderSecurity(); finishRender(); return; }
+  if (activeSection === 'arcade') { renderArcade(); finishRender(); return; }
 
   const data = config[activeSection];
   if (!data || !isObj(data)) {
@@ -458,11 +477,9 @@ function renderArrayField(container, key, arr, path) {
 
 function renderProviderCard(name, provObj, configPath, opts = {}) {
   const apiKeyField = provObj.apiKey ?? provObj.api_key ?? '';
-  const chatModelField = provObj.chatModel ?? provObj.chat_model ?? '';
-  const taskModelField = provObj.taskModel ?? provObj.task_model ?? '';
-  const legacyModelField = provObj.model ?? '';
-  const hasKey = !!apiKeyField;
-  const card = makeCard(opts.displayName || humanize(name), hasKey);
+  const modelField = provObj.model ?? '';
+  const fetchName = (opts.fetchName || name || '').toLowerCase();
+  const card = makeCard(opts.displayName || humanize(name), !!apiKeyField);
 
   // Keep a direct reference to the base input (avoids querySelector issues)
   let baseInpRef = null;
@@ -509,34 +526,19 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
   keyRow.appendChild(keyWrap);
   card.body.appendChild(keyRow);
 
-  // Chat Model row
-  const chatModelRow = document.createElement('div');
-  chatModelRow.className = 'field-row';
-  const chatModelLabel = document.createElement('div');
-  chatModelLabel.className = 'field-label';
-  chatModelLabel.textContent = 'Chat Model';
-  chatModelRow.appendChild(chatModelLabel);
-  const chatModelWrap = document.createElement('div');
-  chatModelWrap.className = 'field-input';
-  chatModelRow.appendChild(chatModelWrap);
-  card.body.appendChild(chatModelRow);
+  // Model row
+  const modelRow = document.createElement('div');
+  modelRow.className = 'field-row';
+  const modelLabel = document.createElement('div');
+  modelLabel.className = 'field-label';
+  modelLabel.textContent = 'Model';
+  modelRow.appendChild(modelLabel);
+  const modelWrap = document.createElement('div');
+  modelWrap.className = 'field-input';
+  modelRow.appendChild(modelWrap);
+  card.body.appendChild(modelRow);
 
-  // Task Model row
-  const taskModelRow = document.createElement('div');
-  taskModelRow.className = 'field-row';
-  const taskModelLabel = document.createElement('div');
-  taskModelLabel.className = 'field-label';
-  taskModelLabel.textContent = 'Task Model';
-  taskModelRow.appendChild(taskModelLabel);
-  const taskModelWrap = document.createElement('div');
-  taskModelWrap.className = 'field-input';
-  taskModelRow.appendChild(taskModelWrap);
-  card.body.appendChild(taskModelRow);
-
-  // Determine the provider name to use for API calls
-  const fetchName = opts.fetchName || name;
-
-  function renderModelDropdown(wrap, currentModel, configKey, placeholderText) {
+  function renderModelDropdown(wrap, currentModel) {
     wrap.innerHTML = '';
     const currentKey = apiKeyInp.value.trim();
     const currentBase = baseInpRef ? baseInpRef.value.trim() : null;
@@ -568,7 +570,7 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
         const sel = document.createElement('select');
         const emptyOpt = document.createElement('option');
         emptyOpt.value = '';
-        emptyOpt.textContent = placeholderText;
+        emptyOpt.textContent = '— Select model —';
         sel.appendChild(emptyOpt);
 
         for (const m of models) {
@@ -588,7 +590,7 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
         }
 
         sel.addEventListener('change', () => {
-          setPath(config, [...configPath, configKey], sel.value);
+          setPath(config, [...configPath, 'model'], sel.value);
           markDirty();
         });
         wrap.appendChild(sel);
@@ -607,15 +609,15 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
         retry.addEventListener('click', () => {
           const ck = `${fetchName}:${currentKey}:${currentBase || ''}`;
           delete modelCache[ck];
-          renderModelDropdown(wrap, currentModel, configKey, placeholderText);
+          renderModelDropdown(wrap, currentModel);
         });
         wrap.appendChild(retry);
       });
   }
 
-  function renderModelAreas() {
-    renderModelDropdown(chatModelWrap, chatModelField || legacyModelField, 'chatModel', '— Select chat model —');
-    renderModelDropdown(taskModelWrap, taskModelField || legacyModelField, 'taskModel', '— Select task model —');
+  function renderModelArea() {
+    const current = getPath(config, [...configPath, 'model']) || '';
+    renderModelDropdown(modelWrap, current);
   }
 
   // Wire up API key changes
@@ -624,7 +626,7 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
     setPath(config, [...configPath, 'apiKey'], apiKeyInp.value);
     markDirty();
     clearTimeout(keyDebounce);
-    keyDebounce = setTimeout(renderModelAreas, 600);
+    keyDebounce = setTimeout(renderModelArea, 600);
   });
 
   // Wire up API base changes via direct ref
@@ -632,14 +634,314 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
     let baseDebounce = null;
     baseInpRef.addEventListener('input', () => {
       clearTimeout(baseDebounce);
-      baseDebounce = setTimeout(renderModelAreas, 600);
+      baseDebounce = setTimeout(renderModelArea, 600);
     });
   }
 
-  // Initial render of model areas
-  renderModelAreas();
+  // Initial render of model area
+  renderModelArea();
 
   return card;
+}
+
+async function fetchChatGPTSubscriptionStatus() {
+  for (const providerPath of ['chatgpt-subscription', 'chatgpt_subscription']) {
+    const res = await apiFetch(`${API}/providers/${providerPath}/status`);
+    if (res.status !== 404) return await res.json();
+  }
+  throw new Error('ChatGPT subscription status endpoint not found');
+}
+
+async function waitForChatGPTSubscriptionCompletion(maxAttempts = CHATGPT_SUBSCRIPTION_POLL_MAX_ATTEMPTS) {
+  for (let i = 0; i < maxAttempts; i++) {
+    await sleep(CHATGPT_SUBSCRIPTION_POLL_INTERVAL_MS);
+    const status = await fetchChatGPTSubscriptionStatus();
+    if (!status.loginInProgress) return status;
+  }
+  return fetchChatGPTSubscriptionStatus();
+}
+
+async function beginChatGPTSubscriptionLogin(model, forceLogin = false) {
+  for (const providerPath of ['chatgpt-subscription', 'chatgpt_subscription']) {
+    const res = await apiFetch(`${API}/providers/${providerPath}/login`, {
+      method: 'POST',
+      body: JSON.stringify({ model, forceLogin }),
+    });
+    if (res.status !== 404) return await res.json();
+  }
+  throw new Error('ChatGPT subscription login endpoint not found');
+}
+
+async function logoutChatGPTSubscription() {
+  for (const providerPath of ['chatgpt-subscription', 'chatgpt_subscription']) {
+    const res = await apiFetch(`${API}/providers/${providerPath}/logout`, {
+      method: 'POST',
+    });
+    if (res.status !== 404) return await res.json();
+  }
+  throw new Error('ChatGPT subscription logout endpoint not found');
+}
+
+function renderChatGPTSubscriptionCard(providersData) {
+  const cfg = providersData[CHATGPT_SUB_PROVIDER_KEY] || { model: SUBSCRIPTION_OPENAI_MODELS[1] };
+  const card = makeCard('ChatGPT Plus/Pro Plan', false);
+  let availableModels = [...SUBSCRIPTION_OPENAI_MODELS];
+  const statusBadge = card.el.querySelector('.card-badge');
+
+  const dynamicRow = document.createElement('div');
+  dynamicRow.className = 'field-row';
+  const dynamicLabel = document.createElement('div');
+  dynamicLabel.className = 'field-label';
+  const dynamicWrap = document.createElement('div');
+  dynamicWrap.className = 'field-input';
+  dynamicRow.appendChild(dynamicLabel);
+  dynamicRow.appendChild(dynamicWrap);
+  card.body.appendChild(dynamicRow);
+
+  const actionRow = document.createElement('div');
+  actionRow.className = 'field-row';
+  const actionLabel = document.createElement('div');
+  actionLabel.className = 'field-label';
+  actionLabel.textContent = 'Actions';
+  const actionWrap = document.createElement('div');
+  actionWrap.className = 'field-input';
+  actionRow.appendChild(actionLabel);
+  actionRow.appendChild(actionWrap);
+  card.body.appendChild(actionRow);
+
+  const getModel = () => (getPath(config, ['providers', CHATGPT_SUB_PROVIDER_KEY, 'model']) || '').trim();
+  if (!getModel()) {
+    setPath(config, ['providers', CHATGPT_SUB_PROVIDER_KEY, 'model'], availableModels[0] || 'gpt-5.2-codex');
+  }
+
+  const renderAuthedModelSelector = () => {
+    dynamicLabel.textContent = 'Model';
+    dynamicWrap.innerHTML = '';
+    const sel = document.createElement('select');
+    const emptyOpt = document.createElement('option');
+    emptyOpt.value = '';
+    emptyOpt.textContent = '— Select subscription model —';
+    sel.appendChild(emptyOpt);
+    const current = getModel();
+    for (const m of availableModels) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      if (m === current) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    if (current && !availableModels.includes(current)) {
+      const opt = document.createElement('option');
+      opt.value = current;
+      opt.textContent = current + ' (current)';
+      opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener('change', () => {
+      setPath(config, ['providers', CHATGPT_SUB_PROVIDER_KEY, 'model'], sel.value);
+      markDirty();
+    });
+    dynamicWrap.appendChild(sel);
+  };
+
+  const renderAuthButton = () => {
+    dynamicLabel.textContent = 'Authentication';
+    dynamicWrap.innerHTML = '';
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-primary';
+    btn.textContent = 'OAuth Authenticate';
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      const model = getModel() || availableModels[0] || 'gpt-5.2-codex';
+      try {
+        const out = await beginChatGPTSubscriptionLogin(model, false);
+        const inProgress = !!out?.loginInProgress;
+        if (out && (out.authenticated || inProgress)) {
+          if (out.authenticated) {
+            showToast('ChatGPT subscription authenticated', 'success');
+          } else {
+            showToast('ChatGPT OAuth flow started. Check browser to authorize.', 'success');
+          }
+          if (inProgress) {
+            const finalStatus = await waitForChatGPTSubscriptionCompletion();
+            if (finalStatus?.authenticated) {
+              showToast('ChatGPT subscription authenticated', 'success');
+            } else if (finalStatus?.loginError) {
+              showToast(finalStatus.loginError || 'Authentication did not complete', 'error');
+            } else if (finalStatus?.loginInProgress) {
+              showToast('OAuth authorization is still pending. Keep the tab open and finish in your browser.', 'error');
+            } else {
+              showToast('Authentication did not complete', 'error');
+            }
+            renderSection();
+            return;
+          }
+        } else {
+          showToast(out.error || 'Authentication did not complete', 'error');
+        }
+      } catch (e) {
+        showToast('Authentication failed: ' + (e.message || e), 'error');
+      } finally {
+        btn.disabled = false;
+        renderSection();
+      }
+    });
+    dynamicWrap.appendChild(btn);
+  };
+
+  const renderActions = (authenticated) => {
+    actionWrap.innerHTML = '';
+    if (!authenticated) return;
+    const relogin = document.createElement('button');
+    relogin.className = 'btn btn-ghost';
+    relogin.textContent = 'Re-authenticate';
+    relogin.addEventListener('click', async () => {
+    relogin.disabled = true;
+      try {
+        const out = await beginChatGPTSubscriptionLogin(
+          getModel() || availableModels[0] || 'gpt-5.2-codex',
+          true,
+        );
+        const inProgress = !!out?.loginInProgress;
+        if (out && (out.authenticated || inProgress)) {
+          if (out.authenticated) {
+            showToast('Re-authenticated', 'success');
+          } else {
+            showToast('Re-auth started. Complete in your browser.', 'success');
+          }
+          if (inProgress) {
+            const finalStatus = await waitForChatGPTSubscriptionCompletion();
+            if (finalStatus?.authenticated) {
+              showToast('Re-authenticated', 'success');
+            } else if (finalStatus?.loginError) {
+              showToast(finalStatus.loginError || 'Re-auth failed', 'error');
+            } else if (finalStatus?.loginInProgress) {
+              showToast('Re-auth is still pending in the browser.', 'error');
+            } else {
+              showToast('Re-auth did not complete', 'error');
+            }
+          }
+        } else {
+          showToast(out.error || 'Re-auth failed', 'error');
+        }
+      } catch (e) {
+        showToast('Re-auth failed: ' + (e.message || e), 'error');
+      } finally {
+        relogin.disabled = false;
+        renderSection();
+      }
+    });
+    actionWrap.appendChild(relogin);
+
+    const disconnect = document.createElement('button');
+    disconnect.className = 'btn btn-ghost';
+    disconnect.style.marginLeft = '8px';
+    disconnect.textContent = 'Disconnect';
+    disconnect.addEventListener('click', async () => {
+      disconnect.disabled = true;
+      try {
+        await logoutChatGPTSubscription();
+        showToast('Disconnected ChatGPT subscription', 'success');
+      } catch (e) {
+        showToast('Disconnect failed: ' + (e.message || e), 'error');
+      } finally {
+        disconnect.disabled = false;
+        renderSection();
+      }
+    });
+    actionWrap.appendChild(disconnect);
+  };
+
+  const renderAuthUrlHint = (authUrl) => {
+    if (!authUrl) return;
+    const authWrap = document.createElement('div');
+    authWrap.className = 'model-hint';
+    authWrap.style.marginTop = '6px';
+
+    const text = document.createElement('div');
+    text.textContent = 'Copy this URL into your browser if it did not open automatically:';
+    authWrap.appendChild(text);
+
+    const link = document.createElement('a');
+    link.href = authUrl;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = authUrl;
+    link.style.wordBreak = 'break-all';
+    authWrap.appendChild(link);
+
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'btn-add';
+    copyBtn.style.marginTop = '6px';
+    copyBtn.textContent = 'Copy URL';
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(authUrl);
+        showToast('Auth URL copied.', 'success');
+      } catch {
+        showToast('Copy failed. Select and copy the link manually.', 'error');
+      }
+    });
+    authWrap.appendChild(copyBtn);
+
+    dynamicWrap.appendChild(authWrap);
+  };
+
+  const renderInProgressAuthState = (authUrl) => {
+    dynamicLabel.textContent = 'Authentication';
+    dynamicWrap.innerHTML = '';
+    const inFlight = document.createElement('div');
+    inFlight.className = 'model-hint';
+    inFlight.textContent = 'OAuth authorization in progress. Finish in your browser, then return here.';
+    dynamicWrap.appendChild(inFlight);
+    renderAuthUrlHint(authUrl);
+    renderActions(false);
+  };
+
+  fetchChatGPTSubscriptionStatus()
+    .then((status) => {
+      if (Array.isArray(status.models) && status.models.length) {
+        availableModels = [...status.models];
+      }
+      const authenticated = !!status.authenticated;
+      const inProgress = !!status.loginInProgress;
+      if (inProgress) {
+        const loginErr = status.loginError;
+        if (statusBadge) {
+          statusBadge.textContent = 'Authorizing';
+          statusBadge.classList.remove('on');
+        }
+        if (loginErr) {
+          const err = document.createElement('div');
+          err.className = 'model-hint error-text';
+          err.textContent = loginErr;
+          actionWrap.innerHTML = '';
+          actionWrap.appendChild(err);
+        }
+      } else if (statusBadge) {
+        statusBadge.textContent = authenticated ? 'Enabled' : 'Disabled';
+        statusBadge.classList.toggle('on', authenticated);
+      }
+      if (inProgress) {
+        renderInProgressAuthState(status.authUrl);
+        return;
+      }
+      if (authenticated) renderAuthedModelSelector();
+      else renderAuthButton();
+      renderActions(authenticated);
+    })
+    .catch((e) => {
+      if (statusBadge) {
+        statusBadge.textContent = 'Disabled';
+        statusBadge.classList.remove('on');
+      }
+      renderAuthButton();
+      actionWrap.innerHTML = '';
+      const err = document.createElement('div');
+      err.className = 'model-hint error-text';
+      err.textContent = 'Auth status check failed: ' + (e.message || e);
+      actionWrap.appendChild(err);
+    });
 }
 
 // ── Section-specific renderers ──
@@ -651,6 +953,7 @@ function renderProviders(data) {
     const opts = {};
     renderProviderCard(name, prov, ['providers', name], opts);
   }
+  renderChatGPTSubscriptionCard(data);
 
   // Custom providers
   const customs = data.custom || [];
@@ -702,7 +1005,7 @@ function renderProviders(data) {
   addBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg> Add Custom Provider';
   addBtn.addEventListener('click', () => {
     if (!config.providers.custom) config.providers.custom = [];
-    config.providers.custom.push({ name: '', apiBase: '', apiKey: '', model: '', chatModel: '', taskModel: '' });
+    config.providers.custom.push({ name: '', apiBase: '', apiKey: '', model: '' });
     markDirty();
     renderSection();
   });
@@ -730,8 +1033,7 @@ function renderAgents(data) {
   const card = makeCard('Agent Defaults');
 
   const providers = config.providers || {};
-  const currentChatProvider = (defaults.chatProvider || defaults.chat_provider || '').toLowerCase();
-  const currentTaskProvider = (defaults.taskProvider || defaults.task_provider || '').toLowerCase();
+  const currentProvider = (defaults.provider || '').toLowerCase();
 
   // Helper: build a provider <select> element
   function buildProviderSelect(currentValue, configKey, label) {
@@ -755,16 +1057,24 @@ function renderAgents(data) {
     for (const name of BUILTIN_PROVIDERS) {
       const prov = providers[name];
       if (!prov) continue;
+      const model = (prov.model || '').trim();
       const hasKey = !!(prov.apiKey || prov.api_key);
       if (!hasKey) continue;
       const opt = document.createElement('option');
       opt.value = name;
-      const roleModel = configKey === 'chatProvider'
-        ? (prov.chatModel || prov.chat_model || prov.model || '')
-        : (prov.taskModel || prov.task_model || prov.model || '');
-      const modelInfo = roleModel ? ` (${roleModel})` : '';
+      const modelInfo = model ? ` (${model})` : '';
       opt.textContent = humanize(name) + modelInfo;
       if (selected === name) opt.selected = true;
+      sel.appendChild(opt);
+    }
+
+    const subProv = providers[CHATGPT_SUB_PROVIDER_KEY] || {};
+    const subModel = (subProv.model || '').trim();
+    if (subModel) {
+      const opt = document.createElement('option');
+      opt.value = CHATGPT_SUB_PROVIDER_VALUE;
+      opt.textContent = 'ChatGPT Plus/Pro Plan' + (subModel ? ` (${subModel})` : '');
+      if (selected === CHATGPT_SUB_PROVIDER_VALUE) opt.selected = true;
       sel.appendChild(opt);
     }
 
@@ -773,10 +1083,7 @@ function renderAgents(data) {
       if (!cp.name || !cp.apiKey) continue;
       const opt = document.createElement('option');
       opt.value = cp.name.toLowerCase();
-      const roleModel = configKey === 'chatProvider'
-        ? (cp.chatModel || cp.chat_model || cp.model || '')
-        : (cp.taskModel || cp.task_model || cp.model || '');
-      const modelInfo = roleModel ? ` (${roleModel})` : '';
+      const modelInfo = cp.model ? ` (${cp.model})` : '';
       opt.textContent = cp.name + modelInfo;
       if (selected === cp.name.toLowerCase()) opt.selected = true;
       sel.appendChild(opt);
@@ -800,11 +1107,8 @@ function renderAgents(data) {
     return row;
   }
 
-  // Chat Provider
-  card.body.appendChild(buildProviderSelect(currentChatProvider, 'chatProvider', 'Chat Provider'));
-
-  // Task Provider
-  card.body.appendChild(buildProviderSelect(currentTaskProvider, 'taskProvider', 'Task Provider'));
+  // Single Provider
+  card.body.appendChild(buildProviderSelect(currentProvider, 'provider', 'Provider'));
 
   // Render remaining agent defaults (excluding provider fields, model, and timezone)
   const otherFields = Object.fromEntries(
@@ -893,6 +1197,17 @@ function renderDashboard(data) {
     Object.entries(data).filter(([k]) => k !== 'enabled')
   );
   renderFields(card.body, filtered, ['dashboard']);
+}
+
+function renderArcade() {
+  const iframe = document.createElement('iframe');
+  iframe.src = '/static/arcade/index.html';
+  iframe.style.width = '100%';
+  iframe.style.height = 'calc(100vh - 140px)';
+  iframe.style.border = 'none';
+  iframe.style.borderRadius = '8px';
+  iframe.style.background = '#050505';
+  contentBody.appendChild(iframe);
 }
 
 function renderJSON() {

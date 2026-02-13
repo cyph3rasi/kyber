@@ -105,14 +105,6 @@ class DiscordChannel(BaseChannel):
         except ValueError:
             raise PermanentDeliveryError(f"Invalid Discord channel id: {msg.chat_id}")
 
-        # For direct responses: stop typing, we're done.
-        # For background updates (progress/completion): Discord will cancel
-        # the typing indicator when we send, so we need to re-trigger it
-        # if the main response is still being processed.
-        is_still_typing = channel_id in self._typing_tasks
-        if not msg.is_background:
-            self._stop_typing(channel_id)
-
         try:
             channel = self._client.get_channel(channel_id)
             if channel is None:
@@ -124,21 +116,27 @@ class DiscordChannel(BaseChannel):
             chunks = [chunk for chunk in self._split_message(msg.content) if chunk.strip()]
             if not chunks:
                 raise PermanentDeliveryError("Empty Discord message content")
-            for chunk in chunks:
-                await channel.send(chunk, allowed_mentions=allowed_mentions)
 
-            # Re-trigger typing if this was a background message and the
-            # main response is still being processed.
-            if msg.is_background and is_still_typing and channel_id in self._typing_tasks:
-                # The send above killed Discord's typing state. Poke the
-                # typing loop so it re-sends the indicator immediately.
-                task = self._typing_tasks.get(channel_id)
-                if task and not task.done():
-                    # Cancel and restart the typing loop so it fires now
-                    # instead of waiting for the next 7s tick.
-                    task.cancel()
-                    self._typing_tasks.pop(channel_id, None)
-                    self._start_typing(channel_id, channel, _restart=True)
+            is_background = bool(getattr(msg, "is_background", False))
+            should_stop_typing = False
+            if not is_background and self.config.typing_indicator:
+                # If there is an active inbound typing signal for this channel,
+                # this outbound response should end that cycle once it is sent.
+                if self._typing_counts.get(channel_id, 0) > 0:
+                    should_stop_typing = True
+                else:
+                    # Non-Discord callers can send without having started typing
+                    # yet. Start + stop here keeps UX consistent.
+                    self._start_typing(channel_id, channel)
+                    should_stop_typing = True
+
+            try:
+                for chunk in chunks:
+                    await channel.send(chunk, allowed_mentions=allowed_mentions)
+            finally:
+                if should_stop_typing:
+                    self._stop_typing(channel_id)
+
         except (PermanentDeliveryError, TemporaryDeliveryError):
             raise
         except Exception as e:
@@ -165,6 +163,9 @@ class DiscordChannel(BaseChannel):
         
         if not await self._should_process_message(message):
             return
+
+        if self.config.typing_indicator:
+            self._start_typing(message.channel.id, message.channel)
         
         sender_id = str(message.author.id)
         if message.author.name:
@@ -173,9 +174,6 @@ class DiscordChannel(BaseChannel):
         chat_id = str(message.channel.id)
         is_dm = message.guild is None
 
-        # Start typing indicator while we process the message
-        self._start_typing(message.channel.id, message.channel)
-        
         content_parts: list[str] = []
         media_paths: list[str] = []
         
@@ -250,13 +248,12 @@ class DiscordChannel(BaseChannel):
         # If not resolved, avoid extra fetches for safety
         return False
 
-    def _start_typing(self, channel_id: int, channel: "discord.abc.Messageable", _restart: bool = False) -> None:
+    def _start_typing(self, channel_id: int, channel: "discord.abc.Messageable") -> None:
         """Start typing indicator for a channel (ref-counted)."""
         if not self.config.typing_indicator:
             return
 
-        if not _restart:
-            self._typing_counts[channel_id] = self._typing_counts.get(channel_id, 0) + 1
+        self._typing_counts[channel_id] = self._typing_counts.get(channel_id, 0) + 1
         if channel_id in self._typing_tasks:
             return
 
@@ -270,6 +267,11 @@ class DiscordChannel(BaseChannel):
                 pass
             except Exception as e:
                 logger.debug(f"Typing indicator error: {e}")
+            finally:
+                task = self._typing_tasks.get(channel_id)
+                if task is asyncio.current_task():
+                    self._typing_tasks.pop(channel_id, None)
+                self._typing_counts.pop(channel_id, None)
 
         self._typing_tasks[channel_id] = asyncio.create_task(_typing_loop())
 
