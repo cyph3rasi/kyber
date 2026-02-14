@@ -176,7 +176,6 @@ _OPENHANDS_CONVERSATION_RUN_FAILURE_RE = re.compile(
     r"Conversation run failed for id=.*:\s*(?P<code>-?\d+)",
     re.IGNORECASE,
 )
-_OPENHANDS_RETRIABLE_EXIT_CODES = {29}
 
 
 def _looks_like_follow_up_tweak(text: str) -> bool:
@@ -711,7 +710,6 @@ class Orchestrator:
         persona_prompt: str,
         model: str | None = None,
         brave_api_key: str | None = None,
-        background_progress_updates: bool = True,
         task_history_path: Path | None = None,
         timezone: str | None = None,
         exec_timeout: int = 60,
@@ -721,10 +719,6 @@ class Orchestrator:
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.brave_api_key = brave_api_key
-        # Opinionated behavior: background tasks should stay quiet while they run,
-        # then chime once on completion.
-        _ = background_progress_updates
-        self.background_progress_updates = False
         self.timezone = timezone
         self.persona_prompt = persona_prompt
         self.exec_timeout = exec_timeout
@@ -1222,10 +1216,8 @@ class Orchestrator:
         # Start background tasks.
         # Completion notifications are always delivered (otherwise tasks feel "silent").
         completion_task: asyncio.Task | None = None
-        progress_task: asyncio.Task | None = None
         completion_task = asyncio.create_task(self._completion_loop())
-        if self.background_progress_updates:
-            progress_task = asyncio.create_task(self._progress_loop())
+        progress_task: asyncio.Task | None = None
 
         try:
             while self._running:
@@ -1954,8 +1946,7 @@ class Orchestrator:
 
     @staticmethod
     def _requires_fresh_openhands_conversation(error: Exception) -> bool:
-        code = Orchestrator._openhands_conversation_run_exit_code(error)
-        return code in _OPENHANDS_RETRIABLE_EXIT_CODES
+        return "conversation run failed" in str(error or "").lower()
 
     @staticmethod
     def _is_retryable_openhands_error(error: Exception) -> bool:

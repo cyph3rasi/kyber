@@ -106,7 +106,6 @@ def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
             {
                 "active": [_task_to_dict(t) for t in active],
                 "history": [_task_to_dict(t) for t in hist_filtered[::-1]],
-                "background_progress_updates": bool(agent.background_progress_updates),
             }
         )
 

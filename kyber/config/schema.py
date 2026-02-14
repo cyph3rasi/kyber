@@ -46,9 +46,6 @@ class AgentDefaults(BaseModel):
     max_tokens: int = 8192
     temperature: float = 0.7
     timezone: str = ""  # User timezone (e.g. "America/New_York"). Empty = system local time.
-    # Deprecated: progress pings are intentionally disabled in opinionated mode.
-    # Tasks acknowledge start and chime when complete.
-    background_progress_updates: bool = False
 
 
 class AgentsConfig(BaseModel):

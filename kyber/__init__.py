@@ -13,5 +13,5 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-__version__ = "2026.2.13.15"
+__version__ = "2026.2.13.20"
 __logo__ = "💎"

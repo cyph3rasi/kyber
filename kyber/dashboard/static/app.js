@@ -1113,7 +1113,15 @@ function renderAgents(data) {
   // Render remaining agent defaults (excluding provider fields, model, and timezone)
   const otherFields = Object.fromEntries(
     Object.entries(defaults).filter(([k]) =>
-      !['provider', 'chatProvider', 'chat_provider', 'taskProvider', 'task_provider', 'model', 'timezone'].includes(k)
+      ![
+        'provider',
+        'chatProvider',
+        'chat_provider',
+        'taskProvider',
+        'task_provider',
+        'model',
+        'timezone',
+      ].includes(k)
     )
   );
   renderFields(card.body, otherFields, ['agents', 'defaults']);
@@ -1288,7 +1296,7 @@ function renderTasks() {
 
   const hint = document.createElement('div');
   hint.className = 'tasks-hint';
-  hint.textContent = 'Tip: progress updates follow Agent Settings (single global switch).';
+  hint.textContent = 'Tip: Task activity and progress are shown in this section.';
   topRow.appendChild(hint);
 
   contentBody.appendChild(topRow);
@@ -1325,8 +1333,6 @@ function renderTasks() {
       const data = await fetchTasks();
       const active = data.active || [];
       const history = data.history || [];
-      const updatesEnabled = data.background_progress_updates !== false;
-      hint.textContent = `Tip: progress updates are ${updatesEnabled ? 'ON' : 'OFF'} in Agent Settings (global switch).`;
 
       // Active
       activeWrap.innerHTML = '';

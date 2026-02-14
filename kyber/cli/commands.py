@@ -212,8 +212,6 @@ This file stores important information that should persist across sessions.
 def _create_orchestrator(
     config,
     bus,
-    *,
-    background_progress_updates: bool = False,
     task_history_path: Path | None = None,
 ):
     """Create an Orchestrator with providers from config.
@@ -260,7 +258,6 @@ def _create_orchestrator(
         persona_prompt=persona,
         model=model,
         brave_api_key=config.tools.web.search.api_key or None,
-        background_progress_updates=background_progress_updates,
         task_history_path=task_history_path,
         timezone=config.agents.defaults.timezone or None,
         exec_timeout=config.tools.exec.timeout,
@@ -434,7 +431,6 @@ def gateway(
     agent = _create_orchestrator(
         config,
         bus,
-        background_progress_updates=getattr(config.agents.defaults, "background_progress_updates", True),
         task_history_path=get_data_dir() / "tasks" / "history.jsonl",
     )
     
