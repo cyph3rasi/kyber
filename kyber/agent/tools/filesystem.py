@@ -1,9 +1,10 @@
-"""File system tools: read, write, edit."""
+"""File system tools: read, write, edit, list."""
 
 from pathlib import Path
 from typing import Any
 
 from kyber.agent.tools.base import Tool
+from kyber.agent.tools.registry import registry
 
 # Files that workers must never overwrite or edit directly.
 # These are managed by kyber's own subsystems (cron, config, etc.).
@@ -50,6 +51,8 @@ def _is_sensitive_read(path: str) -> bool:
 
 class ReadFileTool(Tool):
     """Tool to read file contents."""
+
+    toolset = "file"
 
     # Safety cap for accidental binary-file reads.  500 KB covers any
     # reasonable source file; the agent should prefer grep for huge files.
@@ -102,6 +105,8 @@ class ReadFileTool(Tool):
 class WriteFileTool(Tool):
     """Tool to write content to a file."""
     
+    toolset = "file"
+    
     @property
     def name(self) -> str:
         return "write_file"
@@ -143,6 +148,8 @@ class WriteFileTool(Tool):
 
 class EditFileTool(Tool):
     """Tool to edit a file by replacing text."""
+    
+    toolset = "file"
     
     @property
     def name(self) -> str:
@@ -204,6 +211,8 @@ class EditFileTool(Tool):
 class ListDirTool(Tool):
     """Tool to list directory contents."""
     
+    toolset = "file"
+    
     @property
     def name(self) -> str:
         return "list_dir"
@@ -246,3 +255,10 @@ class ListDirTool(Tool):
             return f"Error: Permission denied: {path}"
         except Exception as e:
             return f"Error listing directory: {str(e)}"
+
+
+# ── Self-register on import ─────────────────────────────────────────
+registry.register(ReadFileTool())
+registry.register(WriteFileTool())
+registry.register(EditFileTool())
+registry.register(ListDirTool())

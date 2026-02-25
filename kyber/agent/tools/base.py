@@ -10,6 +10,16 @@ class Tool(ABC):
     
     Tools are capabilities that the agent can use to interact with
     the environment, such as reading files, executing commands, etc.
+    
+    Subclasses must define:
+        - name: Tool name used in function calls
+        - description: What the tool does
+        - parameters: JSON Schema for tool parameters
+        - toolset: Grouping category (e.g., "file", "terminal", "web")
+        - execute(**kwargs): Actual tool logic
+    
+    Optional overrides:
+        - is_available(): Return False to hide from agent when deps missing
     """
     
     _TYPE_MAP = {
@@ -38,6 +48,24 @@ class Tool(ABC):
     def parameters(self) -> dict[str, Any]:
         """JSON Schema for tool parameters."""
         pass
+    
+    @property
+    def toolset(self) -> str:
+        """Toolset/group this tool belongs to (e.g., 'file', 'terminal', 'web').
+        
+        Override in subclass to set a specific toolset.
+        Defaults to 'general'.
+        """
+        return "general"
+    
+    def is_available(self) -> bool:
+        """Check if this tool is available (dependencies met, API keys present, etc.).
+        
+        Override in subclass to gate on runtime conditions.
+        Tools that return False here won't appear in the agent's tool list.
+        Defaults to True.
+        """
+        return True
     
     @abstractmethod
     async def execute(self, **kwargs: Any) -> str:
@@ -100,3 +128,6 @@ class Tool(ABC):
                 "parameters": self.parameters,
             }
         }
+    
+    def __repr__(self) -> str:
+        return f"<Tool {self.name} [{self.toolset}]>"

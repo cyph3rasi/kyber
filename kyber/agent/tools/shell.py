@@ -7,10 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from kyber.agent.tools.base import Tool
+from kyber.agent.tools.registry import registry
 
 
 class ExecTool(Tool):
     """Tool to execute shell commands."""
+    
+    toolset = "terminal"
     
     def __init__(
         self,
@@ -151,8 +154,8 @@ class ExecTool(Tool):
 
             cwd_path = Path(cwd).resolve()
 
-            win_paths = re.findall(r"[A-Za-z]:\\[^\\\"']+", cmd)
-            posix_paths = re.findall(r"/[^\s\"']+", cmd)
+            win_paths = re.findall(r"[A-Za-z]:\\[^\\\"\\']+", cmd)
+            posix_paths = re.findall(r"/[^\s\"\\']+", cmd)
 
             for raw in win_paths + posix_paths:
                 try:
@@ -163,3 +166,7 @@ class ExecTool(Tool):
                     return "Error: Command blocked by safety guard (path outside working dir)"
 
         return None
+
+
+# ── Self-register on import ─────────────────────────────────────────
+registry.register(ExecTool())

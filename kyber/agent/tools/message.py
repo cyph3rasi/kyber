@@ -3,12 +3,15 @@
 from typing import Any, Callable, Awaitable
 
 from kyber.agent.tools.base import Tool
+from kyber.agent.tools.registry import registry
 from kyber.bus.events import OutboundMessage
 from kyber.utils.helpers import redact_secrets
 
 
 class MessageTool(Tool):
     """Tool to send messages to users on chat channels."""
+    
+    toolset = "messaging"
     
     def __init__(
         self, 
@@ -58,6 +61,10 @@ class MessageTool(Tool):
             "required": ["content"]
         }
     
+    def is_available(self) -> bool:
+        """Available when a send callback is configured."""
+        return self._send_callback is not None
+    
     async def execute(
         self, 
         content: str, 
@@ -85,3 +92,9 @@ class MessageTool(Tool):
             return f"Message sent to {channel}:{chat_id}"
         except Exception as e:
             return f"Error sending message: {str(e)}"
+
+
+# ── Self-register on import ─────────────────────────────────────────
+# Note: MessageTool starts unavailable (no send_callback).
+# The gateway sets up the callback when it starts, making it available.
+registry.register(MessageTool())

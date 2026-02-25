@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import httpx
 
 from kyber.agent.tools.base import Tool
+from kyber.agent.tools.registry import registry
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -46,6 +47,7 @@ def _validate_url(url: str) -> tuple[bool, str]:
 class WebSearchTool(Tool):
     """Search the web using Brave Search API."""
     
+    toolset = "web"
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
     parameters = {
@@ -60,6 +62,10 @@ class WebSearchTool(Tool):
     def __init__(self, api_key: str | None = None, max_results: int = 5):
         self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
         self.max_results = max_results
+    
+    def is_available(self) -> bool:
+        """Only available when BRAVE_API_KEY is set."""
+        return bool(self.api_key or os.environ.get("BRAVE_API_KEY", ""))
     
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         if not self.api_key:
@@ -93,6 +99,7 @@ class WebSearchTool(Tool):
 class WebFetchTool(Tool):
     """Fetch and extract content from a URL using Readability."""
     
+    toolset = "web"
     name = "web_fetch"
     description = "Fetch URL and extract readable content (HTML → markdown/text)."
     parameters = {
@@ -153,7 +160,7 @@ class WebFetchTool(Tool):
     def _to_markdown(self, html: str) -> str:
         """Convert HTML to markdown."""
         # Convert links, headings, lists before stripping tags
-        text = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
+        text = re.sub(r'<a\s+[^>]*href=["\']((?!#)[^"\']+)["\'][^>]*>([\s\S]*?)</a>',
                       lambda m: f'[{_strip_tags(m[2])}]({m[1]})', html, flags=re.I)
         text = re.sub(r'<h([1-6])[^>]*>([\s\S]*?)</h\1>',
                       lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n', text, flags=re.I)
@@ -161,3 +168,8 @@ class WebFetchTool(Tool):
         text = re.sub(r'</(p|div|section|article)>', '\n\n', text, flags=re.I)
         text = re.sub(r'<(br|hr)\s*/?>', '\n', text, flags=re.I)
         return _normalize(_strip_tags(text))
+
+
+# ── Self-register on import ─────────────────────────────────────────
+registry.register(WebSearchTool())
+registry.register(WebFetchTool())
