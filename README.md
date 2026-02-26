@@ -1,6 +1,6 @@
-<img src="kyber_logo.png" alt="Kyber Logo" width="80">
-
-# Kyber 💎
+<p align="center">
+  <img src="kyber_logo.png" alt="Kyber Logo" width="400">
+</p>
 
 **A personal AI assistant that actually works.**
 
@@ -20,29 +20,29 @@ That's it. The installer detects your OS, installs dependencies, walks you throu
 
 ## Why Kyber
 
-**Fast setup** — One command installs, configures, and runs
+⚡ **Fast setup** — One command installs, configures, and runs
 
-**Never locks up** — Concurrent message handling means the bot keeps responding, even during long tasks
+🚀 **Never locks up** — Concurrent message handling means the bot keeps responding, even during long tasks
 
-**Background tasks** — Kick off complex work without blocking the conversation
+🔄 **Background tasks** — Kick off complex work without blocking the conversation
 
-**Any provider** — OpenRouter, Anthropic, OpenAI, Gemini, DeepSeek, Groq, or any OpenAI-compatible endpoint
+🔌 **Any provider** — OpenRouter, Anthropic, OpenAI, Gemini, DeepSeek, Groq, or any OpenAI-compatible endpoint
 
-**Split providers** — Use one model for chat and a different one for background tasks
+🔀 **Split providers** — Use one model for chat and a different one for background tasks
 
-**Chat where you are** — Discord, Telegram, and WhatsApp out of the box
+💬 **Chat where you are** — Discord, Telegram, and WhatsApp out of the box
 
-**Built-in tools** — Web search, shell commands, GitHub, file I/O, and an extensible skills system
+🛠️ **Built-in tools** — Web search, shell commands, GitHub, file I/O, and an extensible skills system
 
-**Runs anywhere** — Laptop, VPS, Raspberry Pi. Optional system service keeps it always on
+🌍 **Runs anywhere** — Laptop, VPS, Raspberry Pi. Optional system service keeps it always on
 
-**Dashboard** — Secure local web UI for config, model selection, and monitoring
+📊 **Dashboard** — Secure local web UI for config, model selection, and monitoring
 
-**Scheduled tasks** — Cron jobs and heartbeat for proactive check-ins
+⏰ **Scheduled tasks** — Cron jobs and heartbeat for proactive check-ins
 
-**Security Center** — Environment audits, ClamAV malware scanning, Cisco AI Defense skill scanning, issue tracking, and scan history
+🔒 **Security Center** — Environment audits, ClamAV malware scanning, Cisco AI Defense skill scanning, issue tracking, and scan history
 
-**Secure by default** — API keys and tokens stored in a locked-down .env file, never in plaintext JSON
+🔐 **Secure by default** — API keys and tokens stored in a locked-down .env file, never in plaintext JSON
 
 ---
 
@@ -148,7 +148,7 @@ If Kyber helps you get things done faster, give us a star ⭐
 - 📖 **[Documentation](https://docs.kyber.chat)** — Full guides, reference, and tutorials
 - 🐙 **[GitHub](https://github.com/axedric/kyber)** — Source code, issues, and contributions
 - 💬 **[Discord](https://discord.gg/kyber)** — Community, support, and chat
-- 🐦 **[Twitter/X](https://twitter.com/kyberchat)** — Updates, tips, and examples
+- 🐦 **[Twitter/X](https://x.com/Kyber_chat)** — Updates, tips, and examples
 
 ---
 
