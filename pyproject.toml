@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kyber-chat"
+version = "2026.2.26.9"
+description = "A lightweight personal AI assistant framework"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    {name = "kyber contributors"}
+]
+keywords = ["ai", "agent", "chatbot"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "typer>=0.9.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "websockets>=12.0",
+    "websocket-client>=1.6.0",
+    "httpx>=0.25.0",
+    "loguru>=0.7.0",
+    "readability-lxml>=0.8.0",
+    "rich>=13.0.0",
+    "croniter>=2.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "python-telegram-bot>=21.0",
+    "discord.py>=2.4.0",
+    "cisco-ai-skill-scanner>=0.1.0",
+    "openhands-sdk>=1.11.4",
+    "openhands-tools>=1.11.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+kyber = "kyber.cli.commands:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kyber*"]
+
+[tool.setuptools.package-data]
+"kyber" = ["skills/**/*.md", "skills/**/*.sh", "dashboard/static/**"]
+
+
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["kyber"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/kyber",
+    "/tests",
+    "/LICENSE",
+    "/README.md",
+    "/pyproject.toml",
+]
