@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from kyber.agent.context import ContextBuilder
+from kyber.agent.task_registry import Task, TaskRegistry, TaskStatus
 from kyber.agent.tools.registry import registry
 from kyber.bus.events import InboundMessage, OutboundMessage
 from kyber.bus.queue import MessageBus
@@ -57,6 +58,7 @@ class AgentCore:
         max_history: int = 40,
         persona_prompt: str | None = None,
         timezone: str | None = None,
+        task_history_path: Path | None = None,
         progress_callback: Callable[[str, str, str], Awaitable[None]] | None = None,
     ):
         self.bus = bus
@@ -71,13 +73,16 @@ class AgentCore:
         # Core components
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = SessionManager(workspace)
+        self.registry = TaskRegistry(history_path=task_history_path)
         
         # Discover and register all tools
         registry.discover()
+        self._configure_tool_callbacks()
         
         # State
         self._running = False
         self._active_tasks: dict[str, asyncio.Task] = {}
+        self._background_tasks: dict[str, asyncio.Task] = {}
     
     # ── Public API ──────────────────────────────────────────────────
     
@@ -135,6 +140,16 @@ class AgentCore:
             content=content,
         )
         return await self._process_message(msg, session_key)
+
+    def _configure_tool_callbacks(self) -> None:
+        """Attach internal callback handlers to tools that rely on the agent runtime."""
+        msg_tool = registry.get("message")
+        if msg_tool and hasattr(msg_tool, "set_send_callback"):
+            msg_tool.set_send_callback(self._publish_tool_message)
+
+    async def _publish_tool_message(self, outbound: OutboundMessage) -> None:
+        """Publish outbound tool messages back through the message bus."""
+        await self.bus.publish_outbound(outbound)
     
     # ── Internal ────────────────────────────────────────────────────
     
@@ -194,6 +209,74 @@ class AgentCore:
         self.sessions.save(session)
         
         return response_text
+
+    def _spawn_task(
+        self,
+        task: Task,
+        conversation_context: str | None = None,
+        *,
+        session_key: str | None = None,
+        project_key: str | None = None,
+    ) -> None:
+        """Run a task asynchronously from the legacy task API."""
+        del conversation_context
+        del project_key
+
+        if not task:
+            return
+
+        run_key = session_key or f"task:{task.id}"
+
+        async def _runner() -> None:
+            self.registry.mark_started(task.id)
+            try:
+                result = await self.process_direct(
+                    task.description,
+                    session_key=run_key,
+                    channel=task.origin_channel,
+                    chat_id=task.origin_chat_id,
+                )
+            except asyncio.CancelledError:
+                self.registry.mark_cancelled(task.id, "Cancelled by user")
+                raise
+            except Exception as exc:  # pragma: no cover
+                logger.exception("Background task failed: %s", task.id)
+                self.registry.mark_failed(task.id, str(exc))
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=task.origin_channel,
+                    chat_id=task.origin_chat_id,
+                    content=f"{task.label} failed: {exc}",
+                    is_background=True,
+                ))
+                return
+
+            final_text = (result or "").strip() or "Done."
+            if task.status != TaskStatus.CANCELLED:
+                self.registry.mark_completed(task.id, final_text)
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=task.origin_channel,
+                    chat_id=task.origin_chat_id,
+                    content=final_text,
+                    is_background=True,
+                ))
+
+        bg_task = asyncio.create_task(_runner())
+
+        def _done(_: asyncio.Task) -> None:
+            self._background_tasks.pop(task.id, None)
+
+        bg_task.add_done_callback(_done)
+        self._background_tasks[task.id] = bg_task
+
+    def _cancel_task(self, task_id: str) -> bool:
+        """Cancel a background task by task id."""
+        running_task = self._background_tasks.get(task_id)
+        if not running_task:
+            return False
+
+        running_task.cancel()
+        self.registry.mark_cancelled(task_id, "Cancelled by user")
+        return True
     
     async def _run_loop(
         self,
@@ -246,7 +329,12 @@ class AgentCore:
                             pass
                     
                     # Execute the tool
-                    result = await self._execute_tool(tc, context_channel, context_chat_id)
+                    result = await self._execute_tool(
+                        tc,
+                        context_channel,
+                        context_chat_id,
+                        task_id=session.key,
+                    )
                     
                     # Add tool result to conversation
                     tool_msg = {
@@ -286,6 +374,7 @@ class AgentCore:
         tc: ToolCallRequest,
         channel: str = "",
         chat_id: str = "",
+        task_id: str = "",
     ) -> str:
         """Execute a single tool call and return the result string."""
         try:
@@ -294,7 +383,7 @@ class AgentCore:
             if msg_tool and hasattr(msg_tool, "set_context"):
                 msg_tool.set_context(channel, chat_id)
             
-            result = await registry.execute(tc.name, tc.arguments)
+            result = await registry.execute(tc.name, tc.arguments, task_id=task_id)
             
             # Truncate very long results
             if len(result) > 100_000:
