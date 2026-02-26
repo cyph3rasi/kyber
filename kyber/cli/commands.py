@@ -205,22 +205,22 @@ This file stores important information that should persist across sessions.
 
 
 # ============================================================================
-# Shared Orchestrator Factory
+# Shared Agent Factory (Hermes-style direct tool-calling)
 # ============================================================================
 
 
-def _create_orchestrator(
+def _create_agent(
     config,
     bus,
     task_history_path: Path | None = None,
 ):
-    """Create an Orchestrator with providers from config.
+    """Create an AgentCore with providers from config.
 
-    Shared by the ``gateway`` and ``agent`` commands so provider/model
-    resolution lives in one place.
+    Uses the new hermes-style direct tool-calling engine.
+    Shared by the ``gateway`` and ``agent`` commands.
     """
-    from kyber.providers.openhands_provider import OpenHandsProvider
-    from kyber.agent.orchestrator import Orchestrator
+    from kyber.providers.openai_provider import OpenAIProvider
+    from kyber.agent.core import AgentCore
 
     # ── Provider ──
     details = config.get_provider_details()
@@ -228,19 +228,23 @@ def _create_orchestrator(
     api_base = details.get("api_base")
     provider_name = details.get("provider_name") or config.get_provider_name()
     model = config.get_model()
+    
     if details.get("is_custom", False) and not api_key:
         console.print(f"[red]Error: Custom provider '{provider_name}' requires an API key.[/red]")
         raise typer.Exit(1)
-    provider = OpenHandsProvider(
+    
+    # Map provider name to OpenAIProvider's expected format
+    provider_type = "openrouter"  # default
+    if "openai" in provider_name.lower():
+        provider_type = "openai"
+    elif "anthropic" in provider_name.lower():
+        provider_type = "anthropic"
+    
+    provider = OpenAIProvider(
         api_key=api_key,
         api_base=api_base,
+        provider=provider_type,
         default_model=model,
-        provider_name=provider_name,
-        is_custom=details.get("is_custom", False),
-        subscription_mode=details.get("is_subscription", False),
-        workspace=config.workspace_path,
-        exec_timeout=config.tools.exec.timeout,
-        brave_api_key=config.tools.web.search.api_key or None,
     )
 
     # ── Persona ──
@@ -250,18 +254,20 @@ def _create_orchestrator(
     if soul_path.exists():
         persona = soul_path.read_text(encoding="utf-8")
 
-    # ── Orchestrator ──
-    return Orchestrator(
+    # ── AgentCore (hermes-style) ──
+    return AgentCore(
         bus=bus,
         provider=provider,
         workspace=workspace,
-        persona_prompt=persona,
+        persona_prompt=persona or None,
         model=model,
-        brave_api_key=config.tools.web.search.api_key or None,
         task_history_path=task_history_path,
         timezone=config.agents.defaults.timezone or None,
-        exec_timeout=config.tools.exec.timeout,
     )
+
+
+# Legacy alias for backwards compatibility
+_create_orchestrator = _create_agent
 
 
 # ============================================================================

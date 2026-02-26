@@ -34,3 +34,4 @@ workspace/memory/*.md
 !workspace/memory/MEMORY.md
 node_modules/
 bridge/node_modules/
+venv/
