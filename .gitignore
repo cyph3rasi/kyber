@@ -1,37 +1,15 @@
-.assets
-.env
-*.pyc
-dist/
-build/
-docs/
-*.egg-info/
-*.egg
-*.pyc
-*.pyo
-*.pyd
-*.pyw
-*.pyz
-*.pywz
-*.pyzz
-.venv/
-__pycache__/
-
-# IDE / editor
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
+# Files
+test
 .DS_Store
-Thumbs.db
 
-# Runtime / local
-*.log
-.kyber/
-workspace/memory/*.md
-!workspace/memory/MEMORY.md
-node_modules/
-bridge/node_modules/
-venv/
+# Binaries
+gum
+dist
+testdata
+
+# Folders
+completions/
+manpages/
+
+# nix
+result

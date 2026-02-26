@@ -1,9 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "kyber-chat"
-dynamic = ["version"]
+version = "2026.2.26.9"
 description = "A lightweight personal AI assistant framework"
+readme = "README.md"
 requires-python = ">=3.12"
-license = {text = "MIT"}
 authors = [
     {name = "kyber contributors"}
 ]
@@ -11,7 +15,6 @@ keywords = ["ai", "agent", "chatbot"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
@@ -46,38 +49,14 @@ dev = [
 [project.scripts]
 kyber = "kyber.cli.commands:app"
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kyber*"]
 
-[tool.hatch.version]
-path = "kyber/__init__.py"
+[tool.setuptools.package-data]
+"kyber" = ["skills/**/*.md", "skills/**/*.sh", "dashboard/static/**"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["kyber"]
 
-[tool.hatch.build.targets.wheel.sources]
-"kyber" = "kyber"
-
-# Include non-Python files in skills
-[tool.hatch.build]
-include = [
-    "kyber/**/*.py",
-    "kyber/skills/**/*.md",
-    "kyber/skills/**/*.sh",
-    "kyber/dashboard/static/**",
-]
-
-[tool.hatch.build.targets.sdist]
-include = [
-    "kyber/",
-    "bridge/",
-    "README.md",
-    "LICENSE",
-]
-
-[tool.hatch.build.targets.wheel.force-include]
-"bridge" = "kyber/bridge"
 
 [tool.ruff]
 line-length = 100
@@ -90,3 +69,15 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["kyber"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/kyber",
+    "/tests",
+    "/LICENSE",
+    "/README.md",
+    "/pyproject.toml",
+]
