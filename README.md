@@ -2,9 +2,9 @@
   <img src="kyber_logo.png" alt="Kyber Logo" width="400">
 </p>
 
-**A personal AI assistant that actually works.**
+**Your new favorite AI assistant.**
 
-Kyber is a lightweight AI bot you can set up in 60 seconds and talk to from Discord, Telegram, WhatsApp, or the command line. It doesn't get stuck. It doesn't take minutes to respond. It handles multiple conversations at once, runs tasks in the background, and stays out of your way.
+Set up in 60 seconds. Chat from Discord, Telegram, WhatsApp, the web dashboard or the command line. Kyber runs on anything, and is a delight to use.
 
 ---
 

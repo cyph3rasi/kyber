@@ -1,0 +1,264 @@
+"""File system tools: read, write, edit, list."""
+
+from pathlib import Path
+from typing import Any
+
+from kyber.agent.tools.base import Tool
+from kyber.agent.tools.registry import registry
+
+# Files that workers must never overwrite or edit directly.
+# These are managed by kyber's own subsystems (cron, config, etc.).
+_PROTECTED_PATTERNS = [
+    "cron/jobs.json",
+    ".kyber/cron/",
+    ".kyber/config",
+    ".kyber/settings",
+]
+
+# Files that workers must never read — they contain secrets that could
+# leak into LLM context and end up in user-facing messages.
+_SENSITIVE_READ_PATTERNS = [
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.secret",
+    "credentials",
+    "id_rsa",
+    "id_ed25519",
+    ".pem",
+    ".key",
+]
+
+
+def _is_protected(path: str) -> bool:
+    """Check if a path matches a protected pattern."""
+    normalized = str(Path(path).expanduser().resolve())
+    for pattern in _PROTECTED_PATTERNS:
+        if pattern in normalized:
+            return True
+    return False
+
+
+def _is_sensitive_read(path: str) -> bool:
+    """Check if a file is too sensitive to read (contains secrets)."""
+    name = Path(path).name.lower()
+    normalized = str(Path(path).expanduser().resolve()).lower()
+    for pattern in _SENSITIVE_READ_PATTERNS:
+        if name == pattern or name.endswith(pattern) or pattern in normalized:
+            return True
+    return False
+
+
+class ReadFileTool(Tool):
+    """Tool to read file contents."""
+
+    toolset = "file"
+
+    # Safety cap for accidental binary-file reads.  500 KB covers any
+    # reasonable source file; the agent should prefer grep for huge files.
+    MAX_READ_CHARS = 500_000
+
+    @property
+    def name(self) -> str:
+        return "read_file"
+
+    @property
+    def description(self) -> str:
+        return "Read the contents of a file at the given path."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to read"
+                }
+            },
+            "required": ["path"]
+        }
+
+    async def execute(self, path: str, **kwargs: Any) -> str:
+        try:
+            if _is_sensitive_read(path):
+                return f"Error: {path} is a sensitive file (likely contains secrets). Reading blocked for security."
+            file_path = Path(path).expanduser()
+            if not file_path.exists():
+                return f"Error: File not found: {path}"
+            if not file_path.is_file():
+                return f"Error: Not a file: {path}"
+
+            content = file_path.read_text(encoding="utf-8")
+            if len(content) > self.MAX_READ_CHARS:
+                content = (
+                    content[:self.MAX_READ_CHARS]
+                    + f"\n\n... (truncated — file is {len(content)} chars, showing first {self.MAX_READ_CHARS})"
+                )
+            return content
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
+        except Exception as e:
+            return f"Error reading file: {str(e)}"
+
+
+class WriteFileTool(Tool):
+    """Tool to write content to a file."""
+    
+    toolset = "file"
+    
+    @property
+    def name(self) -> str:
+        return "write_file"
+    
+    @property
+    def description(self) -> str:
+        return "Write content to a file at the given path. Creates parent directories if needed."
+    
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to write to"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content to write"
+                }
+            },
+            "required": ["path", "content"]
+        }
+    
+    async def execute(self, path: str, content: str, **kwargs: Any) -> str:
+        try:
+            if _is_protected(path):
+                return f"Error: {path} is a protected system file. Use the appropriate CLI command instead (e.g., `kyber cron add`)."
+            file_path = Path(path).expanduser()
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content, encoding="utf-8")
+            return f"Successfully wrote {len(content)} bytes to {path}"
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
+        except Exception as e:
+            return f"Error writing file: {str(e)}"
+
+
+class EditFileTool(Tool):
+    """Tool to edit a file by replacing text."""
+    
+    toolset = "file"
+    
+    @property
+    def name(self) -> str:
+        return "edit_file"
+    
+    @property
+    def description(self) -> str:
+        return "Edit a file by replacing old_text with new_text. The old_text must exist exactly in the file."
+    
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to edit"
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "The exact text to find and replace"
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "The text to replace with"
+                }
+            },
+            "required": ["path", "old_text", "new_text"]
+        }
+    
+    async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
+        try:
+            if _is_protected(path):
+                return f"Error: {path} is a protected system file. Use the appropriate CLI command instead (e.g., `kyber cron add`)."
+            file_path = Path(path).expanduser()
+            if not file_path.exists():
+                return f"Error: File not found: {path}"
+            
+            content = file_path.read_text(encoding="utf-8")
+            
+            if old_text not in content:
+                return f"Error: old_text not found in file. Make sure it matches exactly."
+            
+            # Count occurrences
+            count = content.count(old_text)
+            if count > 1:
+                return f"Warning: old_text appears {count} times. Please provide more context to make it unique."
+            
+            new_content = content.replace(old_text, new_text, 1)
+            file_path.write_text(new_content, encoding="utf-8")
+            
+            return f"Successfully edited {path}"
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
+        except Exception as e:
+            return f"Error editing file: {str(e)}"
+
+
+class ListDirTool(Tool):
+    """Tool to list directory contents."""
+    
+    toolset = "file"
+    
+    @property
+    def name(self) -> str:
+        return "list_dir"
+    
+    @property
+    def description(self) -> str:
+        return "List the contents of a directory."
+    
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The directory path to list"
+                }
+            },
+            "required": ["path"]
+        }
+    
+    async def execute(self, path: str, **kwargs: Any) -> str:
+        try:
+            dir_path = Path(path).expanduser()
+            if not dir_path.exists():
+                return f"Error: Directory not found: {path}"
+            if not dir_path.is_dir():
+                return f"Error: Not a directory: {path}"
+            
+            items = []
+            for item in sorted(dir_path.iterdir()):
+                prefix = "📁 " if item.is_dir() else "📄 "
+                items.append(f"{prefix}{item.name}")
+            
+            if not items:
+                return f"Directory {path} is empty"
+            
+            return "\n".join(items)
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
+        except Exception as e:
+            return f"Error listing directory: {str(e)}"
+
+
+# ── Self-register on import ─────────────────────────────────────────
+registry.register(ReadFileTool())
+registry.register(WriteFileTool())
+registry.register(EditFileTool())
+registry.register(ListDirTool())

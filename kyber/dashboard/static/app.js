@@ -7,6 +7,20 @@ const CRON_AUTOREFRESH_KEY = 'kyber_cron_autorefresh';
 const SECURITY_AUTOREFRESH_KEY = 'kyber_security_autorefresh';
 const LAST_SECTION_KEY = 'kyber_dashboard_last_section';
 const SCROLL_KEY_PREFIX = 'kyber_dashboard_scroll:';
+const CHAT_STATE_KEY = 'kyber_dashboard_chat_state_v1';
+const CHAT_MAX_MESSAGES = 120;
+const RAW_JSON_SECRET_PATHS = [
+  ['providers', 'openrouter', 'apiKey'],
+  ['providers', 'anthropic', 'apiKey'],
+  ['providers', 'openai', 'apiKey'],
+  ['providers', 'deepseek', 'apiKey'],
+  ['providers', 'groq', 'apiKey'],
+  ['providers', 'gemini', 'apiKey'],
+  ['tools', 'web', 'search', 'apiKey'],
+  ['channels', 'telegram', 'token'],
+  ['channels', 'discord', 'token'],
+  ['dashboard', 'authToken'],
+];
 
 // DOM refs
 const $ = (s) => document.getElementById(s);
@@ -75,13 +89,13 @@ const SECTIONS = {
     title: 'Tasks',
     desc: 'View running background tasks, cancel them, and inspect recent results.',
   },
+  chat: {
+    title: 'Chat',
+    desc: 'Chat directly with your Kyber agent from the dashboard.',
+  },
   dashboard: {
     title: 'Dashboard',
     desc: 'Dashboard access, auth token, and allowed hosts.',
-  },
-  arcade: {
-    title: 'Arcade',
-    desc: 'Take a break with some retro games.',
   },
   json: {
     title: 'Raw JSON',
@@ -89,17 +103,7 @@ const SECTIONS = {
   },
 };
 
-const BUILTIN_PROVIDERS = ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'gemini'];
-const SUBSCRIPTION_OPENAI_MODELS = [
-  'gpt-5.2',
-  'gpt-5.2-codex',
-  'gpt-5.1-codex-max',
-  'gpt-5.1-codex-mini',
-];
-const CHATGPT_SUB_PROVIDER_VALUE = 'chatgpt_subscription';
-const CHATGPT_SUB_PROVIDER_KEY = 'chatgptSubscription';
-const CHATGPT_SUBSCRIPTION_POLL_INTERVAL_MS = 1200;
-const CHATGPT_SUBSCRIPTION_POLL_MAX_ATTEMPTS = 40;
+const BUILTIN_PROVIDERS = ['anthropic', 'openai', 'openrouter', 'deepseek'];
 
 // ── Helpers ──
 function showToast(msg, type = 'info') {
@@ -143,6 +147,18 @@ function getPath(obj, path) {
 
 function isObj(v) { return v && typeof v === 'object' && !Array.isArray(v); }
 
+function deletePath(obj, path) {
+  let t = obj;
+  for (let i = 0; i < path.length - 1; i++) {
+    const key = path[i];
+    if (!t || typeof t !== 'object' || !(key in t)) return;
+    t = t[key];
+  }
+  if (t && typeof t === 'object') {
+    delete t[path[path.length - 1]];
+  }
+}
+
 function isSensitive(key) {
   const k = key.toLowerCase();
   return k.includes('token') || k.includes('key') || k.includes('secret');
@@ -163,6 +179,48 @@ function markClean() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function newChatSessionId() {
+  return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getChatState() {
+  const fallback = { sessionId: newChatSessionId(), messages: [] };
+  try {
+    const raw = localStorage.getItem(CHAT_STATE_KEY);
+    if (!raw) return fallback;
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return fallback;
+    const sessionId = typeof data.sessionId === 'string' && data.sessionId.trim()
+      ? data.sessionId.trim()
+      : fallback.sessionId;
+    const messages = Array.isArray(data.messages) ? data.messages.filter((m) =>
+      m && typeof m === 'object' && typeof m.role === 'string' && typeof m.content === 'string'
+    ) : [];
+    return { sessionId, messages: messages.slice(-CHAT_MAX_MESSAGES) };
+  } catch {
+    return fallback;
+  }
+}
+
+function setChatState(state) {
+  localStorage.setItem(CHAT_STATE_KEY, JSON.stringify({
+    sessionId: state.sessionId,
+    messages: (state.messages || []).slice(-CHAT_MAX_MESSAGES),
+  }));
+}
+
+function buildRawConfigView(source) {
+  const safe = JSON.parse(JSON.stringify(source || {}));
+  RAW_JSON_SECRET_PATHS.forEach((p) => deletePath(safe, p));
+  const custom = safe.providers && Array.isArray(safe.providers.custom) ? safe.providers.custom : [];
+  custom.forEach((cp) => {
+    if (cp && typeof cp === 'object' && 'apiKey' in cp) {
+      delete cp.apiKey;
+    }
+  });
+  return safe;
 }
 
 // ── API ──
@@ -247,11 +305,13 @@ async function fetchModels(providerName, apiKey, apiBase) {
 
   const res = await apiFetch(`${API}/providers/${providerName}/models?${params}`);
   const data = await res.json();
-  if (data.models && data.models.length > 0) {
-    modelCache[cacheKey] = data.models;
-    return data.models;
-  }
-  throw new Error(data.error || 'No models returned');
+  const payload = {
+    models: Array.isArray(data.models) ? data.models : [],
+    modelListingUnsupported: !!data.modelListingUnsupported,
+    error: data.error || '',
+  };
+  modelCache[cacheKey] = payload;
+  return payload;
 }
 
 // ── Navigation ──
@@ -279,6 +339,7 @@ function switchSection(section) {
 function renderSection() {
   if (!config) { contentBody.innerHTML = '<div class="empty-state">Loading configuration…</div>'; return; }
   contentBody.innerHTML = '';
+  contentBody.classList.toggle('chat-mode', activeSection === 'chat');
 
   const finishRender = () => {
     if (restoreScrollAfterRender) {
@@ -291,10 +352,10 @@ function renderSection() {
 
   if (activeSection === 'json') { renderJSON(); finishRender(); return; }
   if (activeSection === 'tasks') { renderTasks(); finishRender(); return; }
+  if (activeSection === 'chat') { renderChat(); finishRender(); return; }
   if (activeSection === 'skills') { renderSkills(); finishRender(); return; }
   if (activeSection === 'cron') { renderCron(); finishRender(); return; }
   if (activeSection === 'security') { renderSecurity(); finishRender(); return; }
-  if (activeSection === 'arcade') { renderArcade(); finishRender(); return; }
 
   const data = config[activeSection];
   if (!data || !isObj(data)) {
@@ -538,6 +599,34 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
   modelRow.appendChild(modelWrap);
   card.body.appendChild(modelRow);
 
+  function renderManualModelInput(wrap, currentModel, hintText, retryFn = null) {
+    wrap.innerHTML = '';
+    const hint = document.createElement('div');
+    hint.className = 'model-hint';
+    hint.textContent = hintText || 'Enter model manually';
+    wrap.appendChild(hint);
+
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.value = currentModel || '';
+    inp.placeholder = 'Enter model id manually';
+    inp.style.marginTop = '8px';
+    inp.addEventListener('input', () => {
+      setPath(config, [...configPath, 'model'], inp.value);
+      markDirty();
+    });
+    wrap.appendChild(inp);
+
+    if (retryFn) {
+      const retry = document.createElement('button');
+      retry.className = 'btn-add';
+      retry.textContent = 'Retry model fetch';
+      retry.style.marginTop = '8px';
+      retry.addEventListener('click', retryFn);
+      wrap.appendChild(retry);
+    }
+  }
+
   function renderModelDropdown(wrap, currentModel) {
     wrap.innerHTML = '';
     const currentKey = apiKeyInp.value.trim();
@@ -565,7 +654,16 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
     wrap.appendChild(loading);
 
     fetchModels(fetchName, currentKey, currentBase)
-      .then((models) => {
+      .then((result) => {
+        const models = Array.isArray(result.models) ? result.models : [];
+        if (models.length === 0) {
+          const msg = result.modelListingUnsupported
+            ? 'This provider does not expose a models endpoint. Enter model id manually.'
+            : 'No models were returned. Enter model id manually.';
+          renderManualModelInput(wrap, currentModel, msg);
+          return;
+        }
+
         wrap.innerHTML = '';
         const sel = document.createElement('select');
         const emptyOpt = document.createElement('option');
@@ -596,22 +694,13 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
         wrap.appendChild(sel);
       })
       .catch((err) => {
-        wrap.innerHTML = '';
-        const errEl = document.createElement('div');
-        errEl.className = 'model-hint error-text';
-        errEl.textContent = 'Failed to load models: ' + (err.message || err);
-        wrap.appendChild(errEl);
-
-        const retry = document.createElement('button');
-        retry.className = 'btn-add';
-        retry.textContent = 'Retry';
-        retry.style.marginTop = '6px';
-        retry.addEventListener('click', () => {
+        const message = 'Failed to load models: ' + (err.message || err);
+        const retry = () => {
           const ck = `${fetchName}:${currentKey}:${currentBase || ''}`;
           delete modelCache[ck];
           renderModelDropdown(wrap, currentModel);
-        });
-        wrap.appendChild(retry);
+        };
+        renderManualModelInput(wrap, currentModel, message, retry);
       });
   }
 
@@ -644,306 +733,6 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
   return card;
 }
 
-async function fetchChatGPTSubscriptionStatus() {
-  for (const providerPath of ['chatgpt-subscription', 'chatgpt_subscription']) {
-    const res = await apiFetch(`${API}/providers/${providerPath}/status`);
-    if (res.status !== 404) return await res.json();
-  }
-  throw new Error('ChatGPT subscription status endpoint not found');
-}
-
-async function waitForChatGPTSubscriptionCompletion(maxAttempts = CHATGPT_SUBSCRIPTION_POLL_MAX_ATTEMPTS) {
-  for (let i = 0; i < maxAttempts; i++) {
-    await sleep(CHATGPT_SUBSCRIPTION_POLL_INTERVAL_MS);
-    const status = await fetchChatGPTSubscriptionStatus();
-    if (!status.loginInProgress) return status;
-  }
-  return fetchChatGPTSubscriptionStatus();
-}
-
-async function beginChatGPTSubscriptionLogin(model, forceLogin = false) {
-  for (const providerPath of ['chatgpt-subscription', 'chatgpt_subscription']) {
-    const res = await apiFetch(`${API}/providers/${providerPath}/login`, {
-      method: 'POST',
-      body: JSON.stringify({ model, forceLogin }),
-    });
-    if (res.status !== 404) return await res.json();
-  }
-  throw new Error('ChatGPT subscription login endpoint not found');
-}
-
-async function logoutChatGPTSubscription() {
-  for (const providerPath of ['chatgpt-subscription', 'chatgpt_subscription']) {
-    const res = await apiFetch(`${API}/providers/${providerPath}/logout`, {
-      method: 'POST',
-    });
-    if (res.status !== 404) return await res.json();
-  }
-  throw new Error('ChatGPT subscription logout endpoint not found');
-}
-
-function renderChatGPTSubscriptionCard(providersData) {
-  const cfg = providersData[CHATGPT_SUB_PROVIDER_KEY] || { model: SUBSCRIPTION_OPENAI_MODELS[1] };
-  const card = makeCard('ChatGPT Plus/Pro Plan', false);
-  let availableModels = [...SUBSCRIPTION_OPENAI_MODELS];
-  const statusBadge = card.el.querySelector('.card-badge');
-
-  const dynamicRow = document.createElement('div');
-  dynamicRow.className = 'field-row';
-  const dynamicLabel = document.createElement('div');
-  dynamicLabel.className = 'field-label';
-  const dynamicWrap = document.createElement('div');
-  dynamicWrap.className = 'field-input';
-  dynamicRow.appendChild(dynamicLabel);
-  dynamicRow.appendChild(dynamicWrap);
-  card.body.appendChild(dynamicRow);
-
-  const actionRow = document.createElement('div');
-  actionRow.className = 'field-row';
-  const actionLabel = document.createElement('div');
-  actionLabel.className = 'field-label';
-  actionLabel.textContent = 'Actions';
-  const actionWrap = document.createElement('div');
-  actionWrap.className = 'field-input';
-  actionRow.appendChild(actionLabel);
-  actionRow.appendChild(actionWrap);
-  card.body.appendChild(actionRow);
-
-  const getModel = () => (getPath(config, ['providers', CHATGPT_SUB_PROVIDER_KEY, 'model']) || '').trim();
-  if (!getModel()) {
-    setPath(config, ['providers', CHATGPT_SUB_PROVIDER_KEY, 'model'], availableModels[0] || 'gpt-5.2-codex');
-  }
-
-  const renderAuthedModelSelector = () => {
-    dynamicLabel.textContent = 'Model';
-    dynamicWrap.innerHTML = '';
-    const sel = document.createElement('select');
-    const emptyOpt = document.createElement('option');
-    emptyOpt.value = '';
-    emptyOpt.textContent = '— Select subscription model —';
-    sel.appendChild(emptyOpt);
-    const current = getModel();
-    for (const m of availableModels) {
-      const opt = document.createElement('option');
-      opt.value = m;
-      opt.textContent = m;
-      if (m === current) opt.selected = true;
-      sel.appendChild(opt);
-    }
-    if (current && !availableModels.includes(current)) {
-      const opt = document.createElement('option');
-      opt.value = current;
-      opt.textContent = current + ' (current)';
-      opt.selected = true;
-      sel.appendChild(opt);
-    }
-    sel.addEventListener('change', () => {
-      setPath(config, ['providers', CHATGPT_SUB_PROVIDER_KEY, 'model'], sel.value);
-      markDirty();
-    });
-    dynamicWrap.appendChild(sel);
-  };
-
-  const renderAuthButton = () => {
-    dynamicLabel.textContent = 'Authentication';
-    dynamicWrap.innerHTML = '';
-    const btn = document.createElement('button');
-    btn.className = 'btn btn-primary';
-    btn.textContent = 'OAuth Authenticate';
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
-      const model = getModel() || availableModels[0] || 'gpt-5.2-codex';
-      try {
-        const out = await beginChatGPTSubscriptionLogin(model, false);
-        const inProgress = !!out?.loginInProgress;
-        if (out && (out.authenticated || inProgress)) {
-          if (out.authenticated) {
-            showToast('ChatGPT subscription authenticated', 'success');
-          } else {
-            showToast('ChatGPT OAuth flow started. Check browser to authorize.', 'success');
-          }
-          if (inProgress) {
-            const finalStatus = await waitForChatGPTSubscriptionCompletion();
-            if (finalStatus?.authenticated) {
-              showToast('ChatGPT subscription authenticated', 'success');
-            } else if (finalStatus?.loginError) {
-              showToast(finalStatus.loginError || 'Authentication did not complete', 'error');
-            } else if (finalStatus?.loginInProgress) {
-              showToast('OAuth authorization is still pending. Keep the tab open and finish in your browser.', 'error');
-            } else {
-              showToast('Authentication did not complete', 'error');
-            }
-            renderSection();
-            return;
-          }
-        } else {
-          showToast(out.error || 'Authentication did not complete', 'error');
-        }
-      } catch (e) {
-        showToast('Authentication failed: ' + (e.message || e), 'error');
-      } finally {
-        btn.disabled = false;
-        renderSection();
-      }
-    });
-    dynamicWrap.appendChild(btn);
-  };
-
-  const renderActions = (authenticated) => {
-    actionWrap.innerHTML = '';
-    if (!authenticated) return;
-    const relogin = document.createElement('button');
-    relogin.className = 'btn btn-ghost';
-    relogin.textContent = 'Re-authenticate';
-    relogin.addEventListener('click', async () => {
-    relogin.disabled = true;
-      try {
-        const out = await beginChatGPTSubscriptionLogin(
-          getModel() || availableModels[0] || 'gpt-5.2-codex',
-          true,
-        );
-        const inProgress = !!out?.loginInProgress;
-        if (out && (out.authenticated || inProgress)) {
-          if (out.authenticated) {
-            showToast('Re-authenticated', 'success');
-          } else {
-            showToast('Re-auth started. Complete in your browser.', 'success');
-          }
-          if (inProgress) {
-            const finalStatus = await waitForChatGPTSubscriptionCompletion();
-            if (finalStatus?.authenticated) {
-              showToast('Re-authenticated', 'success');
-            } else if (finalStatus?.loginError) {
-              showToast(finalStatus.loginError || 'Re-auth failed', 'error');
-            } else if (finalStatus?.loginInProgress) {
-              showToast('Re-auth is still pending in the browser.', 'error');
-            } else {
-              showToast('Re-auth did not complete', 'error');
-            }
-          }
-        } else {
-          showToast(out.error || 'Re-auth failed', 'error');
-        }
-      } catch (e) {
-        showToast('Re-auth failed: ' + (e.message || e), 'error');
-      } finally {
-        relogin.disabled = false;
-        renderSection();
-      }
-    });
-    actionWrap.appendChild(relogin);
-
-    const disconnect = document.createElement('button');
-    disconnect.className = 'btn btn-ghost';
-    disconnect.style.marginLeft = '8px';
-    disconnect.textContent = 'Disconnect';
-    disconnect.addEventListener('click', async () => {
-      disconnect.disabled = true;
-      try {
-        await logoutChatGPTSubscription();
-        showToast('Disconnected ChatGPT subscription', 'success');
-      } catch (e) {
-        showToast('Disconnect failed: ' + (e.message || e), 'error');
-      } finally {
-        disconnect.disabled = false;
-        renderSection();
-      }
-    });
-    actionWrap.appendChild(disconnect);
-  };
-
-  const renderAuthUrlHint = (authUrl) => {
-    if (!authUrl) return;
-    const authWrap = document.createElement('div');
-    authWrap.className = 'model-hint';
-    authWrap.style.marginTop = '6px';
-
-    const text = document.createElement('div');
-    text.textContent = 'Copy this URL into your browser if it did not open automatically:';
-    authWrap.appendChild(text);
-
-    const link = document.createElement('a');
-    link.href = authUrl;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    link.textContent = authUrl;
-    link.style.wordBreak = 'break-all';
-    authWrap.appendChild(link);
-
-    const copyBtn = document.createElement('button');
-    copyBtn.className = 'btn-add';
-    copyBtn.style.marginTop = '6px';
-    copyBtn.textContent = 'Copy URL';
-    copyBtn.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(authUrl);
-        showToast('Auth URL copied.', 'success');
-      } catch {
-        showToast('Copy failed. Select and copy the link manually.', 'error');
-      }
-    });
-    authWrap.appendChild(copyBtn);
-
-    dynamicWrap.appendChild(authWrap);
-  };
-
-  const renderInProgressAuthState = (authUrl) => {
-    dynamicLabel.textContent = 'Authentication';
-    dynamicWrap.innerHTML = '';
-    const inFlight = document.createElement('div');
-    inFlight.className = 'model-hint';
-    inFlight.textContent = 'OAuth authorization in progress. Finish in your browser, then return here.';
-    dynamicWrap.appendChild(inFlight);
-    renderAuthUrlHint(authUrl);
-    renderActions(false);
-  };
-
-  fetchChatGPTSubscriptionStatus()
-    .then((status) => {
-      if (Array.isArray(status.models) && status.models.length) {
-        availableModels = [...status.models];
-      }
-      const authenticated = !!status.authenticated;
-      const inProgress = !!status.loginInProgress;
-      if (inProgress) {
-        const loginErr = status.loginError;
-        if (statusBadge) {
-          statusBadge.textContent = 'Authorizing';
-          statusBadge.classList.remove('on');
-        }
-        if (loginErr) {
-          const err = document.createElement('div');
-          err.className = 'model-hint error-text';
-          err.textContent = loginErr;
-          actionWrap.innerHTML = '';
-          actionWrap.appendChild(err);
-        }
-      } else if (statusBadge) {
-        statusBadge.textContent = authenticated ? 'Enabled' : 'Disabled';
-        statusBadge.classList.toggle('on', authenticated);
-      }
-      if (inProgress) {
-        renderInProgressAuthState(status.authUrl);
-        return;
-      }
-      if (authenticated) renderAuthedModelSelector();
-      else renderAuthButton();
-      renderActions(authenticated);
-    })
-    .catch((e) => {
-      if (statusBadge) {
-        statusBadge.textContent = 'Disabled';
-        statusBadge.classList.remove('on');
-      }
-      renderAuthButton();
-      actionWrap.innerHTML = '';
-      const err = document.createElement('div');
-      err.className = 'model-hint error-text';
-      err.textContent = 'Auth status check failed: ' + (e.message || e);
-      actionWrap.appendChild(err);
-    });
-}
-
 // ── Section-specific renderers ──
 
 function renderProviders(data) {
@@ -953,7 +742,6 @@ function renderProviders(data) {
     const opts = {};
     renderProviderCard(name, prov, ['providers', name], opts);
   }
-  renderChatGPTSubscriptionCard(data);
 
   // Custom providers
   const customs = data.custom || [];
@@ -1065,16 +853,6 @@ function renderAgents(data) {
       const modelInfo = model ? ` (${model})` : '';
       opt.textContent = humanize(name) + modelInfo;
       if (selected === name) opt.selected = true;
-      sel.appendChild(opt);
-    }
-
-    const subProv = providers[CHATGPT_SUB_PROVIDER_KEY] || {};
-    const subModel = (subProv.model || '').trim();
-    if (subModel) {
-      const opt = document.createElement('option');
-      opt.value = CHATGPT_SUB_PROVIDER_VALUE;
-      opt.textContent = 'ChatGPT Plus/Pro Plan' + (subModel ? ` (${subModel})` : '');
-      if (selected === CHATGPT_SUB_PROVIDER_VALUE) opt.selected = true;
       sel.appendChild(opt);
     }
 
@@ -1207,22 +985,11 @@ function renderDashboard(data) {
   renderFields(card.body, filtered, ['dashboard']);
 }
 
-function renderArcade() {
-  const iframe = document.createElement('iframe');
-  iframe.src = '/static/arcade/index.html';
-  iframe.style.width = '100%';
-  iframe.style.height = 'calc(100vh - 140px)';
-  iframe.style.border = 'none';
-  iframe.style.borderRadius = '8px';
-  iframe.style.background = '#050505';
-  contentBody.appendChild(iframe);
-}
-
 function renderJSON() {
   const ta = document.createElement('textarea');
   ta.className = 'json-editor';
   ta.spellcheck = false;
-  ta.value = JSON.stringify(config, null, 2);
+  ta.value = JSON.stringify(buildRawConfigView(config), null, 2);
   ta.addEventListener('input', () => {
     markDirty();
     try {
@@ -1417,29 +1184,6 @@ function renderTasks() {
           const body = document.createElement('div');
           body.className = 'task-body';
 
-          const actions = document.createElement('div');
-          actions.className = 'task-actions';
-
-          const redeliverBtn = document.createElement('button');
-          redeliverBtn.className = 'btn btn-ghost';
-          redeliverBtn.textContent = 'Redeliver to Chat';
-          redeliverBtn.addEventListener('click', async (ev) => {
-            ev.preventDefault();
-            ev.stopPropagation();
-            redeliverBtn.disabled = true;
-            try {
-              const ref = t.completion_reference || t.reference || t.id || '';
-              await apiFetch(`${API}/tasks/${encodeURIComponent(ref)}/redeliver`, { method: 'POST' });
-              showToast('Queued for delivery', 'success');
-            } catch {
-              showToast('Redeliver failed', 'error');
-            } finally {
-              redeliverBtn.disabled = false;
-            }
-          });
-          actions.appendChild(redeliverBtn);
-          body.appendChild(actions);
-
           const pre = document.createElement('pre');
           pre.className = 'task-output';
           const out = t.result || t.error || '';
@@ -1474,6 +1218,244 @@ function renderTasks() {
       doRender({ showLoading: false });
     }, 3000);
   }
+}
+
+// ── Chat ──
+async function chatTurn(message, sessionId) {
+  const res = await apiFetch(`${API}/chat/turn`, {
+    method: 'POST',
+    body: JSON.stringify({ message, sessionId }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const raw = String(data.detail || data.error || '').trim();
+    if (res.status === 404 || raw.toLowerCase() === 'not found') {
+      throw new Error('Chat API is unavailable on the gateway. Restart gateway and dashboard services.');
+    }
+    throw new Error(raw || `Chat request failed (${res.status})`);
+  }
+  return data;
+}
+
+async function chatReset(sessionId) {
+  const res = await apiFetch(`${API}/chat/reset`, {
+    method: 'POST',
+    body: JSON.stringify({ sessionId }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.detail || data.error || `Chat reset failed (${res.status})`);
+  }
+  return data;
+}
+
+function renderChat() {
+  const state = getChatState();
+  let sending = false;
+
+  const shell = document.createElement('div');
+  shell.className = 'chat-shell';
+
+  const toolbar = document.createElement('div');
+  toolbar.className = 'chat-toolbar';
+
+  const info = document.createElement('div');
+  info.className = 'chat-info';
+
+  const sessionLabel = document.createElement('span');
+  sessionLabel.className = 'chat-session';
+  const setSessionLabel = () => {
+    sessionLabel.textContent = `session: ${state.sessionId}`;
+  };
+  setSessionLabel();
+  info.appendChild(sessionLabel);
+
+  const statusPill = document.createElement('span');
+  statusPill.className = 'chat-status-pill ready';
+  const statusDot = document.createElement('span');
+  statusDot.className = 'chat-status-dot';
+  const statusText = document.createElement('span');
+  statusText.className = 'chat-status-text';
+  statusText.textContent = 'Ready';
+  statusPill.appendChild(statusDot);
+  statusPill.appendChild(statusText);
+  info.appendChild(statusPill);
+
+  toolbar.appendChild(info);
+
+  const controls = document.createElement('div');
+  controls.className = 'chat-controls';
+  const newChatBtn = document.createElement('button');
+  newChatBtn.className = 'btn btn-ghost';
+  newChatBtn.textContent = 'New Chat';
+  controls.appendChild(newChatBtn);
+  toolbar.appendChild(controls);
+
+  const transcript = document.createElement('div');
+  transcript.className = 'chat-transcript';
+
+  const compose = document.createElement('div');
+  compose.className = 'chat-compose';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'chat-input';
+  input.placeholder = 'Message your agent...';
+  compose.appendChild(input);
+
+  const sendBtn = document.createElement('button');
+  sendBtn.className = 'btn btn-primary chat-send';
+  sendBtn.textContent = 'Send';
+  compose.appendChild(sendBtn);
+
+  shell.appendChild(toolbar);
+  shell.appendChild(transcript);
+  shell.appendChild(compose);
+  contentBody.appendChild(shell);
+
+  const setStatus = (kind, text) => {
+    statusPill.className = `chat-status-pill ${kind}`;
+    statusText.textContent = text;
+  };
+
+  const scrollToBottom = () => {
+    transcript.scrollTop = transcript.scrollHeight;
+  };
+
+  const renderMessages = () => {
+    transcript.innerHTML = '';
+    if (!state.messages.length) {
+      const empty = document.createElement('div');
+      empty.className = 'chat-empty';
+      empty.textContent = 'Ask anything. Press Enter to send.';
+      transcript.appendChild(empty);
+    } else {
+      state.messages.forEach((msg) => {
+        const row = document.createElement('div');
+        row.className = `chat-msg ${msg.role}`;
+
+        const bubble = document.createElement('div');
+        bubble.className = 'chat-bubble';
+
+        const meta = document.createElement('div');
+        meta.className = 'chat-meta';
+        const who = msg.role === 'user' ? 'You' : (msg.role === 'assistant' ? 'Kyber' : 'System');
+        const when = msg.ts ? new Date(msg.ts).toLocaleTimeString() : '';
+        meta.textContent = when ? `${who} · ${when}` : who;
+
+        const text = document.createElement('div');
+        text.className = 'chat-text';
+        text.textContent = msg.content;
+
+        bubble.appendChild(meta);
+        bubble.appendChild(text);
+        row.appendChild(bubble);
+        transcript.appendChild(row);
+      });
+    }
+
+    if (sending) {
+      const row = document.createElement('div');
+      row.className = 'chat-msg assistant';
+      const bubble = document.createElement('div');
+      bubble.className = 'chat-bubble';
+      bubble.innerHTML = `
+        <div class="chat-meta">Kyber</div>
+        <div class="chat-thinking"><span></span><span></span><span></span></div>
+      `;
+      row.appendChild(bubble);
+      transcript.appendChild(row);
+    }
+  };
+
+  const setSending = (value) => {
+    sending = value;
+    sendBtn.disabled = value;
+    input.disabled = value;
+    newChatBtn.disabled = value;
+    sendBtn.textContent = value ? 'Working...' : 'Send';
+    setStatus(value ? 'working' : 'ready', value ? 'Thinking' : 'Ready');
+    renderMessages();
+    scrollToBottom();
+  };
+
+  const pushMessage = (role, content) => {
+    state.messages.push({
+      role,
+      content,
+      ts: new Date().toISOString(),
+    });
+    if (state.messages.length > CHAT_MAX_MESSAGES) {
+      state.messages = state.messages.slice(-CHAT_MAX_MESSAGES);
+    }
+    setChatState(state);
+  };
+
+  const sendMessage = async () => {
+    const text = input.value.trim();
+    if (!text || sending) return;
+
+    pushMessage('user', text);
+    renderMessages();
+    scrollToBottom();
+    input.value = '';
+    setSending(true);
+
+    try {
+      const out = await chatTurn(text, state.sessionId);
+      const answer = String(out.response || '').trim() || '(No response returned)';
+      pushMessage('assistant', answer);
+      renderMessages();
+      scrollToBottom();
+    } catch (e) {
+      let msg = e && e.message ? e.message : String(e || 'Unknown chat error');
+      if (msg.trim().toLowerCase() === 'not found') {
+        msg = 'Chat API is unavailable on the gateway. Restart gateway and dashboard services.';
+      }
+      pushMessage('system', `Chat error: ${msg}`);
+      renderMessages();
+      scrollToBottom();
+      showToast(msg, 'error');
+      setStatus('error', 'Error');
+    } finally {
+      setSending(false);
+      input.focus();
+    }
+  };
+
+  newChatBtn.addEventListener('click', async () => {
+    if (sending) return;
+    const oldSessionId = state.sessionId;
+    state.sessionId = newChatSessionId();
+    state.messages = [];
+    setChatState(state);
+    setSessionLabel();
+    renderMessages();
+    scrollToBottom();
+    input.focus();
+
+    try {
+      await chatReset(oldSessionId);
+      showToast('Started a new chat session', 'success');
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e || 'Failed to reset old session');
+      showToast(msg, 'error');
+    }
+  });
+
+  sendBtn.addEventListener('click', sendMessage);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  renderMessages();
+  requestAnimationFrame(() => {
+    scrollToBottom();
+    input.focus();
+  });
 }
 
 // ── Skills ──

@@ -13,10 +13,15 @@ Plugs into kyber's existing bus/channel architecture:
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from kyber.agent.context import ContextBuilder
+from kyber.agent.display import (
+    get_cute_tool_message,
+    build_tool_preview,
+)
 from kyber.agent.task_registry import Task, TaskRegistry, TaskStatus
 from kyber.agent.tools.registry import registry
 from kyber.bus.events import InboundMessage, OutboundMessage
@@ -25,6 +30,11 @@ from kyber.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from kyber.session.manager import SessionManager, Session
 
 logger = logging.getLogger(__name__)
+
+AGENT_MESSAGE_TIMEOUT_SECONDS = 600.0
+AGENT_LOOP_TIMEOUT_SECONDS = 600.0
+AGENT_SINGLE_LLM_TIMEOUT_SECONDS = 600.0
+AGENT_SINGLE_TOOL_TIMEOUT_SECONDS = 600.0
 
 
 class AgentCore:
@@ -42,10 +52,14 @@ class AgentCore:
         workspace: Path to the workspace directory.
         model: Model identifier (uses provider default if not set).
         max_iterations: Maximum tool-calling loop iterations per message.
+                        `<= 0` means unlimited (bounded by timeout guards).
         max_history: Maximum conversation messages to include as context.
         persona_prompt: Optional persona/personality system prompt override.
         timezone: Timezone for datetime display.
-        progress_callback: Optional callback for tool execution progress updates.
+        progress_callback: Optional async callback(channel, chat_id, status_line, status_key)
+                           for tool execution progress updates. status_line is
+                           a formatted string like "┊ 🔍 search    query  1.2s".
+                           status_key identifies which in-flight request the update belongs to.
     """
     
     def __init__(
@@ -54,12 +68,12 @@ class AgentCore:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
-        max_iterations: int = 30,
-        max_history: int = 40,
+        max_iterations: int = 0,
+        max_history: int = 20,
         persona_prompt: str | None = None,
         timezone: str | None = None,
         task_history_path: Path | None = None,
-        progress_callback: Callable[[str, str, str], Awaitable[None]] | None = None,
+        progress_callback: Callable[[str, str, str, str], Awaitable[None]] | None = None,
     ):
         self.bus = bus
         self.provider = provider
@@ -81,8 +95,12 @@ class AgentCore:
         
         # State
         self._running = False
-        self._active_tasks: dict[str, asyncio.Task] = {}
+        self._active_tasks: dict[int, asyncio.Task] = {}
         self._background_tasks: dict[str, asyncio.Task] = {}
+        self._running_tasks_by_task_id: dict[str, asyncio.Task] = {}
+        # Per-session locks: keep ordering deterministic within one chat/session
+        # while still allowing parallel work across different sessions.
+        self._session_locks: dict[str, asyncio.Lock] = {}
     
     # ── Public API ──────────────────────────────────────────────────
     
@@ -96,11 +114,12 @@ class AgentCore:
                 msg = await asyncio.wait_for(
                     self.bus.consume_inbound(), timeout=1.0
                 )
-                # Process each message concurrently
+                # Process messages concurrently across chats.
                 task = asyncio.create_task(self._handle_message(msg))
-                self._active_tasks[msg.session_key] = task
+                active_key = id(task)
+                self._active_tasks[active_key] = task
                 task.add_done_callback(
-                    lambda t, key=msg.session_key: self._active_tasks.pop(key, None)
+                    lambda t, key=active_key: self._active_tasks.pop(key, None)
                 )
             except asyncio.TimeoutError:
                 continue
@@ -121,6 +140,7 @@ class AgentCore:
         session_key: str = "cli:default",
         channel: str = "cli",
         chat_id: str = "default",
+        tracked_task_id: str | None = None,
     ) -> str:
         """Process a message directly (for CLI/cron, bypassing the bus).
         
@@ -139,7 +159,54 @@ class AgentCore:
             chat_id=chat_id,
             content=content,
         )
-        return await self._process_message(msg, session_key)
+        session_lock = self._get_session_lock(session_key)
+        auto_finalize = tracked_task_id is None
+        task_tracker: dict[str, str | None] = {"id": tracked_task_id}
+
+        try:
+            async with session_lock:
+                response_text = await self._process_message(
+                    msg,
+                    session_key,
+                    tracked_task_id=tracked_task_id,
+                    task_tracker=task_tracker,
+                )
+            task_id = task_tracker.get("id")
+            if auto_finalize and task_id:
+                tracked = self.registry.get(task_id)
+                if tracked and tracked.status not in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                ):
+                    self.registry.mark_completed(task_id, response_text)
+            return response_text
+        except asyncio.CancelledError:
+            task_id = task_tracker.get("id")
+            if auto_finalize and task_id:
+                tracked = self.registry.get(task_id)
+                if tracked and tracked.status not in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                ):
+                    self.registry.mark_cancelled(task_id, "Cancelled by user")
+            raise
+        except Exception as e:
+            task_id = task_tracker.get("id")
+            if auto_finalize and task_id:
+                tracked = self.registry.get(task_id)
+                if tracked and tracked.status not in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                ):
+                    self.registry.mark_failed(task_id, str(e))
+            raise
+        finally:
+            task_id = task_tracker.get("id")
+            if task_id:
+                self._running_tasks_by_task_id.pop(task_id, None)
 
     def _configure_tool_callbacks(self) -> None:
         """Attach internal callback handlers to tools that rely on the agent runtime."""
@@ -150,13 +217,37 @@ class AgentCore:
     async def _publish_tool_message(self, outbound: OutboundMessage) -> None:
         """Publish outbound tool messages back through the message bus."""
         await self.bus.publish_outbound(outbound)
+
+    def _get_session_lock(self, session_key: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_key] = lock
+        return lock
     
     # ── Internal ────────────────────────────────────────────────────
     
     async def _handle_message(self, msg: InboundMessage) -> None:
         """Handle an inbound message: process and publish response."""
+        task_tracker: dict[str, str | None] = {"id": None}
+        session_lock = self._get_session_lock(msg.session_key)
         try:
-            response_text = await self._process_message(msg, msg.session_key)
+            async with session_lock:
+                # Hard upper bound so a runaway tool loop can't keep users waiting forever.
+                response_text = await asyncio.wait_for(
+                    self._process_message(
+                        msg,
+                        msg.session_key,
+                        tracked_task_id=None,
+                        task_tracker=task_tracker,
+                    ),
+                    timeout=AGENT_MESSAGE_TIMEOUT_SECONDS,
+                )
+            task_id = task_tracker.get("id")
+            if task_id:
+                tracked = self.registry.get(task_id)
+                if tracked and tracked.status != TaskStatus.CANCELLED:
+                    self.registry.mark_completed(task_id, response_text)
             
             # Publish response to bus
             response = OutboundMessage(
@@ -165,8 +256,37 @@ class AgentCore:
                 content=response_text,
             )
             await self.bus.publish_outbound(response)
-            
+        except asyncio.CancelledError:
+            task_id = task_tracker.get("id")
+            if task_id:
+                tracked = self.registry.get(task_id)
+                if tracked and tracked.status != TaskStatus.CANCELLED:
+                    self.registry.mark_cancelled(task_id, "Cancelled by user")
+            raise
+        except asyncio.TimeoutError:
+            task_id = task_tracker.get("id")
+            if task_id:
+                tracked = self.registry.get(task_id)
+                if tracked and tracked.status != TaskStatus.CANCELLED:
+                    self.registry.mark_failed(
+                        task_id,
+                        "I took too long and hit a timeout while working on that.",
+                    )
+            timeout_msg = OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "I took too long and hit a timeout while working on that. "
+                    "Please try again with a shorter request."
+                ),
+            )
+            await self.bus.publish_outbound(timeout_msg)
         except Exception as e:
+            task_id = task_tracker.get("id")
+            if task_id:
+                tracked = self.registry.get(task_id)
+                if tracked and tracked.status != TaskStatus.CANCELLED:
+                    self.registry.mark_failed(task_id, str(e))
             logger.exception(f"Error handling message from {msg.session_key}")
             error_msg = OutboundMessage(
                 channel=msg.channel,
@@ -174,8 +294,18 @@ class AgentCore:
                 content=f"Sorry, I hit an error: {str(e)}",
             )
             await self.bus.publish_outbound(error_msg)
+        finally:
+            task_id = task_tracker.get("id")
+            if task_id:
+                self._running_tasks_by_task_id.pop(task_id, None)
     
-    async def _process_message(self, msg: InboundMessage, session_key: str) -> str:
+    async def _process_message(
+        self,
+        msg: InboundMessage,
+        session_key: str,
+        tracked_task_id: str | None = None,
+        task_tracker: dict[str, str | None] | None = None,
+    ) -> str:
         """Core message processing: build context, run tool loop, return response."""
         
         # Get or create session
@@ -186,13 +316,16 @@ class AgentCore:
         
         # Build system prompt
         system_prompt = self._build_system_prompt(msg)
-        
+
         # Get tool definitions
         tool_defs = registry.get_definitions()
-        
+
         # Build messages for LLM
         messages = self._build_messages(system_prompt, session)
         
+        status_key = str(msg.metadata.get("message_id") or f"run-{time.time_ns()}")
+        status_intro = self._build_status_intro(msg.content)
+
         # Run the tool-calling loop
         response_text = await self._run_loop(
             messages=messages,
@@ -200,6 +333,12 @@ class AgentCore:
             session=session,
             context_channel=msg.channel,
             context_chat_id=msg.chat_id,
+            context_status_key=status_key,
+            context_status_intro=status_intro,
+            tracked_task_id=tracked_task_id,
+            tracked_task_description=msg.content,
+            tracked_task_label=self._build_task_label(msg.content),
+            task_tracker=task_tracker,
         )
         
         # Add assistant response to session
@@ -235,6 +374,7 @@ class AgentCore:
                     session_key=run_key,
                     channel=task.origin_channel,
                     chat_id=task.origin_chat_id,
+                    tracked_task_id=task.id,
                 )
             except asyncio.CancelledError:
                 self.registry.mark_cancelled(task.id, "Cancelled by user")
@@ -270,8 +410,14 @@ class AgentCore:
 
     def _cancel_task(self, task_id: str) -> bool:
         """Cancel a background task by task id."""
-        running_task = self._background_tasks.get(task_id)
+        task = self.registry.get(task_id)
+        if not task or task.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+            return False
+
+        running_task = self._background_tasks.get(task_id) or self._running_tasks_by_task_id.get(task_id)
         if not running_task:
+            return False
+        if running_task.done():
             return False
 
         running_task.cancel()
@@ -285,6 +431,12 @@ class AgentCore:
         session: Session,
         context_channel: str = "",
         context_chat_id: str = "",
+        context_status_key: str = "",
+        context_status_intro: str = "",
+        tracked_task_id: str | None = None,
+        tracked_task_description: str = "",
+        tracked_task_label: str = "Task",
+        task_tracker: dict[str, str | None] | None = None,
     ) -> str:
         """The core hermes-style tool-calling loop.
         
@@ -292,82 +444,204 @@ class AgentCore:
         and loops until the LLM produces a final text response.
         """
         iteration = 0
+        loop_start_time = time.time()
+        max_loop_seconds = AGENT_LOOP_TIMEOUT_SECONDS
+        max_single_llm_seconds = AGENT_SINGLE_LLM_TIMEOUT_SECONDS
+        max_single_tool_seconds = AGENT_SINGLE_TOOL_TIMEOUT_SECONDS
         
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            # Call LLM
-            try:
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=tools if tools else None,
-                    model=self.model,
-                )
-            except Exception as e:
-                logger.error(f"LLM call failed (iteration {iteration}): {e}")
-                return f"I had trouble reaching the AI model: {str(e)}"
-            
-            # If the LLM returned tool calls — execute them
-            if response.has_tool_calls:
-                # Add assistant message with tool calls to conversation
-                assistant_msg = self._build_tool_call_message(response)
-                messages.append(assistant_msg)
+        status_started = False
+
+        try:
+            while True:
+                if self.max_iterations > 0 and iteration >= self.max_iterations:
+                    break
+
+                if (time.time() - loop_start_time) > max_loop_seconds:
+                    logger.warning("Agent loop timeout after %.1fs", time.time() - loop_start_time)
+                    return (
+                        "I got stuck while working on that and stopped early. "
+                        "Please try again with a more specific request."
+                    )
+
+                iteration += 1
+                if tracked_task_id:
+                    self.registry.update_progress(
+                        tracked_task_id,
+                        iteration=iteration,
+                        current_action="thinking",
+                    )
                 
-                # Execute each tool call
-                for tc in response.tool_calls:
-                    logger.info(f"Tool call: {tc.name}({_summarize_args(tc.arguments)})")
-                    
-                    # Send progress update if callback registered
-                    if self.progress_callback:
+                # Call LLM
+                try:
+                    response = await asyncio.wait_for(
+                        self.provider.chat(
+                            messages=messages,
+                            tools=tools if tools else None,
+                            model=self.model,
+                        ),
+                        timeout=max_single_llm_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("LLM call timed out (iteration %s)", iteration)
+                    return "I hit a timeout while waiting on the model. Please try again."
+                except Exception as e:
+                    logger.error(f"LLM call failed (iteration {iteration}): {e}")
+                    return f"I had trouble reaching the AI model: {str(e)}"
+                
+                # If the LLM returned tool calls — execute them
+                if response.has_tool_calls:
+                    if not tracked_task_id:
+                        task = self.registry.create(
+                            description=tracked_task_description,
+                            label=tracked_task_label,
+                            origin_channel=context_channel or "cli",
+                            origin_chat_id=context_chat_id or "direct",
+                        )
+                        tracked_task_id = task.id
+                        self.registry.mark_started(task.id)
+                        cur = asyncio.current_task()
+                        if cur is not None:
+                            self._running_tasks_by_task_id[task.id] = cur
+                        if task_tracker is not None:
+                            task_tracker["id"] = task.id
+
+                    # Start status message on first tool call
+                    if not status_started and self.progress_callback:
                         try:
                             await self.progress_callback(
                                 context_channel,
                                 context_chat_id,
-                                f"🔧 {tc.name}...",
+                                "__KYBER_STATUS_START__",
+                                context_status_key,
                             )
+                            await self.progress_callback(
+                                context_channel,
+                                context_chat_id,
+                                context_status_intro or "Working...",
+                                context_status_key,
+                            )
+                            status_started = True
                         except Exception:
                             pass
-                    
-                    # Execute the tool
-                    result = await self._execute_tool(
-                        tc,
-                        context_channel,
-                        context_chat_id,
-                        task_id=session.key,
-                    )
-                    
-                    # Add tool result to conversation
-                    tool_msg = {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    }
-                    messages.append(tool_msg)
-                    
-                    # Also record in session for persistence
-                    session.add_message(
-                        "tool",
-                        result,
-                        tool_call_id=tc.id,
-                        tool_name=tc.name,
-                    )
+
+                    # Add assistant message with tool calls to conversation
+                    assistant_msg = self._build_tool_call_message(response)
+                    messages.append(assistant_msg)
+
+                    # Execute each tool call
+                    for tc in response.tool_calls:
+                        logger.info(f"Tool call: {tc.name}({_summarize_args(tc.arguments)})")
+                        tool_preview = build_tool_preview(tc.name, tc.arguments)
+                        action_line = f"{tc.name} {tool_preview}".strip() if tool_preview else tc.name
+                        if tracked_task_id:
+                            self.registry.update_progress(
+                                tracked_task_id,
+                                iteration=iteration,
+                                current_action=action_line,
+                            )
+
+                        tool_start_time = time.time()
+
+                        # Execute the tool
+                        try:
+                            result = await asyncio.wait_for(
+                                self._execute_tool(
+                                    tc,
+                                    context_channel,
+                                    context_chat_id,
+                                    task_id=session.key,
+                                ),
+                                timeout=max_single_tool_seconds,
+                            )
+                        except asyncio.TimeoutError:
+                            result = json.dumps(
+                                {"error": f"Tool '{tc.name}' timed out after {int(max_single_tool_seconds)}s"}
+                            )
+
+                        tool_duration = time.time() - tool_start_time
+
+                        # Send cute progress update with timing
+                        if self.progress_callback:
+                            try:
+                                status_line = get_cute_tool_message(
+                                    tc.name,
+                                    tc.arguments,
+                                    tool_duration,
+                                    result=result[:500] if result else None,
+                                )
+                                await self.progress_callback(
+                                    context_channel,
+                                    context_chat_id,
+                                    status_line,
+                                    context_status_key,
+                                )
+                            except Exception:
+                                pass
+
+                        # Add tool result to conversation
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        }
+                        messages.append(tool_msg)
+
+                        # Also record in session for persistence
+                        session.add_message(
+                            "tool",
+                            result,
+                            tool_call_id=tc.id,
+                            tool_name=tc.name,
+                        )
+                        if tracked_task_id:
+                            self.registry.update_progress(
+                                tracked_task_id,
+                                action_completed=action_line,
+                            )
+
+                    # Loop back to call LLM again with tool results
+                    continue
                 
-                # Loop back to call LLM again with tool results
+                # No tool calls — we have a final text response
+                if response.content:
+                    return response.content
+                
+                # Edge case: no content and no tool calls
+                logger.warning(f"Empty response from LLM at iteration {iteration}")
                 continue
             
-            # No tool calls — we have a final text response
-            if response.content:
-                return response.content
-            
-            # Edge case: no content and no tool calls
-            logger.warning(f"Empty response from LLM at iteration {iteration}")
-            if iteration >= self.max_iterations:
-                break
-            continue
-        
-        # Exceeded max iterations
-        logger.warning(f"Agent loop hit max iterations ({self.max_iterations})")
-        return "I ran out of steps trying to complete that. Could you try breaking it into smaller pieces?"
+            # Exceeded max iterations
+            logger.warning(f"Agent loop hit max iterations ({self.max_iterations})")
+            return "I ran out of steps trying to complete that. Could you try breaking it into smaller pieces?"
+        finally:
+            if status_started and self.progress_callback:
+                try:
+                    await self.progress_callback(
+                        context_channel,
+                        context_chat_id,
+                        "__KYBER_STATUS_END__",
+                        context_status_key,
+                    )
+                except Exception:
+                    pass
+
+    def _build_status_intro(self, content: str, limit: int = 120) -> str:
+        """Build a short status line that identifies the request being worked on."""
+        text = " ".join((content or "").strip().split())
+        if not text:
+            return "Working..."
+        if len(text) > limit:
+            text = text[: max(0, limit - 3)].rstrip() + "..."
+        return f"Working on: {text}"
+
+    def _build_task_label(self, content: str, limit: int = 80) -> str:
+        """Build a concise task label from user input for dashboard lists."""
+        text = " ".join((content or "").strip().split())
+        if not text:
+            return "Task"
+        if len(text) > limit:
+            text = text[: max(0, limit - 3)].rstrip() + "..."
+        return text
     
     async def _execute_tool(
         self,
@@ -383,7 +657,9 @@ class AgentCore:
             if msg_tool and hasattr(msg_tool, "set_context"):
                 msg_tool.set_context(channel, chat_id)
             
-            result = await registry.execute(tc.name, tc.arguments, task_id=task_id)
+            result = await registry.execute(
+                tc.name, tc.arguments, task_id=task_id, agent_core=self
+            )
             
             # Truncate very long results
             if len(result) > 100_000:
@@ -462,7 +738,6 @@ class AgentCore:
             msg["content"] = None
         
         return msg
-
 
 def _summarize_args(args: dict[str, Any], max_len: int = 80) -> str:
     """Summarize tool arguments for logging."""

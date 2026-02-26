@@ -2,6 +2,7 @@
 
 import asyncio
 import errno
+import os
 import platform
 import socket
 from contextlib import suppress
@@ -213,6 +214,7 @@ def _create_agent(
     config,
     bus,
     task_history_path: Path | None = None,
+    channels = None,
 ):
     """Create an AgentCore with providers from config.
 
@@ -228,6 +230,25 @@ def _create_agent(
     api_base = details.get("api_base")
     provider_name = details.get("provider_name") or config.get_provider_name()
     model = config.get_model()
+
+    provider_name_str = str(provider_name or "")
+    provider_name_lc = provider_name_str.lower()
+
+    # Normalize accidental "Bearer <key>" pastes. SDK adds "Bearer" itself.
+    if isinstance(api_key, str):
+        token = api_key.strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        api_key = token
+
+    # Custom-provider key fallback from env (useful for manual env setup).
+    if details.get("is_custom", False) and not api_key:
+        env_key_name = "KYBER_CUSTOM_PROVIDER_" + "".join(
+            ch if ch.isalnum() else "_" for ch in provider_name_str.upper()
+        ) + "_API_KEY"
+        api_key = (os.environ.get(env_key_name, "") or "").strip()
+        if not api_key and "minimax" in provider_name_lc:
+            api_key = (os.environ.get("MINIMAX_API_KEY", "") or "").strip()
     
     if details.get("is_custom", False) and not api_key:
         console.print(f"[red]Error: Custom provider '{provider_name}' requires an API key.[/red]")
@@ -235,10 +256,13 @@ def _create_agent(
     
     # Map provider name to OpenAIProvider's expected format
     provider_type = "openrouter"  # default
-    if "openai" in provider_name.lower():
+    if "openai" in provider_name_lc:
         provider_type = "openai"
-    elif "anthropic" in provider_name.lower():
+    elif "anthropic" in provider_name_lc:
         provider_type = "anthropic"
+    elif "z.ai" in provider_name_lc or details.get("is_custom"):
+        # z.ai and other custom providers use OpenAI-compatible API
+        provider_type = "openai"
     
     provider = OpenAIProvider(
         api_key=api_key,
@@ -254,6 +278,37 @@ def _create_agent(
     if soul_path.exists():
         persona = soul_path.read_text(encoding="utf-8")
 
+    # ── Progress callback for status updates ──
+    async def _progress_callback(channel: str, chat_id: str, status_line: str, status_key: str = "") -> None:
+        """Send tool execution progress to the appropriate channel."""
+        if not channels:
+            return
+        channel_obj = channels.get_channel(channel)
+        if not channel_obj:
+            return
+        # Discord has start/update/clear_status_message methods
+        if hasattr(channel_obj, "update_status_message"):
+            try:
+                chat_id_int = int(chat_id)
+                if status_line == "__KYBER_STATUS_START__" and hasattr(channel_obj, "start_status_message"):
+                    try:
+                        await channel_obj.start_status_message(chat_id_int, status_key)
+                    except TypeError:
+                        await channel_obj.start_status_message(chat_id_int)
+                    return
+                if status_line == "__KYBER_STATUS_END__" and hasattr(channel_obj, "clear_status_message"):
+                    try:
+                        await channel_obj.clear_status_message(chat_id_int, status_key)
+                    except TypeError:
+                        await channel_obj.clear_status_message(chat_id_int)
+                    return
+                try:
+                    await channel_obj.update_status_message(chat_id_int, status_line, status_key)
+                except TypeError:
+                    await channel_obj.update_status_message(chat_id_int, status_line)
+            except (ValueError, TypeError):
+                pass
+
     # ── AgentCore (hermes-style) ──
     return AgentCore(
         bus=bus,
@@ -263,6 +318,7 @@ def _create_agent(
         model=model,
         task_history_path=task_history_path,
         timezone=config.agents.defaults.timezone or None,
+        progress_callback=_progress_callback if channels else None,
     )
 
 
@@ -364,6 +420,7 @@ def gateway(
     from kyber.channels.manager import ChannelManager
     from kyber.cron.service import CronService
     from kyber.cron.types import CronJob
+    from kyber.cron.paths import get_cron_store_path
     from kyber.heartbeat.service import HeartbeatService
     from kyber.gateway.api import create_gateway_app
     
@@ -434,11 +491,17 @@ def gateway(
     # Create components
     bus = MessageBus()
     
+    # Create channel manager first (so agent can reference it for progress callbacks)
+    channels = ChannelManager(config, bus)
+    
     agent = _create_orchestrator(
         config,
         bus,
         task_history_path=get_data_dir() / "tasks" / "history.jsonl",
+        channels=channels,
     )
+    
+    # Note: Discord typing indicators are handled directly in DiscordChannel class
     
     # Create cron service
     async def on_cron_job(job: CronJob) -> str | None:
@@ -484,7 +547,7 @@ def gateway(
             ))
         return response
     
-    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron_store_path = get_cron_store_path()
     user_tz = config.agents.defaults.timezone or None
     cron = CronService(cron_store_path, on_job=on_cron_job, timezone=user_tz)
 
@@ -508,8 +571,8 @@ def gateway(
         enabled=True
     )
     
-    # Create channel manager
-    channels = ChannelManager(config, bus)
+    # Channel manager was already created above and passed to the agent
+    # channels = ChannelManager(config, bus)  # REMOVED: duplicate was breaking progress callbacks
     
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
@@ -932,10 +995,10 @@ def cron_list(
     all: bool = typer.Option(False, "--all", "-a", help="Include disabled jobs"),
 ):
     """List scheduled jobs."""
-    from kyber.config.loader import get_data_dir
+    from kyber.cron.paths import get_cron_store_path
     from kyber.cron.service import CronService
     
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = get_cron_store_path()
     service = CronService(store_path)
     
     jobs = service.list_jobs(include_disabled=all)
@@ -986,7 +1049,7 @@ def cron_add(
     channel: str = typer.Option(None, "--channel", help="Channel for delivery (e.g. 'telegram', 'whatsapp')"),
 ):
     """Add a scheduled job."""
-    from kyber.config.loader import get_data_dir
+    from kyber.cron.paths import get_cron_store_path
     from kyber.cron.service import CronService
     from kyber.cron.types import CronSchedule
     
@@ -1003,7 +1066,7 @@ def cron_add(
         console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
         raise typer.Exit(1)
     
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = get_cron_store_path()
     service = CronService(store_path)
     
     job = service.add_job(
@@ -1023,10 +1086,10 @@ def cron_remove(
     job_id: str = typer.Argument(..., help="Job ID to remove"),
 ):
     """Remove a scheduled job."""
-    from kyber.config.loader import get_data_dir
+    from kyber.cron.paths import get_cron_store_path
     from kyber.cron.service import CronService
     
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = get_cron_store_path()
     service = CronService(store_path)
     
     if service.remove_job(job_id):
@@ -1041,10 +1104,10 @@ def cron_enable(
     disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
 ):
     """Enable or disable a job."""
-    from kyber.config.loader import get_data_dir
+    from kyber.cron.paths import get_cron_store_path
     from kyber.cron.service import CronService
     
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = get_cron_store_path()
     service = CronService(store_path)
     
     job = service.enable_job(job_id, enabled=not disable)
@@ -1061,10 +1124,10 @@ def cron_run(
     force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
 ):
     """Manually run a job."""
-    from kyber.config.loader import get_data_dir
+    from kyber.cron.paths import get_cron_store_path
     from kyber.cron.service import CronService
     
-    store_path = get_data_dir() / "cron" / "jobs.json"
+    store_path = get_cron_store_path()
     service = CronService(store_path)
     
     async def run():

@@ -93,8 +93,6 @@ BUILTIN_PROVIDERS = [
     "deepseek",
     "anthropic",
     "openai",
-    "gemini",
-    "groq",
     "chatgpt_subscription",
 ]
 
@@ -253,7 +251,7 @@ class Config(BaseSettings):
             prov = getattr(self.providers, name)
             if getattr(prov, "api_key", "") and getattr(prov, "model", ""):
                 return prov.model
-        return "openrouter/google/gemini-3-flash-preview"
+        return "openrouter/anthropic/claude-sonnet-4"
 
     def is_custom_provider(self) -> bool:
         """Check if the active provider is a custom one."""

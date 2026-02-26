@@ -451,16 +451,37 @@ def create_dashboard_app(config: Config) -> FastAPI:
         # Always talk to localhost; gateway binds based on its own config.
         return f"http://127.0.0.1:{cfg.gateway.port}"
 
-    async def _proxy_gateway(request: Request, method: str, path: str, json_body: Any | None = None) -> JSONResponse:
+    async def _proxy_gateway(
+        request: Request,
+        method: str,
+        path: str,
+        json_body: Any | None = None,
+        timeout: float = 10.0,
+    ) -> JSONResponse:
         token = request.app.state.auth_token
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         url = _gateway_base() + path
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.request(method, url, headers=headers, json=json_body)
         except (httpx.ConnectError, httpx.ConnectTimeout):
             return JSONResponse(
                 {"error": "Gateway is not running. Start it with: kyber gateway"},
+                status_code=502,
+            )
+        except httpx.ReadTimeout:
+            return JSONResponse(
+                {"error": f"Gateway request timed out after {int(timeout)}s"},
+                status_code=504,
+            )
+        if path.startswith("/chat/") and resp.status_code == 404:
+            return JSONResponse(
+                {
+                    "error": (
+                        "Gateway is running without dashboard chat endpoints. "
+                        "Restart the gateway service and try again."
+                    )
+                },
                 status_code=502,
             )
         # Pass through status and body
@@ -485,6 +506,26 @@ def create_dashboard_app(config: Config) -> FastAPI:
     @app.post("/api/tasks/{ref}/redeliver", dependencies=[Depends(_require_token)])
     async def redeliver_task(request: Request, ref: str) -> JSONResponse:
         return await _proxy_gateway(request, "POST", f"/tasks/{ref}/redeliver")
+
+    @app.post("/api/chat/turn", dependencies=[Depends(_require_token)])
+    async def chat_turn(request: Request, body: dict[str, Any]) -> JSONResponse:
+        return await _proxy_gateway(
+            request,
+            "POST",
+            "/chat/turn",
+            json_body=body,
+            timeout=180.0,
+        )
+
+    @app.post("/api/chat/reset", dependencies=[Depends(_require_token)])
+    async def chat_reset(request: Request, body: dict[str, Any] | None = None) -> JSONResponse:
+        return await _proxy_gateway(
+            request,
+            "POST",
+            "/chat/reset",
+            json_body=body or {},
+            timeout=30.0,
+        )
 
     @app.get("/api/skills", dependencies=[Depends(_require_token)])
     async def get_skills() -> JSONResponse:
@@ -744,21 +785,42 @@ def create_dashboard_app(config: Config) -> FastAPI:
                 api_base = api_base.strip() or None
             logger.info(f"Fetching models for {provider_name}, api_base={api_base!r}")
             models = await fetch_provider_models(provider_name, api_key or "", api_base)
-            return JSONResponse({"models": models})
+            return JSONResponse({"models": models, "modelListingUnsupported": False})
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code == 404:
+                # Some OpenAI-compatible providers (e.g. MiniMax) do not expose
+                # a /models endpoint. Keep setup usable by allowing manual model entry.
+                logger.info(
+                    f"Provider {provider_name} does not expose /models (api_base={api_base!r}); "
+                    "falling back to manual model selection."
+                )
+                return JSONResponse(
+                    {
+                        "models": [],
+                        "modelListingUnsupported": True,
+                        "error": "This provider does not expose a models listing endpoint.",
+                    }
+                )
+            logger.warning(f"Failed to fetch models for {provider_name}: {e}")
+            return JSONResponse(
+                {"error": str(e), "models": [], "modelListingUnsupported": False},
+                status_code=502,
+            )
         except Exception as e:
             logger.warning(f"Failed to fetch models for {provider_name}: {e}")
             return JSONResponse(
-                {"error": str(e), "models": []},
+                {"error": str(e), "models": [], "modelListingUnsupported": False},
                 status_code=502,
             )
 
     # ── Cron Jobs API ──
 
     def _cron_service():
-        from kyber.config.loader import get_data_dir
+        from kyber.cron.paths import get_cron_store_path
         from kyber.cron.service import CronService
         cfg = load_config()
-        store_path = get_data_dir() / "cron" / "jobs.json"
+        store_path = get_cron_store_path()
         user_tz = cfg.agents.defaults.timezone or None
         return CronService(store_path, timezone=user_tz)
 

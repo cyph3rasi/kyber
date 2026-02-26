@@ -1,0 +1,2 @@
+[console_scripts]
+kyber = kyber.cli.commands:app
