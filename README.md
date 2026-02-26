@@ -10,7 +10,6 @@
 
 <p align="center">
   <a href="https://pypi.org/project/kyber-chat/"><img alt="PyPI" src="https://img.shields.io/pypi/v/kyber-chat?label=PyPI&color=0f766e"></a>
-  <a href="https://pypi.org/project/kyber-chat/"><img alt="Python Versions" src="https://img.shields.io/pypi/pyversions/kyber-chat?color=1d4ed8"></a>
   <a href="https://docs.kyber.chat"><img alt="Docs" src="https://img.shields.io/badge/docs-kyber.chat-7c3aed"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-16a34a"></a>
 </p>
@@ -29,6 +28,8 @@ Installer flow:
 - Optionally sets up service mode
 
 ## Why Kyber
+
+Most assistants are fine for simple Q&A, then fall apart when the real work starts. Kyber is built for actual execution: it can run multi-step tasks, keep you updated while it works, and stay responsive to new messages without getting stuck. You get the speed of chat plus the reliability of a real automation runtime.
 
 - `Fast setup` One command to install, configure, and run
 - `Actually concurrent` Long-running tasks do not block new messages
@@ -61,21 +62,6 @@ Installer flow:
 - Cancel misfired tasks from UI or API
 - Review security scan findings and history
 
-## Quick Start
-
-```bash
-# 1) Start gateway (agent + channels + local API)
-kyber gateway
-
-# 2) Optional: open web dashboard
-kyber dashboard
-
-# 3) Or chat directly in terminal
-kyber agent -m "Review this repo and find dead code."
-```
-
-Docs: [docs.kyber.chat](https://docs.kyber.chat)
-
 ## Provider Flexibility
 
 Kyber works with:
@@ -83,7 +69,6 @@ Kyber works with:
 - Anthropic
 - OpenRouter
 - DeepSeek
-- MiniMax
 - Any OpenAI-compatible endpoint
 
 You can select the provider/model during onboarding and change it later from the dashboard.
@@ -129,9 +114,6 @@ kyber: schedules cron -> runs checks -> posts concise summaries on schedule
 ### Agent
 ![Kyber Dashboard Agent Settings](.github/assets/readme/agent.png)
 
-### Discord Bot Personas
-![Kyber Dashboard Discord Bot Personas](.github/assets/readme/discordbotpersonas.png)
-
 ### Cron Jobs
 ![Kyber Dashboard Cron Jobs](.github/assets/readme/cronjobs.png)
 
@@ -140,6 +122,9 @@ kyber: schedules cron -> runs checks -> posts concise summaries on schedule
 
 ### Security Center
 ![Kyber Dashboard Security Center](.github/assets/readme/securitycenter.png)
+
+### Discord Bot Personas
+![Kyber Dashboard Discord Bot Personas](.github/assets/readme/discordbotpersonas.png)
 
 ## Security And Reliability
 
@@ -151,7 +136,7 @@ kyber: schedules cron -> runs checks -> posts concise summaries on schedule
 ## Project Links
 
 - Documentation: [docs.kyber.chat](https://docs.kyber.chat)
-- GitHub: [github.com/axedric/kyber](https://github.com/axedric/kyber)
+- GitHub: [github.com/cyph3rasi/kyber](https://github.com/cyph3rasi/kyber/)
 - Community: [discord.gg/HJCFXTz2bE](https://discord.gg/HJCFXTz2bE)
 - Updates: [x.com/Kyber_chat](https://x.com/Kyber_chat)
 
