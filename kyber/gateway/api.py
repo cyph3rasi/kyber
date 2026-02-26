@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_404_NOT_FOUND
 
-from kyber.agent.orchestrator import Orchestrator
+from kyber.agent.core import AgentCore
 from kyber.agent.task_registry import Task, TaskStatus
 from kyber.logging.error_store import clear_errors, get_errors
 from kyber.bus.events import OutboundMessage
@@ -86,7 +86,7 @@ def _is_dashboard_visible_task(t: Task) -> bool:
     return True
 
 
-def create_gateway_app(agent: Orchestrator, token: str) -> FastAPI:
+def create_gateway_app(agent: AgentCore, token: str) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     require = _require_token(token)
 
