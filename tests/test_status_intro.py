@@ -15,6 +15,7 @@ class _SummaryProvider(LLMProvider):
         super().__init__(api_key=None, api_base=None)
         self._content = content
         self._should_fail = should_fail
+        self.chat_calls = 0
 
     async def chat(
         self,
@@ -26,6 +27,7 @@ class _SummaryProvider(LLMProvider):
         temperature: float = 0.7,
     ) -> LLMResponse:
         del messages, tools, model, tool_choice, max_tokens, temperature
+        self.chat_calls += 1
         if self._should_fail:
             raise RuntimeError("provider unavailable")
         return LLMResponse(content=self._content)
@@ -38,18 +40,29 @@ def _make_core(workspace: Path, provider: LLMProvider) -> AgentCore:
     return AgentCore(bus=MessageBus(), provider=provider, workspace=workspace)
 
 
-def test_status_intro_uses_llm_rephrase_and_prefix() -> None:
+def test_status_intro_uses_direct_text_and_prefix() -> None:
     with TemporaryDirectory() as td:
-        core = _make_core(Path(td), _SummaryProvider("✅ Task: Summarize inbox every 3 hours."))
+        provider = _SummaryProvider("ignored")
+        core = _make_core(Path(td), provider)
         intro = asyncio.run(core._build_status_intro("read my inbox and summarize it every 3 hours"))
-        assert intro == "✅ Task: Summarize inbox every 3 hours."
+        assert intro == "✅ Task: read my inbox and summarize it every 3 hours"
+        assert provider.chat_calls == 0
 
 
-def test_status_intro_falls_back_when_summary_fails() -> None:
+def test_status_intro_normalizes_whitespace() -> None:
     with TemporaryDirectory() as td:
-        core = _make_core(Path(td), _SummaryProvider(should_fail=True))
+        provider = _SummaryProvider(should_fail=True)
+        core = _make_core(Path(td), provider)
         intro = asyncio.run(core._build_status_intro("   set up hourly digest for alerts   "))
         assert intro == "✅ Task: set up hourly digest for alerts"
+        assert provider.chat_calls == 0
+
+
+def test_status_intro_truncates_long_text() -> None:
+    with TemporaryDirectory() as td:
+        core = _make_core(Path(td), _SummaryProvider(None))
+        intro = asyncio.run(core._build_status_intro("a" * 130))
+        assert intro == f"✅ Task: {'a' * 117}..."
 
 
 def test_status_intro_empty_content() -> None:
