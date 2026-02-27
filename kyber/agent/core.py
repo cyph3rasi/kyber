@@ -480,6 +480,24 @@ class AgentCore:
         status_started = False
 
         try:
+            if self.progress_callback:
+                try:
+                    await self.progress_callback(
+                        context_channel,
+                        context_chat_id,
+                        "__KYBER_STATUS_START__",
+                        context_status_key,
+                    )
+                    await self.progress_callback(
+                        context_channel,
+                        context_chat_id,
+                        context_status_intro or "✅ Task: In progress.",
+                        context_status_key,
+                    )
+                    status_started = True
+                except Exception:
+                    pass
+
             while True:
                 if self.max_iterations > 0 and iteration >= self.max_iterations:
                     break
@@ -532,25 +550,6 @@ class AgentCore:
                             self._running_tasks_by_task_id[task.id] = cur
                         if task_tracker is not None:
                             task_tracker["id"] = task.id
-
-                    # Start status message on first tool call
-                    if not status_started and self.progress_callback:
-                        try:
-                            await self.progress_callback(
-                                context_channel,
-                                context_chat_id,
-                                "__KYBER_STATUS_START__",
-                                context_status_key,
-                            )
-                            await self.progress_callback(
-                                context_channel,
-                                context_chat_id,
-                                context_status_intro or "✅ Task: In progress.",
-                                context_status_key,
-                            )
-                            status_started = True
-                        except Exception:
-                            pass
 
                     # Add assistant message with tool calls to conversation
                     assistant_msg = self._build_tool_call_message(response)

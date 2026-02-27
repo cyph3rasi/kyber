@@ -127,6 +127,7 @@ Skills with available="false" need dependencies installed first - you can try in
             "- **web_search** — Search the web via Brave Search\n"
             "- **web_fetch** — Fetch and extract content from a URL\n"
             "- **message** — Send a message to a chat channel/user\n\n"
+            "- **mcp_list_servers / mcp_list_tools / mcp_call_tool** — Discover and use configured MCP servers\n\n"
             "### Guidelines\n"
             "- **Be direct.** Call tools when needed, don't ask permission first.\n"
             "- **Be concise.** Respect the user's time.\n"

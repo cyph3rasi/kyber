@@ -647,6 +647,19 @@ def create_dashboard_app(config: Config) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.post("/api/mcp/servers/test", dependencies=[Depends(_require_token)])
+    async def test_mcp_server_api(body: dict[str, Any]) -> JSONResponse:
+        server_name = str(body.get("name", "") or "").strip()
+        if not server_name:
+            raise HTTPException(status_code=400, detail="name is required")
+        try:
+            from kyber.agent.tools.mcp import test_mcp_server
+
+            result = await test_mcp_server(server_name)
+            return JSONResponse(result)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     @app.put("/api/config", dependencies=[Depends(_require_token)])
     async def update_config(body: dict[str, Any]) -> JSONResponse:
         data = convert_keys(body)

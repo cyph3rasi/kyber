@@ -1609,7 +1609,7 @@ wheels = [
 
 [[package]]
 name = "kyber-chat"
-version = "2026.2.27.10"
+version = "2026.2.27.11"
 source = { editable = "." }
 dependencies = [
     { name = "cisco-ai-skill-scanner" },
@@ -1618,6 +1618,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "loguru" },
+    { name = "mcp" },
     { name = "openhands-sdk" },
     { name = "openhands-tools" },
     { name = "pydantic" },
@@ -1646,6 +1647,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.25.0" },
     { name = "loguru", specifier = ">=0.7.0" },
+    { name = "mcp", specifier = ">=1.17.0" },
     { name = "openhands-sdk", specifier = ">=1.11.4" },
     { name = "openhands-tools", specifier = ">=1.11.4" },
     { name = "pydantic", specifier = ">=2.0.0" },

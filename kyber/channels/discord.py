@@ -1,7 +1,6 @@
 """Discord channel implementation using discord.py."""
 
 import asyncio
-import time
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +8,6 @@ from loguru import logger
 
 from kyber.bus.events import OutboundMessage
 from kyber.bus.queue import MessageBus
-from kyber.agent.display import format_duration
 from kyber.channels.base import BaseChannel
 from kyber.channels.errors import PermanentDeliveryError, TemporaryDeliveryError
 from kyber.config.schema import DiscordConfig
@@ -42,8 +40,8 @@ class DiscordChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
         self._typing_counts: dict[int, int] = {}
-        # Status message tracking: (chat_id, status_key) -> (message, start_time, tool_lines)
-        self._status_messages: dict[tuple[int, str], tuple["discord.Message", float, list[str]]] = {}
+        # Status message tracking: (chat_id, status_key) -> (message, tool_lines)
+        self._status_messages: dict[tuple[int, str], tuple["discord.Message", list[str]]] = {}
         self._status_lock = asyncio.Lock()
     
     async def start(self) -> None:
@@ -321,7 +319,7 @@ class DiscordChannel(BaseChannel):
 
         # Clean up any existing status message for this specific task scope
         if scope_key in self._status_messages:
-            old_msg, _, _ = self._status_messages[scope_key]
+            old_msg, _ = self._status_messages[scope_key]
             try:
                 await old_msg.delete()
             except Exception:
@@ -336,7 +334,7 @@ class DiscordChannel(BaseChannel):
             
             content = "💎 Working..."
             msg = await channel.send(content)
-            self._status_messages[scope_key] = (msg, time.time(), [])
+            self._status_messages[scope_key] = (msg, [])
         except Exception as e:
             logger.debug(f"Failed to create status message: {e}")
 
@@ -347,7 +345,7 @@ class DiscordChannel(BaseChannel):
         
         Args:
             channel_id: The Discord channel ID
-            tool_line: A formatted tool status line (e.g., "┊ 🔍 search    query  1.2s")
+            tool_line: A formatted tool status line.
         """
         if not self._client or not self._ready.is_set():
             return
@@ -361,7 +359,7 @@ class DiscordChannel(BaseChannel):
                 if scope_key not in self._status_messages:
                     return
             
-            msg, start_time, tool_lines = self._status_messages[scope_key]
+            msg, tool_lines = self._status_messages[scope_key]
             tool_lines.append(tool_line)
             
             # Keep only the last 15 tool lines to avoid message getting too long
@@ -369,8 +367,7 @@ class DiscordChannel(BaseChannel):
                 tool_lines = tool_lines[-15:]
             
             try:
-                elapsed = time.time() - start_time
-                header = f"💎 Working... ({format_duration(elapsed)})\n"
+                header = "💎 Working...\n"
                 content = header + "\n".join(tool_lines)
                 
                 # Discord message limit is 2000 chars
@@ -378,7 +375,7 @@ class DiscordChannel(BaseChannel):
                     content = content[:1950] + "\n..."
                 
                 await msg.edit(content=content)
-                self._status_messages[scope_key] = (msg, start_time, tool_lines)
+                self._status_messages[scope_key] = (msg, tool_lines)
             except discord.NotFound:
                 # Message was deleted, clean up
                 self._status_messages.pop(scope_key, None)
@@ -392,7 +389,7 @@ class DiscordChannel(BaseChannel):
             if scope_key not in self._status_messages:
                 return
             
-            msg, _, _ = self._status_messages.pop(scope_key)
+            msg, _ = self._status_messages.pop(scope_key)
             try:
                 await msg.delete()
             except Exception:

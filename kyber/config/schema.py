@@ -124,7 +124,6 @@ class DashboardConfig(BaseModel):
 
 class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
-    timeout: int = 60
     restrict_to_workspace: bool = False  # If true, block commands accessing paths outside workspace
 
 
@@ -141,11 +140,31 @@ class SkillScannerConfig(BaseModel):
     enable_meta: bool = True  # Enable meta-analyzer for false positive filtering
 
 
+class MCPServerConfig(BaseModel):
+    """Single MCP server definition (stdio transport)."""
+    name: str = ""
+    enabled: bool = True
+    transport: str = "stdio"  # "stdio" or "http"
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str = ""
+    url: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: int = 30
+
+
+class MCPToolsConfig(BaseModel):
+    """MCP tool integration config."""
+    servers: list[MCPServerConfig] = Field(default_factory=list)
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     skill_scanner: SkillScannerConfig = Field(default_factory=SkillScannerConfig)
+    mcp: MCPToolsConfig = Field(default_factory=MCPToolsConfig)
 
 
 class Config(BaseSettings):

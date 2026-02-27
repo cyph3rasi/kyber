@@ -263,7 +263,9 @@ async function loadConfig() {
   }
 }
 
-async function saveConfig() {
+async function saveConfig(opts = {}) {
+  const showNotifications = opts.showNotifications !== false;
+  const rerender = opts.rerender !== false;
   if (!config) return;
   let payload = config;
 
@@ -271,7 +273,10 @@ async function saveConfig() {
     const ta = contentBody.querySelector('.json-editor');
     if (ta) {
       try { payload = JSON.parse(ta.value); }
-      catch { showToast('Invalid JSON', 'error'); return; }
+      catch {
+        if (showNotifications) showToast('Invalid JSON', 'error');
+        return false;
+      }
     }
   }
 
@@ -283,15 +288,19 @@ async function saveConfig() {
     delete config._gatewayRestarted;
     delete config._gatewayMessage;
     savedAt.textContent = 'Saved ' + new Date().toLocaleTimeString();
-    if (gwRestarted) {
-      showToast('Saved — gateway restarted', 'success');
-    } else {
-      showToast('Saved — gateway restart failed: ' + (gwMessage || 'unknown'), 'error');
+    if (showNotifications) {
+      if (gwRestarted) {
+        showToast('Saved — gateway restarted', 'success');
+      } else {
+        showToast('Saved — gateway restart failed: ' + (gwMessage || 'unknown'), 'error');
+      }
     }
     markClean();
-    renderSection();
+    if (rerender) renderSection();
+    return true;
   } catch {
-    showToast('Save failed', 'error');
+    if (showNotifications) showToast('Save failed', 'error');
+    return false;
   }
 }
 
@@ -981,6 +990,425 @@ function renderTools(data) {
     const card = makeCard('Shell Execution');
     renderFields(card.body, data.exec, ['tools', 'exec']);
   }
+  if (data.mcp) {
+    const card = makeCard('MCP Servers');
+    const toolsCfg = config.tools || (config.tools = {});
+    const mcpCfg = toolsCfg.mcp || (toolsCfg.mcp = {});
+    if (!Array.isArray(mcpCfg.servers)) {
+      mcpCfg.servers = Array.isArray(data.mcp.servers) ? data.mcp.servers : [];
+    }
+    const servers = mcpCfg.servers;
+
+    const intro = document.createElement('div');
+    intro.className = 'tasks-hint';
+    intro.textContent = 'MCP lets Kyber connect to external tool servers.';
+    card.body.appendChild(intro);
+
+    const intro2 = document.createElement('div');
+    intro2.className = 'tasks-hint';
+    intro2.style.marginTop = '4px';
+    intro2.textContent = 'Choose connection type: Local Command (runs a process) or Remote URL (HTTP server like mcp.stripe.com).';
+    card.body.appendChild(intro2);
+
+    const topActions = document.createElement('div');
+    topActions.className = 'tasks-controls';
+    topActions.style.marginTop = '12px';
+    card.body.appendChild(topActions);
+
+    const addServerBtn = document.createElement('button');
+    addServerBtn.className = 'btn btn-primary';
+    addServerBtn.textContent = 'Add MCP Server';
+    topActions.appendChild(addServerBtn);
+
+    const listWrap = document.createElement('div');
+    listWrap.style.marginTop = '12px';
+    card.body.appendChild(listWrap);
+
+    const defaultServer = () => ({
+      name: '',
+      enabled: true,
+      transport: 'stdio',
+      command: '',
+      args: [],
+      env: {},
+      cwd: '',
+      url: '',
+      headers: {},
+      timeoutSeconds: 30,
+    });
+
+    const normalizeServer = (server) => {
+      if (!server || typeof server !== 'object') return defaultServer();
+      const transport = String(server.transport || 'stdio').toLowerCase();
+      server.transport = (transport === 'http') ? 'http' : 'stdio';
+      if (!Array.isArray(server.args)) server.args = [];
+      if (!server.env || typeof server.env !== 'object' || Array.isArray(server.env)) server.env = {};
+      if (!server.headers || typeof server.headers !== 'object' || Array.isArray(server.headers)) server.headers = {};
+      if (typeof server.enabled !== 'boolean') server.enabled = true;
+      if (typeof server.timeoutSeconds !== 'number' || Number.isNaN(server.timeoutSeconds)) server.timeoutSeconds = 30;
+      if (typeof server.name !== 'string') server.name = '';
+      if (typeof server.command !== 'string') server.command = '';
+      if (typeof server.cwd !== 'string') server.cwd = '';
+      if (typeof server.url !== 'string') server.url = '';
+      return server;
+    };
+
+    const buildTextField = (labelText, value, onInput, placeholder = '') => {
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      const label = document.createElement('div');
+      label.className = 'field-label';
+      label.textContent = labelText;
+      row.appendChild(label);
+      const inputWrap = document.createElement('div');
+      inputWrap.className = 'field-input';
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.value = value || '';
+      inp.placeholder = placeholder;
+      inp.addEventListener('input', () => onInput(inp.value));
+      inputWrap.appendChild(inp);
+      row.appendChild(inputWrap);
+      return row;
+    };
+
+    const buildMapEditor = (labelText, mapObj, onChange, addLabel) => {
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      row.style.alignItems = 'flex-start';
+      const label = document.createElement('div');
+      label.className = 'field-label';
+      label.style.paddingTop = '8px';
+      label.textContent = labelText;
+      row.appendChild(label);
+      const wrap = document.createElement('div');
+      wrap.className = 'field-input array-field';
+      row.appendChild(wrap);
+
+      const render = () => {
+        const pairs = Object.entries(mapObj || {});
+        wrap.innerHTML = '';
+        if (!pairs.length) pairs.push(['', '']);
+
+        const commit = () => {
+          const next = {};
+          pairs.forEach(([k, v]) => {
+            const key = (k || '').trim();
+            if (key) next[key] = v || '';
+          });
+          onChange(next);
+          markDirty();
+        };
+
+        pairs.forEach((pair, pairIdx) => {
+          const r = document.createElement('div');
+          r.className = 'array-row';
+          const keyInp = document.createElement('input');
+          keyInp.type = 'text';
+          keyInp.placeholder = 'KEY';
+          keyInp.value = pair[0] || '';
+          keyInp.addEventListener('input', () => {
+            pair[0] = keyInp.value;
+            commit();
+          });
+          r.appendChild(keyInp);
+          const valInp = document.createElement('input');
+          valInp.type = 'text';
+          valInp.placeholder = 'value';
+          valInp.value = pair[1] || '';
+          valInp.addEventListener('input', () => {
+            pair[1] = valInp.value;
+            commit();
+          });
+          r.appendChild(valInp);
+          const del = document.createElement('button');
+          del.className = 'btn-icon danger';
+          del.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+          del.addEventListener('click', () => {
+            pairs.splice(pairIdx, 1);
+            commit();
+            render();
+          });
+          r.appendChild(del);
+          wrap.appendChild(r);
+        });
+
+        const add = document.createElement('button');
+        add.className = 'btn-add';
+        add.innerHTML = `<svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg> ${addLabel}`;
+        add.addEventListener('click', () => {
+          pairs.push(['', '']);
+          render();
+        });
+        wrap.appendChild(add);
+      };
+
+      render();
+      return row;
+    };
+
+    const buildArgsEditor = (args, onChange) => {
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      row.style.alignItems = 'flex-start';
+      const label = document.createElement('div');
+      label.className = 'field-label';
+      label.style.paddingTop = '8px';
+      label.textContent = 'Arguments';
+      row.appendChild(label);
+      const wrap = document.createElement('div');
+      wrap.className = 'field-input array-field';
+      row.appendChild(wrap);
+
+      const render = () => {
+        wrap.innerHTML = '';
+        (args || []).forEach((arg, argIdx) => {
+          const r = document.createElement('div');
+          r.className = 'array-row';
+          const inp = document.createElement('input');
+          inp.type = 'text';
+          inp.placeholder = 'argument';
+          inp.value = arg || '';
+          inp.addEventListener('input', () => {
+            args[argIdx] = inp.value;
+            onChange(args);
+            markDirty();
+          });
+          r.appendChild(inp);
+          const del = document.createElement('button');
+          del.className = 'btn-icon danger';
+          del.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+          del.addEventListener('click', () => {
+            args.splice(argIdx, 1);
+            onChange(args);
+            markDirty();
+            render();
+          });
+          r.appendChild(del);
+          wrap.appendChild(r);
+        });
+        const add = document.createElement('button');
+        add.className = 'btn-add';
+        add.innerHTML = '<svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg> Add argument';
+        add.addEventListener('click', () => {
+          args.push('');
+          onChange(args);
+          markDirty();
+          render();
+        });
+        wrap.appendChild(add);
+      };
+
+      render();
+      return row;
+    };
+
+    const renderServers = () => {
+      listWrap.innerHTML = '';
+      if (!servers.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.textContent = 'No MCP servers yet. Add one to enable external MCP tools.';
+        listWrap.appendChild(empty);
+        return;
+      }
+
+      servers.forEach((server, idx) => {
+        const s = normalizeServer(server);
+
+        const box = document.createElement('div');
+        box.className = 'card';
+        box.style.marginTop = '10px';
+        box.style.border = '1px solid var(--border)';
+
+        const header = document.createElement('div');
+        header.className = 'card-header';
+        const title = document.createElement('span');
+        title.className = 'card-title';
+        title.textContent = s.name ? `Server: ${s.name}` : `Server ${idx + 1}`;
+        header.appendChild(title);
+
+        const headerActions = document.createElement('div');
+        headerActions.className = 'tasks-controls';
+        const testBtn = document.createElement('button');
+        testBtn.className = 'btn btn-ghost';
+        testBtn.textContent = 'Test';
+        headerActions.appendChild(testBtn);
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'btn btn-ghost';
+        removeBtn.textContent = 'Remove';
+        headerActions.appendChild(removeBtn);
+        header.appendChild(headerActions);
+        box.appendChild(header);
+
+        const body = document.createElement('div');
+        body.className = 'card-body';
+        box.appendChild(body);
+
+        body.appendChild(buildTextField('Name', s.name, (val) => {
+          s.name = val;
+          markDirty();
+          title.textContent = s.name ? `Server: ${s.name}` : `Server ${idx + 1}`;
+        }, 'filesystem'));
+
+        const enabledRow = document.createElement('div');
+        enabledRow.className = 'field-row';
+        const enabledLabel = document.createElement('div');
+        enabledLabel.className = 'field-label';
+        enabledLabel.textContent = 'Enabled';
+        enabledRow.appendChild(enabledLabel);
+        const enabledWrap = document.createElement('div');
+        enabledWrap.className = 'field-input';
+        const enabledCheckboxWrap = document.createElement('div');
+        enabledCheckboxWrap.className = 'checkbox-wrap';
+        const enabledCb = document.createElement('input');
+        enabledCb.type = 'checkbox';
+        enabledCb.checked = s.enabled !== false;
+        const enabledText = document.createElement('label');
+        enabledText.className = 'checkbox-label';
+        enabledText.textContent = enabledCb.checked ? 'Yes' : 'No';
+        enabledCb.addEventListener('change', () => {
+          s.enabled = enabledCb.checked;
+          enabledText.textContent = enabledCb.checked ? 'Yes' : 'No';
+          markDirty();
+        });
+        enabledCheckboxWrap.appendChild(enabledCb);
+        enabledCheckboxWrap.appendChild(enabledText);
+        enabledWrap.appendChild(enabledCheckboxWrap);
+        enabledRow.appendChild(enabledWrap);
+        body.appendChild(enabledRow);
+
+        const transportRow = document.createElement('div');
+        transportRow.className = 'field-row';
+        const transportLabel = document.createElement('div');
+        transportLabel.className = 'field-label';
+        transportLabel.textContent = 'Connection Type';
+        transportRow.appendChild(transportLabel);
+        const transportWrap = document.createElement('div');
+        transportWrap.className = 'field-input';
+        const transportSel = document.createElement('select');
+        const optStdio = document.createElement('option');
+        optStdio.value = 'stdio';
+        optStdio.textContent = 'Local Command (stdio)';
+        const optHttp = document.createElement('option');
+        optHttp.value = 'http';
+        optHttp.textContent = 'Remote URL (HTTP)';
+        transportSel.appendChild(optStdio);
+        transportSel.appendChild(optHttp);
+        transportSel.value = s.transport || 'stdio';
+        transportSel.addEventListener('change', () => {
+          s.transport = transportSel.value;
+          markDirty();
+          renderServers();
+        });
+        transportWrap.appendChild(transportSel);
+        transportRow.appendChild(transportWrap);
+        body.appendChild(transportRow);
+
+        if (s.transport === 'http') {
+          body.appendChild(buildTextField('Server URL', s.url, (val) => {
+            s.url = val;
+            markDirty();
+          }, 'https://mcp.example.com'));
+          body.appendChild(buildMapEditor('Headers', s.headers || {}, (next) => {
+            s.headers = next;
+          }, 'Add header'));
+        } else {
+          body.appendChild(buildTextField('Command', s.command, (val) => {
+            s.command = val;
+            markDirty();
+          }, 'uvx'));
+          body.appendChild(buildTextField('Working Directory (optional)', s.cwd, (val) => {
+            s.cwd = val;
+            markDirty();
+          }, '/absolute/path'));
+          body.appendChild(buildArgsEditor(s.args || [], (next) => {
+            s.args = next;
+          }));
+          body.appendChild(buildMapEditor('Environment', s.env || {}, (next) => {
+            s.env = next;
+          }, 'Add env var'));
+        }
+
+        const timeoutRow = document.createElement('div');
+        timeoutRow.className = 'field-row';
+        const timeoutLabel = document.createElement('div');
+        timeoutLabel.className = 'field-label';
+        timeoutLabel.textContent = 'Timeout Seconds';
+        timeoutRow.appendChild(timeoutLabel);
+        const timeoutWrap = document.createElement('div');
+        timeoutWrap.className = 'field-input';
+        const timeoutInp = document.createElement('input');
+        timeoutInp.type = 'number';
+        timeoutInp.min = '1';
+        timeoutInp.value = String(s.timeoutSeconds || 30);
+        timeoutInp.addEventListener('input', () => {
+          const n = Number(timeoutInp.value);
+          s.timeoutSeconds = Number.isFinite(n) && n > 0 ? n : 30;
+          markDirty();
+        });
+        timeoutWrap.appendChild(timeoutInp);
+        timeoutRow.appendChild(timeoutWrap);
+        body.appendChild(timeoutRow);
+
+        const result = document.createElement('div');
+        result.className = 'tasks-hint';
+        result.style.marginTop = '8px';
+        body.appendChild(result);
+
+        testBtn.addEventListener('click', async () => {
+          if (!(s.name || '').trim()) {
+            showToast('Server name is required to run test', 'error');
+            return;
+          }
+          if (s.transport === 'http' && !(s.url || '').trim()) {
+            showToast('Server URL is required for Remote URL transport', 'error');
+            return;
+          }
+          if (s.transport !== 'http' && !(s.command || '').trim()) {
+            showToast('Command is required for Local Command transport', 'error');
+            return;
+          }
+          testBtn.disabled = true;
+          result.textContent = 'Saving changes...';
+          try {
+            const saved = await saveConfig({ showNotifications: false, rerender: false });
+            if (!saved) {
+              result.textContent = 'Save failed. Please review your fields and try again.';
+              showToast('Save failed — cannot run test', 'error');
+              return;
+            }
+            result.textContent = 'Testing server...';
+            const out = await testMcpServer(s.name);
+            const names = (out.tools || []).map((t) => t.name).slice(0, 5).join(', ');
+            result.textContent = `${out.count || 0} tools found${names ? `: ${names}` : ''}`;
+            showToast(`${s.name}: ${out.count || 0} tool(s)`, 'success');
+          } catch (e) {
+            result.textContent = e.message || String(e);
+            showToast(e.message || String(e), 'error');
+          } finally {
+            testBtn.disabled = false;
+          }
+        });
+
+        removeBtn.addEventListener('click', () => {
+          servers.splice(idx, 1);
+          markDirty();
+          renderServers();
+        });
+
+        listWrap.appendChild(box);
+      });
+    };
+
+    addServerBtn.addEventListener('click', () => {
+      servers.push(defaultServer());
+      markDirty();
+      renderServers();
+    });
+
+    renderServers();
+  }
 }
 
 function renderDashboard(data) {
@@ -1502,6 +1930,18 @@ async function updateAllSkills() {
     throw new Error(data.detail || data.error || 'Update failed');
   }
   return await res.json();
+}
+
+async function testMcpServer(name) {
+  const res = await apiFetch(`${API}/mcp/servers/test`, {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.detail || data.error || 'MCP server test failed');
+  }
+  return data;
 }
 
 function renderSkills() {

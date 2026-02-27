@@ -2,14 +2,12 @@
 
 import asyncio
 import re
-import time
 
 from loguru import logger
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-from kyber.agent.display import format_duration
 from kyber.bus.events import OutboundMessage
 from kyber.bus.queue import MessageBus
 from kyber.channels.base import BaseChannel
@@ -96,8 +94,8 @@ class TelegramChannel(BaseChannel):
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[int, asyncio.Task] = {}
         self._typing_counts: dict[int, int] = {}
-        # (chat_id, status_key) -> (message_id, start_time, tool_lines)
-        self._status_messages: dict[tuple[int, str], tuple[int, float, list[str]]] = {}
+        # (chat_id, status_key) -> (message_id, tool_lines)
+        self._status_messages: dict[tuple[int, str], tuple[int, list[str]]] = {}
         self._status_lock = asyncio.Lock()
     
     async def start(self) -> None:
@@ -382,7 +380,7 @@ class TelegramChannel(BaseChannel):
         scope_key = self._status_scope(chat_id, status_key)
 
         if scope_key in self._status_messages:
-            old_msg_id, _, _ = self._status_messages.pop(scope_key)
+            old_msg_id, _ = self._status_messages.pop(scope_key)
             try:
                 await self._app.bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
             except Exception:
@@ -390,7 +388,7 @@ class TelegramChannel(BaseChannel):
 
         try:
             msg = await self._app.bot.send_message(chat_id=chat_id, text="💎 Working...")
-            self._status_messages[scope_key] = (msg.message_id, time.time(), [])
+            self._status_messages[scope_key] = (msg.message_id, [])
         except Exception as e:
             logger.debug(f"Failed to create Telegram status message: {e}")
 
@@ -406,13 +404,12 @@ class TelegramChannel(BaseChannel):
                 if scope_key not in self._status_messages:
                     return
 
-            msg_id, start_time, tool_lines = self._status_messages[scope_key]
+            msg_id, tool_lines = self._status_messages[scope_key]
             tool_lines.append(tool_line)
             if len(tool_lines) > 15:
                 tool_lines = tool_lines[-15:]
 
-            elapsed = time.time() - start_time
-            content = f"💎 Working... ({format_duration(elapsed)})\n" + "\n".join(tool_lines)
+            content = "💎 Working...\n" + "\n".join(tool_lines)
             if len(content) > 3900:
                 content = content[:3900] + "\n..."
 
@@ -422,7 +419,7 @@ class TelegramChannel(BaseChannel):
                     message_id=msg_id,
                     text=content,
                 )
-                self._status_messages[scope_key] = (msg_id, start_time, tool_lines)
+                self._status_messages[scope_key] = (msg_id, tool_lines)
             except Exception as e:
                 err = str(e).lower()
                 if "message is not modified" in err:
@@ -441,7 +438,7 @@ class TelegramChannel(BaseChannel):
             if scope_key not in self._status_messages:
                 return
 
-            msg_id, _, _ = self._status_messages.pop(scope_key)
+            msg_id, _ = self._status_messages.pop(scope_key)
             try:
                 await self._app.bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except Exception:

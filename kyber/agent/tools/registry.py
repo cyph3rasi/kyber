@@ -177,6 +177,7 @@ class ToolRegistry:
             "kyber.agent.tools.skills",
             "kyber.agent.tools.session_search",
             "kyber.agent.tools.delegate",
+            "kyber.agent.tools.mcp",
         ]
         
         for mod_name in _TOOL_MODULES:
