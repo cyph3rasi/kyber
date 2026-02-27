@@ -14,6 +14,7 @@ def test_create_workspace_templates_creates_expected_files(tmp_path) -> None:
     assert (workspace / "USER.md").exists()
     assert (workspace / "IDENTITY.md").exists()
     assert (workspace / "TOOLS.md").exists()
+    assert (workspace / "HEARTBEAT.md").exists()
     assert (workspace / "memory").is_dir()
     assert (workspace / "memory" / "MEMORY.md").exists()
     assert (workspace / "skills").is_dir()

@@ -176,6 +176,15 @@ Examples:
 - Safe/unsafe environments
 - Project-specific tool conventions
 """,
+        "HEARTBEAT.md": """# Heartbeat Tasks
+
+This file is checked on every heartbeat interval.
+Add recurring checks or maintenance tasks as checklist items.
+
+## Active Tasks
+
+- [ ] (add a recurring task here)
+""",
     }
     
     for filename, content in templates.items():
