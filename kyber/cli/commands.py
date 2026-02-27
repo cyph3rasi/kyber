@@ -220,15 +220,25 @@ This file stores important information that should persist across sessions.
     skills_dir = workspace / "skills"
     skills_dir.mkdir(exist_ok=True)
     skills_readme = skills_dir / "README.md"
+    canonical_skills_readme = (
+        "# Skills\n\n"
+        "Drop custom skills here as folders containing a `SKILL.md`.\n\n"
+        "Example:\n"
+        "- `skills/my-skill/SKILL.md`\n\n"
+        "This workspace is the canonical skills location.\n"
+    )
     if not skills_readme.exists():
-        skills_readme.write_text(
-            "# Skills\n\n"
-            "Drop custom skills here as folders containing a `SKILL.md`.\n\n"
-            "Example:\n"
-            "- `skills/my-skill/SKILL.md`\n\n"
-            "This workspace is the canonical skills location.\n"
-        )
+        skills_readme.write_text(canonical_skills_readme)
         console.print("  [dim]Created skills/README.md[/dim]")
+    else:
+        existing = skills_readme.read_text()
+        legacy_markers = (
+            "Kyber also supports managed skills in `~/.kyber/skills/<skill>/SKILL.md`.",
+            "Kyber also supports managed skills in `~/.kyber/skills`.",
+        )
+        if any(marker in existing for marker in legacy_markers):
+            skills_readme.write_text(canonical_skills_readme)
+            console.print("  [dim]Updated skills/README.md to canonical workspace-only text[/dim]")
 
 
 # ============================================================================

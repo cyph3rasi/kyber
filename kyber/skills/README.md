@@ -12,13 +12,12 @@ Kyber uses the [AgentSkills](https://opencode.ai/docs/skills/) format, which is 
 
 ## Skill Locations & Precedence
 
-Skills are loaded from three places (highest priority first):
+Skills are loaded from two places (highest priority first):
 
 1. **Workspace skills**: `~/.kyber/workspace/skills/`
-2. **Managed/local skills**: `~/.kyber/skills/`
-3. **Bundled skills**: shipped with kyber (this directory)
+2. **Bundled skills**: shipped with kyber (this directory)
 
-If the same skill name exists in multiple locations, the higher-priority one wins.
+If the same skill name exists in both locations, the workspace version wins.
 
 ## OpenClaw Compatibility
 
@@ -34,7 +33,7 @@ works identically to:
 metadata: {"kyber":{"emoji":"♊️","requires":{"bins":["gemini"]}}}
 ```
 
-To use an OpenClaw skill, drop its folder into `~/.kyber/skills/` or your workspace `skills/` directory.
+To use an OpenClaw skill, drop its folder into your workspace `skills/` directory.
 
 ## Available Built-in Skills
 

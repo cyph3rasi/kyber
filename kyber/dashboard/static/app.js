@@ -1507,6 +1507,7 @@ async function updateAllSkills() {
 function renderSkills() {
   const topRow = document.createElement('div');
   topRow.className = 'tasks-toprow';
+  const defaultSkillsInstallDir = '~/.kyber/workspace/skills';
 
   const leftControls = document.createElement('div');
   leftControls.className = 'tasks-controls';
@@ -1547,7 +1548,7 @@ function renderSkills() {
 
   const hint = document.createElement('div');
   hint.className = 'tasks-hint';
-  hint.innerHTML = `Search uses <span class="mono">skills.sh</span> and installs into <span class="mono">~/.kyber/skills</span>.`;
+  hint.textContent = `Search uses skills.sh and installs into ${defaultSkillsInstallDir}.`;
   topRow.appendChild(hint);
   contentBody.appendChild(topRow);
 
@@ -1722,6 +1723,8 @@ function renderSkills() {
     try {
       const data = await fetchSkills();
       const skills = data.skills || [];
+      const installDir = data.install_dir || data.installDir || defaultSkillsInstallDir;
+      hint.textContent = `Search uses skills.sh and installs into ${installDir}.`;
       installedWrap.innerHTML = '';
       if (!skills.length) {
         installedWrap.innerHTML = '<div class="empty-state">No skills found.</div>';
@@ -1742,7 +1745,7 @@ function renderSkills() {
         pre.textContent = s.path || '';
         body.appendChild(pre);
 
-        if (s.source === 'managed') {
+        if (s.source === 'workspace') {
           const actions = document.createElement('div');
           actions.className = 'skills-actions';
           const rm = document.createElement('button');

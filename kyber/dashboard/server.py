@@ -532,8 +532,15 @@ def create_dashboard_app(config: Config) -> FastAPI:
         cfg = load_config()
         loader = SkillsLoader(cfg.workspace_path)
         skills = loader.list_skills(filter_unavailable=False)
-        manifest = list_managed_installs(skills_dir=cfg.workspace_path / "skills")
-        return JSONResponse({"skills": skills, "managed": manifest.get("installed", {})})
+        install_dir = cfg.workspace_path / "skills"
+        manifest = list_managed_installs(skills_dir=install_dir)
+        return JSONResponse(
+            {
+                "skills": skills,
+                "managed": manifest.get("installed", {}),
+                "install_dir": str(install_dir),
+            }
+        )
 
     @app.get("/api/skills/search", dependencies=[Depends(_require_token)])
     async def search_skills(q: str, limit: int = 10) -> JSONResponse:
@@ -549,13 +556,14 @@ def create_dashboard_app(config: Config) -> FastAPI:
             raise HTTPException(status_code=400, detail="source is required")
         try:
             cfg = load_config()
+            install_dir = cfg.workspace_path / "skills"
             res = install_from_source(
                 source,
                 skill=skill,
                 replace=replace,
-                skills_dir=cfg.workspace_path / "skills",
+                skills_dir=install_dir,
             )
-            return JSONResponse(res)
+            return JSONResponse({**res, "install_dir": str(install_dir)})
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
