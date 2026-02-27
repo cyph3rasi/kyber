@@ -44,6 +44,7 @@ def main(
 # ============================================================================
 
 
+@app.command()
 def onboard():
     """Initialize kyber configuration and workspace."""
     from kyber.config.loader import get_config_path, get_env_path, save_config
@@ -159,6 +160,22 @@ Information about the user goes here.
 - Timezone: (your timezone)
 - Language: (your preferred language)
 """,
+        "IDENTITY.md": """# Identity
+
+Use this file for stable identity constraints that should always apply.
+Examples:
+- Role and scope boundaries
+- Non-negotiable behavioral rules
+- Product-specific identity details
+""",
+        "TOOLS.md": """# Tools
+
+Optional tool usage guidance for this workspace.
+Examples:
+- Preferred command patterns
+- Safe/unsafe environments
+- Project-specific tool conventions
+""",
     }
     
     for filename, content in templates.items():
@@ -243,10 +260,10 @@ def _create_agent(
 
     # Custom-provider key fallback from env (useful for manual env setup).
     if details.get("is_custom", False) and not api_key:
-        env_key_name = "KYBER_CUSTOM_PROVIDER_" + "".join(
-            ch if ch.isalnum() else "_" for ch in provider_name_str.upper()
-        ) + "_API_KEY"
-        api_key = (os.environ.get(env_key_name, "") or "").strip()
+        from kyber.config.loader import custom_provider_env_key
+
+        env_key_name = custom_provider_env_key(provider_name_str) or ""
+        api_key = (os.environ.get(env_key_name, "") or "").strip() if env_key_name else ""
         if not api_key and "minimax" in provider_name_lc:
             api_key = (os.environ.get("MINIMAX_API_KEY", "") or "").strip()
     
@@ -481,9 +498,7 @@ def gateway(
 
     # Ensure workspace scaffold exists even if user didn't run `kyber onboard`.
     workspace = config.workspace_path
-    workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / "memory").mkdir(exist_ok=True)
-    (workspace / "skills").mkdir(exist_ok=True)
+    _create_workspace_templates(workspace)
 
     # Best-effort preflight: never block startup (prevents service bootloops).
     _warn_if_openhands_runtime_unusable()
@@ -676,6 +691,7 @@ def agent(
     from kyber.bus.queue import MessageBus
     
     config = load_config()
+    _create_workspace_templates(config.workspace_path)
     bus = MessageBus()
     agent_instance = _create_orchestrator(config, bus)
     
@@ -723,6 +739,7 @@ def dashboard(
     from kyber.logging.error_store import init_error_store
 
     config = load_config()
+    _create_workspace_templates(config.workspace_path)
     dash = config.dashboard
 
     _suppress_websocket_deprecation_noise()

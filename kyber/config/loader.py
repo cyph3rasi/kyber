@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -42,6 +43,24 @@ _ENV_MAP: dict[tuple[str, ...], str] = {
     ("channels", "discord", "token"): "KYBER_CHANNELS__DISCORD__TOKEN",
     ("dashboard", "authToken"): "KYBER_DASHBOARD__AUTH_TOKEN",
 }
+
+
+_CUSTOM_PROVIDER_ENV_KEY_RE = re.compile(r"^KYBER_CUSTOM_PROVIDER_[A-Z0-9_]+_API_KEY$")
+
+
+def custom_provider_env_key(name: str) -> str | None:
+    """Build a safe env-var name for a custom provider API key.
+
+    Provider names can contain punctuation/spaces that are invalid in shell
+    variable names. This function normalizes to ASCII `A-Z0-9_` only.
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return None
+    normalized = re.sub(r"[^A-Z0-9]+", "_", raw.upper()).strip("_")
+    if not normalized:
+        return None
+    return f"KYBER_CUSTOM_PROVIDER_{normalized}_API_KEY"
 
 
 def get_config_path() -> Path:
@@ -209,6 +228,13 @@ def _write_secrets_to_env(data: dict, env_path: Path) -> None:
     # Load existing .env to preserve values not managed by us
     existing = _load_dotenv(env_path) if env_path.exists() else {}
 
+    # Prune malformed legacy custom-provider keys (e.g., containing dots) so
+    # downstream shell sourcing of .env doesn't error on invalid identifiers.
+    for key in list(existing):
+        if key.startswith("KYBER_CUSTOM_PROVIDER_") and key.endswith("_API_KEY"):
+            if not _CUSTOM_PROVIDER_ENV_KEY_RE.fullmatch(key):
+                existing.pop(key, None)
+
     for config_keys, env_var in _ENV_MAP.items():
         value = _get_nested(data, config_keys)
         if value:
@@ -218,11 +244,16 @@ def _write_secrets_to_env(data: dict, env_path: Path) -> None:
 
     # Also handle custom providers (dynamic list)
     custom_list = data.get("providers", {}).get("custom", [])
-    for i, cp in enumerate(custom_list):
+    for cp in custom_list:
         name = (cp.get("name") or "").strip()
         api_key = cp.get("apiKey", "")
-        if name and api_key:
-            env_var = f"KYBER_CUSTOM_PROVIDER_{name.upper().replace('-', '_').replace(' ', '_')}_API_KEY"
+        env_var = custom_provider_env_key(name)
+        # Remove legacy key shape for this provider name if it differs from
+        # canonical form. This cleans up older invalid keys like names with '.'.
+        legacy_env_var = f"KYBER_CUSTOM_PROVIDER_{name.upper().replace('-', '_').replace(' ', '_')}_API_KEY"
+        if legacy_env_var != env_var:
+            existing.pop(legacy_env_var, None)
+        if env_var and api_key:
             existing[env_var] = api_key
 
     # Write .env
@@ -300,9 +331,9 @@ def _apply_env_secrets(config: Config) -> None:
     # Handle custom provider keys
     for cp in config.providers.custom:
         name = (cp.name or "").strip()
-        if not name:
+        env_var = custom_provider_env_key(name)
+        if not env_var:
             continue
-        env_var = f"KYBER_CUSTOM_PROVIDER_{name.upper().replace('-', '_').replace(' ', '_')}_API_KEY"
         value = os.environ.get(env_var, "")
         if value:
             cp.api_key = value

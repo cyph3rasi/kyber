@@ -1609,7 +1609,7 @@ wheels = [
 
 [[package]]
 name = "kyber-chat"
-version = "2026.2.27.2"
+version = "2026.2.27.3"
 source = { editable = "." }
 dependencies = [
     { name = "cisco-ai-skill-scanner" },
