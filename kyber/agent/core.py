@@ -36,6 +36,10 @@ AGENT_LOOP_TIMEOUT_SECONDS = 600.0
 AGENT_SINGLE_LLM_TIMEOUT_SECONDS = 600.0
 AGENT_SINGLE_TOOL_TIMEOUT_SECONDS = 600.0
 AGENT_STATUS_SUMMARY_TIMEOUT_SECONDS = 4.0
+SESSION_TOOL_PERSIST_MAX_EVENTS_PER_TURN = 20
+SESSION_TOOL_PERSIST_MAX_CHARS_PER_EVENT = 2000
+SESSION_TOOL_CONTEXT_MAX_EVENTS = 20
+SESSION_TOOL_CONTEXT_MAX_TOTAL_CHARS = 24000
 
 
 class AgentCore:
@@ -368,6 +372,7 @@ class AgentCore:
             session_lock = self._get_session_lock(session_key)
             async with session_lock:
                 shared = self.sessions.get_or_create(session_key)
+                self._merge_turn_tool_messages(shared, run_session)
                 shared.add_message("assistant", response_text)
                 self.sessions.save(shared)
         
@@ -613,7 +618,7 @@ class AgentCore:
                         # Also record in session for persistence
                         session.add_message(
                             "tool",
-                            result,
+                            self._trim_for_session_tool_context(result),
                             tool_call_id=tc.id,
                             tool_name=tc.name,
                         )
@@ -749,6 +754,62 @@ class AgentCore:
         except Exception as e:
             logger.exception(f"Tool execution error: {tc.name}")
             return json.dumps({"error": str(e)})
+
+    def _trim_for_session_tool_context(self, content: str, max_chars: int = SESSION_TOOL_PERSIST_MAX_CHARS_PER_EVENT) -> str:
+        """Compress tool output before persisting it into session context."""
+        text = " ".join((content or "").strip().split())
+        if len(text) > max_chars:
+            return text[: max(0, max_chars - 3)].rstrip() + "..."
+        return text
+
+    def _merge_turn_tool_messages(self, shared: Session, turn_session: Session) -> None:
+        """Persist compact tool outputs from the current turn into shared session history."""
+        tool_msgs = [
+            m for m in turn_session.messages
+            if (m.get("role") == "tool") and str(m.get("content") or "").strip()
+        ]
+        if not tool_msgs:
+            return
+        for m in tool_msgs[-SESSION_TOOL_PERSIST_MAX_EVENTS_PER_TURN:]:
+            shared.add_message(
+                "tool",
+                self._trim_for_session_tool_context(str(m.get("content") or "")),
+                tool_name=str(m.get("tool_name") or ""),
+                tool_call_id=str(m.get("tool_call_id") or ""),
+            )
+
+    def _build_recent_tool_context_block(self, history: list[dict[str, Any]]) -> str | None:
+        """Build a bounded tool-context block from recent session messages."""
+        recent_tools: list[str] = []
+        for msg in history:
+            if msg.get("role") != "tool":
+                continue
+            content = self._trim_for_session_tool_context(str(msg.get("content") or ""))
+            if not content:
+                continue
+            tool_name = str(msg.get("tool_name") or "tool").strip() or "tool"
+            recent_tools.append(f"- [{tool_name}] {content}")
+
+        if not recent_tools:
+            return None
+
+        kept: list[str] = []
+        total = 0
+        for line in reversed(recent_tools[-SESSION_TOOL_CONTEXT_MAX_EVENTS:]):
+            line_len = len(line)
+            if kept and (total + line_len) > SESSION_TOOL_CONTEXT_MAX_TOTAL_CHARS:
+                break
+            kept.append(line)
+            total += line_len
+
+        if not kept:
+            return None
+
+        kept.reverse()
+        return (
+            "Recent tool outputs from this chat. Reuse this context before re-running discovery commands:\n"
+            + "\n".join(kept)
+        )
     
     def _build_system_prompt(self, msg: InboundMessage) -> str:
         """Build the system prompt, optionally with persona overlay."""
@@ -780,15 +841,16 @@ class AgentCore:
     ) -> list[dict[str, Any]]:
         """Build the messages list for the LLM call."""
         messages = [{"role": "system", "content": system_prompt}]
-        
-        # Add conversation history (skip the last message which we just added)
-        history = session.get_history(max_messages=self.max_history)
-        
-        # Filter to just user/assistant messages for now
-        # (tool messages from previous turns don't need to go back)
+
+        history = session.messages[-self.max_history:] if len(session.messages) > self.max_history else session.messages
+        tool_context = self._build_recent_tool_context_block(history)
+        if tool_context:
+            messages.append({"role": "system", "content": tool_context})
+
         for msg in history:
-            if msg["role"] in ("user", "assistant"):
-                messages.append(msg)
+            role = msg.get("role")
+            if role in ("user", "assistant"):
+                messages.append({"role": role, "content": str(msg.get("content") or "")})
         
         return messages
     
