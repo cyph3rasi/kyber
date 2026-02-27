@@ -13,10 +13,40 @@ load_twine_env_file() {
   # Preserve already-exported shell env vars; only fill from file when absent.
   local orig_user="${TWINE_USERNAME-__KYBER_UNSET__}"
   local orig_pass="${TWINE_PASSWORD-__KYBER_UNSET__}"
-  set -a
-  # shellcheck disable=SC1090
-  . "$env_file"
-  set +a
+
+  _read_env_key() {
+    local key="$1"
+    local line
+    line="$(grep -E "^(export[[:space:]]+)?${key}[[:space:]]*=" "$env_file" | tail -n 1 || true)"
+    if [[ -z "$line" ]]; then
+      return 0
+    fi
+    local value
+    value="$(printf '%s\n' "$line" | sed -E "s/^(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//")"
+    # Strip matching surrounding single or double quotes.
+    if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+      value="${BASH_REMATCH[1]}"
+    elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+      value="${BASH_REMATCH[1]}"
+    fi
+    printf '%s' "$value"
+  }
+
+  if [[ "$orig_user" == "__KYBER_UNSET__" ]]; then
+    local loaded_user
+    loaded_user="$(_read_env_key "TWINE_USERNAME")"
+    if [[ -n "$loaded_user" ]]; then
+      export TWINE_USERNAME="$loaded_user"
+    fi
+  fi
+
+  if [[ "$orig_pass" == "__KYBER_UNSET__" ]]; then
+    local loaded_pass
+    loaded_pass="$(_read_env_key "TWINE_PASSWORD")"
+    if [[ -n "$loaded_pass" ]]; then
+      export TWINE_PASSWORD="$loaded_pass"
+    fi
+  fi
 
   if [[ "$orig_user" != "__KYBER_UNSET__" ]]; then
     export TWINE_USERNAME="$orig_user"
