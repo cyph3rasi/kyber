@@ -1,5 +1,6 @@
 """File system tools: read, write, edit, list."""
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,22 @@ def _is_sensitive_read(path: str) -> bool:
         if name == pattern or name.endswith(pattern) or pattern in normalized:
             return True
     return False
+
+
+@asynccontextmanager
+async def _write_lock(path: Path, **kwargs: Any):
+    """Acquire a per-file async lock when running under AgentCore."""
+    agent_core = kwargs.get("agent_core")
+    if agent_core and hasattr(agent_core, "get_file_lock"):
+        try:
+            lock = agent_core.get_file_lock(path)
+            async with lock:
+                yield
+            return
+        except Exception:
+            # Fallback to unlocked write path if lock acquisition fails.
+            pass
+    yield
 
 
 class ReadFileTool(Tool):
@@ -137,8 +154,9 @@ class WriteFileTool(Tool):
             if _is_protected(path):
                 return f"Error: {path} is a protected system file. Use the appropriate CLI command instead (e.g., `kyber cron add`)."
             file_path = Path(path).expanduser()
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(content, encoding="utf-8")
+            async with _write_lock(file_path, **kwargs):
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {path}"
         except PermissionError:
             return f"Error: Permission denied: {path}"
@@ -185,21 +203,22 @@ class EditFileTool(Tool):
             if _is_protected(path):
                 return f"Error: {path} is a protected system file. Use the appropriate CLI command instead (e.g., `kyber cron add`)."
             file_path = Path(path).expanduser()
-            if not file_path.exists():
-                return f"Error: File not found: {path}"
-            
-            content = file_path.read_text(encoding="utf-8")
-            
-            if old_text not in content:
-                return f"Error: old_text not found in file. Make sure it matches exactly."
-            
-            # Count occurrences
-            count = content.count(old_text)
-            if count > 1:
-                return f"Warning: old_text appears {count} times. Please provide more context to make it unique."
-            
-            new_content = content.replace(old_text, new_text, 1)
-            file_path.write_text(new_content, encoding="utf-8")
+            async with _write_lock(file_path, **kwargs):
+                if not file_path.exists():
+                    return f"Error: File not found: {path}"
+
+                content = file_path.read_text(encoding="utf-8")
+
+                if old_text not in content:
+                    return f"Error: old_text not found in file. Make sure it matches exactly."
+
+                # Count occurrences
+                count = content.count(old_text)
+                if count > 1:
+                    return f"Warning: old_text appears {count} times. Please provide more context to make it unique."
+
+                new_content = content.replace(old_text, new_text, 1)
+                file_path.write_text(new_content, encoding="utf-8")
             
             return f"Successfully edited {path}"
         except PermissionError:

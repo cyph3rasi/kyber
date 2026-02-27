@@ -3,6 +3,7 @@ kyber - A lightweight AI agent framework
 """
 
 import warnings
+from importlib.metadata import PackageNotFoundError, version
 
 # Suppress litellm cost-calculation warnings for custom/unmapped models.
 # OpenHands uses litellm internally; it spams these on every LLM call when
@@ -13,5 +14,8 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-__version__ = "2026.2.26.8"
+try:
+    __version__ = version("kyber-chat")
+except PackageNotFoundError:
+    __version__ = "0.0.0.dev0"
 __logo__ = "💎"

@@ -9,6 +9,7 @@ import pytest
 
 from kyber.agent.core import AgentCore
 from kyber.agent.task_registry import TaskStatus
+from kyber.bus.events import InboundMessage
 from kyber.bus.queue import MessageBus
 from kyber.providers.base import LLMProvider, LLMResponse
 
@@ -30,11 +31,14 @@ class _DummyProvider(LLMProvider):
 
 
 def _make_core(workspace: Path) -> AgentCore:
-    return AgentCore(
+    core = AgentCore(
         bus=MessageBus(),
         provider=_DummyProvider(),
         workspace=workspace,
     )
+    # Tests focus on task lifecycle, not session persistence I/O.
+    core.sessions.save = lambda _session: None  # type: ignore[method-assign]
+    return core
 
 
 def test_process_direct_auto_completes_auto_created_task() -> None:
@@ -110,3 +114,49 @@ def test_process_direct_auto_marks_failed_on_exception() -> None:
         assert refreshed is not None
         assert refreshed.status == TaskStatus.FAILED
         assert refreshed.error == "boom"
+
+
+def test_handle_message_processes_same_session_concurrently() -> None:
+    async def _run() -> None:
+        with TemporaryDirectory() as td:
+            core = _make_core(Path(td))
+
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+
+            async def _fake_run_loop(*_args, **kwargs):
+                if kwargs.get("tracked_task_description") == "first":
+                    first_started.set()
+                    await release_first.wait()
+                    return "first done"
+                return "second done"
+
+            core._run_loop = _fake_run_loop  # type: ignore[method-assign]
+
+            first = InboundMessage(
+                channel="discord",
+                sender_id="u1",
+                chat_id="c1",
+                content="first",
+            )
+            second = InboundMessage(
+                channel="discord",
+                sender_id="u1",
+                chat_id="c1",
+                content="second",
+            )
+
+            t1 = asyncio.create_task(core._handle_message(first))
+            await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+            t2 = asyncio.create_task(core._handle_message(second))
+            second_out = await asyncio.wait_for(core.bus.consume_outbound(), timeout=1.0)
+            assert second_out.content == "second done"
+
+            release_first.set()
+
+            first_out = await asyncio.wait_for(core.bus.consume_outbound(), timeout=1.0)
+            assert first_out.content == "first done"
+            await asyncio.wait_for(asyncio.gather(t1, t2), timeout=1.0)
+
+    asyncio.run(_run())

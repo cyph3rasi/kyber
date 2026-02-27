@@ -98,8 +98,9 @@ class AgentCore:
         self._active_tasks: dict[int, asyncio.Task] = {}
         self._background_tasks: dict[str, asyncio.Task] = {}
         self._running_tasks_by_task_id: dict[str, asyncio.Task] = {}
-        # Per-session locks: keep ordering deterministic within one chat/session
-        # while still allowing parallel work across different sessions.
+        self._file_locks: dict[str, asyncio.Lock] = {}
+        # Per-session locks for short critical sections (history snapshot + commit)
+        # while allowing concurrent long-running turns in the same chat.
         self._session_locks: dict[str, asyncio.Lock] = {}
     
     # ── Public API ──────────────────────────────────────────────────
@@ -170,6 +171,7 @@ class AgentCore:
                     session_key,
                     tracked_task_id=tracked_task_id,
                     task_tracker=task_tracker,
+                    session_lock_held=True,
                 )
             task_id = task_tracker.get("id")
             if auto_finalize and task_id:
@@ -224,25 +226,32 @@ class AgentCore:
             lock = asyncio.Lock()
             self._session_locks[session_key] = lock
         return lock
+
+    def get_file_lock(self, path: str | Path) -> asyncio.Lock:
+        """Get a per-file async lock for write/edit operations."""
+        key = str(Path(path).expanduser().resolve(strict=False))
+        lock = self._file_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._file_locks[key] = lock
+        return lock
     
     # ── Internal ────────────────────────────────────────────────────
     
     async def _handle_message(self, msg: InboundMessage) -> None:
         """Handle an inbound message: process and publish response."""
         task_tracker: dict[str, str | None] = {"id": None}
-        session_lock = self._get_session_lock(msg.session_key)
         try:
-            async with session_lock:
-                # Hard upper bound so a runaway tool loop can't keep users waiting forever.
-                response_text = await asyncio.wait_for(
-                    self._process_message(
-                        msg,
-                        msg.session_key,
-                        tracked_task_id=None,
-                        task_tracker=task_tracker,
-                    ),
-                    timeout=AGENT_MESSAGE_TIMEOUT_SECONDS,
-                )
+            # Hard upper bound so a runaway tool loop can't keep users waiting forever.
+            response_text = await asyncio.wait_for(
+                self._process_message(
+                    msg,
+                    msg.session_key,
+                    tracked_task_id=None,
+                    task_tracker=task_tracker,
+                ),
+                timeout=AGENT_MESSAGE_TIMEOUT_SECONDS,
+            )
             task_id = task_tracker.get("id")
             if task_id:
                 tracked = self.registry.get(task_id)
@@ -305,23 +314,31 @@ class AgentCore:
         session_key: str,
         tracked_task_id: str | None = None,
         task_tracker: dict[str, str | None] | None = None,
+        session_lock_held: bool = False,
     ) -> str:
         """Core message processing: build context, run tool loop, return response."""
-        
-        # Get or create session
-        session = self.sessions.get_or_create(session_key)
-        
-        # Add user message to session
-        session.add_message("user", msg.content)
-        
+
         # Build system prompt
         system_prompt = self._build_system_prompt(msg)
 
         # Get tool definitions
         tool_defs = registry.get_definitions()
 
-        # Build messages for LLM
-        messages = self._build_messages(system_prompt, session)
+        # Build messages from a short critical section on shared session history.
+        if session_lock_held:
+            session = self.sessions.get_or_create(session_key)
+            session.add_message("user", msg.content)
+            messages = self._build_messages(system_prompt, session)
+            run_session = session
+        else:
+            session_lock = self._get_session_lock(session_key)
+            async with session_lock:
+                session = self.sessions.get_or_create(session_key)
+                session.add_message("user", msg.content)
+                messages = self._build_messages(system_prompt, session)
+                self.sessions.save(session)
+            # Per-turn scratch session: tool messages stay isolated while turn runs.
+            run_session = Session(key=session_key)
         
         status_key = str(msg.metadata.get("message_id") or f"run-{time.time_ns()}")
         status_intro = self._build_status_intro(msg.content)
@@ -330,7 +347,7 @@ class AgentCore:
         response_text = await self._run_loop(
             messages=messages,
             tools=tool_defs,
-            session=session,
+            session=run_session,
             context_channel=msg.channel,
             context_chat_id=msg.chat_id,
             context_status_key=status_key,
@@ -340,12 +357,18 @@ class AgentCore:
             tracked_task_label=self._build_task_label(msg.content),
             task_tracker=task_tracker,
         )
-        
-        # Add assistant response to session
-        session.add_message("assistant", response_text)
-        
-        # Save session
-        self.sessions.save(session)
+
+        if session_lock_held:
+            # Direct/caller-managed flow is already serialized by caller lock.
+            run_session.add_message("assistant", response_text)
+            self.sessions.save(run_session)
+        else:
+            # Commit assistant output atomically to shared session history.
+            session_lock = self._get_session_lock(session_key)
+            async with session_lock:
+                shared = self.sessions.get_or_create(session_key)
+                shared.add_message("assistant", response_text)
+                self.sessions.save(shared)
         
         return response_text
 
