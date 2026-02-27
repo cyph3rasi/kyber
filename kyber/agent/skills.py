@@ -9,7 +9,7 @@ from pathlib import Path
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
-# Managed/local skills directory (user-installed, e.g. from ClawHub)
+# Legacy managed skills directory (deprecated; kept for compatibility only)
 MANAGED_SKILLS_DIR = Path.home() / ".kyber" / "skills"
 
 # Metadata namespace keys we understand (ours + OpenClaw-compatible)
@@ -24,13 +24,14 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     
     Compatible with the AgentSkills / OpenClaw skill format.
-    Precedence: workspace > managed (~/.kyber/skills) > builtin.
+    Active precedence: workspace > builtin.
     """
     
     def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
-        self.managed_skills = MANAGED_SKILLS_DIR
+        # Single canonical skills location: workspace/skills.
+        self.managed_skills = self.workspace_skills
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
 
         # Fresh installs may not have created these directories yet. Create them
@@ -38,11 +39,7 @@ class SkillsLoader:
         try:
             self.workspace_skills.mkdir(parents=True, exist_ok=True)
         except Exception:
-            # Best-effort: if workspace is read-only, we still allow builtin/managed.
-            pass
-        try:
-            self.managed_skills.mkdir(parents=True, exist_ok=True)
-        except Exception:
+            # Best-effort: if workspace is read-only, builtin skills still work.
             pass
     
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
@@ -68,9 +65,8 @@ class SkillsLoader:
                         seen.add(skill_dir.name)
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": source})
         
-        # Precedence: workspace > managed > builtin
+        # Precedence: workspace > builtin
         _scan(self.workspace_skills, "workspace")
-        _scan(self.managed_skills, "managed")
         if self.builtin_skills:
             _scan(self.builtin_skills, "builtin")
         
@@ -89,8 +85,8 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        # Precedence: workspace > managed > builtin
-        for base in (self.workspace_skills, self.managed_skills, self.builtin_skills):
+        # Precedence: workspace > builtin
+        for base in (self.workspace_skills, self.builtin_skills):
             if base:
                 skill_file = base / name / "SKILL.md"
                 if skill_file.exists():

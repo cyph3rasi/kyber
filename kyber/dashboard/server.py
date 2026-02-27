@@ -532,7 +532,7 @@ def create_dashboard_app(config: Config) -> FastAPI:
         cfg = load_config()
         loader = SkillsLoader(cfg.workspace_path)
         skills = loader.list_skills(filter_unavailable=False)
-        manifest = list_managed_installs()
+        manifest = list_managed_installs(skills_dir=cfg.workspace_path / "skills")
         return JSONResponse({"skills": skills, "managed": manifest.get("installed", {})})
 
     @app.get("/api/skills/search", dependencies=[Depends(_require_token)])
@@ -548,7 +548,13 @@ def create_dashboard_app(config: Config) -> FastAPI:
         if not source:
             raise HTTPException(status_code=400, detail="source is required")
         try:
-            res = install_from_source(source, skill=skill, replace=replace)
+            cfg = load_config()
+            res = install_from_source(
+                source,
+                skill=skill,
+                replace=replace,
+                skills_dir=cfg.workspace_path / "skills",
+            )
             return JSONResponse(res)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -556,7 +562,8 @@ def create_dashboard_app(config: Config) -> FastAPI:
     @app.post("/api/skills/remove/{name}", dependencies=[Depends(_require_token)])
     async def remove_skill_api(name: str) -> JSONResponse:
         try:
-            res = remove_skill(name)
+            cfg = load_config()
+            res = remove_skill(name, skills_dir=cfg.workspace_path / "skills")
             return JSONResponse(res)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -566,7 +573,8 @@ def create_dashboard_app(config: Config) -> FastAPI:
         replace = True
         if body and "replace" in body:
             replace = bool(body.get("replace"))
-        res = update_all(replace=replace)
+        cfg = load_config()
+        res = update_all(replace=replace, skills_dir=cfg.workspace_path / "skills")
         return JSONResponse(res)
 
     @app.post("/api/skills/preview", dependencies=[Depends(_require_token)])

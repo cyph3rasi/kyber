@@ -2,7 +2,7 @@
 
 Design goals:
 - Compatible with the skills.sh ecosystem (directory containing SKILL.md).
-- Install into managed dir: ~/.kyber/skills/<skill-name>/SKILL.md
+- Install into workspace dir: <workspace>/skills/<skill-name>/SKILL.md
 - Keep a small manifest so updates/removals are possible.
 """
 
@@ -18,11 +18,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from kyber.agent.skills import MANAGED_SKILLS_DIR
+from kyber.utils.helpers import get_workspace_path
 
 
-def _manifest_path() -> Path:
-    return MANAGED_SKILLS_DIR / ".kyber-manifest.json"
+def _resolve_skills_dir(skills_dir: Path | None = None) -> Path:
+    if skills_dir is not None:
+        return Path(skills_dir).expanduser()
+    return get_workspace_path() / "skills"
+
+
+def _manifest_path(skills_dir: Path) -> Path:
+    return skills_dir / ".kyber-manifest.json"
 
 
 def _utcnow() -> str:
@@ -181,8 +187,8 @@ def find_skill_dirs(root: Path) -> list[Path]:
     return out
 
 
-def _load_manifest() -> dict[str, Any]:
-    path = _manifest_path()
+def _load_manifest(skills_dir: Path) -> dict[str, Any]:
+    path = _manifest_path(skills_dir)
     if not path.exists():
         return {"installed": {}}
     try:
@@ -191,24 +197,28 @@ def _load_manifest() -> dict[str, Any]:
         return {"installed": {}}
 
 
-def _save_manifest(obj: dict[str, Any]) -> None:
-    MANAGED_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    _manifest_path().write_text(json.dumps(obj, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+def _save_manifest(skills_dir: Path, obj: dict[str, Any]) -> None:
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    _manifest_path(skills_dir).write_text(
+        json.dumps(obj, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
 
 
-def reconcile_manifest() -> dict[str, Any]:
+def reconcile_manifest(skills_dir: Path | None = None) -> dict[str, Any]:
     """Prune manifest entries that no longer exist on disk.
 
     This keeps `update-all` from reinstalling deleted skills.
     """
-    manifest = _load_manifest()
+    resolved_skills_dir = _resolve_skills_dir(skills_dir)
+    manifest = _load_manifest(resolved_skills_dir)
     installed = manifest.get("installed", {})
     if not isinstance(installed, dict):
         installed = {}
 
     existing: set[str] = set()
-    if MANAGED_SKILLS_DIR.exists():
-        for p in MANAGED_SKILLS_DIR.iterdir():
+    if resolved_skills_dir.exists():
+        for p in resolved_skills_dir.iterdir():
             if not p.is_dir():
                 continue
             if (p / "SKILL.md").exists():
@@ -234,21 +244,23 @@ def reconcile_manifest() -> dict[str, Any]:
 
     manifest["installed"] = installed
     if changed:
-        _save_manifest(manifest)
+        _save_manifest(resolved_skills_dir, manifest)
     return manifest
 
 
-def list_managed_installs() -> dict[str, Any]:
-    return reconcile_manifest()
+def list_managed_installs(skills_dir: Path | None = None) -> dict[str, Any]:
+    return reconcile_manifest(skills_dir=skills_dir)
 
 
 def install_from_source(
     source: str,
     skill: str | None = None,
     replace: bool = False,
+    skills_dir: Path | None = None,
 ) -> dict[str, Any]:
+    resolved_skills_dir = _resolve_skills_dir(skills_dir)
     # Ensure manifest doesn't contain stale entries before we add/update.
-    reconcile_manifest()
+    reconcile_manifest(skills_dir=resolved_skills_dir)
     spec = parse_source(source)
 
     repo_dir = _clone_repo(spec.url, ref=spec.ref)
@@ -276,7 +288,7 @@ def install_from_source(
                 # Don't install hidden skills by default.
                 continue
 
-            dest = MANAGED_SKILLS_DIR / name
+            dest = resolved_skills_dir / name
             if dest.exists():
                 if not replace:
                     continue
@@ -285,7 +297,7 @@ def install_from_source(
             installed.append(name)
 
         sha = _read_head_sha(repo_dir)
-        manifest = _load_manifest()
+        manifest = _load_manifest(resolved_skills_dir)
         inst = manifest.setdefault("installed", {})
         inst_key = _safe_slug(source) or _safe_slug(spec.url)
         inst[inst_key] = {
@@ -297,21 +309,22 @@ def install_from_source(
             "updated_at": _utcnow(),
             "revision": sha,
         }
-        _save_manifest(manifest)
+        _save_manifest(resolved_skills_dir, manifest)
         return {"ok": True, "installed": installed, "revision": sha}
     finally:
         shutil.rmtree(repo_dir, ignore_errors=True)
 
 
-def remove_skill(name: str) -> dict[str, Any]:
+def remove_skill(name: str, skills_dir: Path | None = None) -> dict[str, Any]:
+    resolved_skills_dir = _resolve_skills_dir(skills_dir)
     skill_name = (name or "").strip()
     if not skill_name:
         raise ValueError("name is required")
-    dest = MANAGED_SKILLS_DIR / skill_name
+    dest = resolved_skills_dir / skill_name
     if dest.exists():
         shutil.rmtree(dest)
 
-    manifest = _load_manifest()
+    manifest = _load_manifest(resolved_skills_dir)
     installed = manifest.get("installed", {})
     if isinstance(installed, dict):
         # Remove from any package records
@@ -323,15 +336,16 @@ def remove_skill(name: str) -> dict[str, Any]:
             if isinstance(rec, dict) and rec.get("skills") == []:
                 installed.pop(k, None)
         manifest["installed"] = installed
-        _save_manifest(manifest)
+        _save_manifest(resolved_skills_dir, manifest)
 
     # Also prune any stale entries (in case the skill was already missing).
-    reconcile_manifest()
+    reconcile_manifest(skills_dir=resolved_skills_dir)
     return {"ok": True}
 
 
-def update_all(replace: bool = True) -> dict[str, Any]:
-    manifest = reconcile_manifest()
+def update_all(replace: bool = True, skills_dir: Path | None = None) -> dict[str, Any]:
+    resolved_skills_dir = _resolve_skills_dir(skills_dir)
+    manifest = reconcile_manifest(skills_dir=resolved_skills_dir)
     installed = manifest.get("installed", {})
     if not isinstance(installed, dict) or not installed:
         return {"ok": True, "updated": []}
@@ -344,7 +358,7 @@ def update_all(replace: bool = True) -> dict[str, Any]:
         if not src:
             continue
         try:
-            res = install_from_source(str(src), replace=replace)
+            res = install_from_source(str(src), replace=replace, skills_dir=resolved_skills_dir)
             updated.append({"source": src, "installed": res.get("installed", []), "revision": res.get("revision")})
         except Exception as e:
             updated.append({"source": src, "error": str(e)})

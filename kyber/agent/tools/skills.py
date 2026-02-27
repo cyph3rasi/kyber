@@ -11,7 +11,6 @@ from kyber.agent.tools.base import Tool
 from kyber.agent.tools.registry import registry
 
 
-SKILLS_DIR = Path.home() / ".kyber" / "skills"
 DEFAULT_WORKSPACE = Path.home() / ".kyber" / "workspace"
 
 
@@ -30,8 +29,6 @@ def _resolve_category(skill_file: Path, loader: SkillsLoader, source: str) -> st
 
     if source == "workspace":
         root = loader.workspace_skills
-    elif source == "managed":
-        root = loader.managed_skills
     else:
         root = loader.builtin_skills
 
@@ -41,7 +38,7 @@ def _resolve_category(skill_file: Path, loader: SkillsLoader, source: str) -> st
 
 
 def _list_available_skills(loader: SkillsLoader) -> list[dict[str, str]]:
-    """List all available skills across workspace/managed/builtin sources."""
+    """List all available skills across workspace/builtin sources."""
     skills = []
     entries = loader.list_skills(filter_unavailable=False)
     for entry in entries:
@@ -66,24 +63,46 @@ def _extract_description(content: str) -> str:
     return ""
 
 
-def _get_skill_path(name: str, category: str | None = None) -> Path | None:
-    """Find a managed skill path by name (for skill_manage actions)."""
-    if not SKILLS_DIR.exists():
-        return None
-    
-    if category:
-        path = SKILLS_DIR / category / name
-        if path.exists():
-            return path
-    
-    # Search all categories
-    for category_dir in SKILLS_DIR.iterdir():
-        if not category_dir.is_dir():
+def _iter_skill_dirs(root: Path) -> list[Path]:
+    """Return candidate skill dirs under a root (direct + one nested level)."""
+    if not root.exists():
+        return []
+    candidates: list[Path] = []
+    for child in root.iterdir():
+        if not child.is_dir():
             continue
-        skill_dir = category_dir / name
-        if skill_dir.exists():
+        # Direct skill layout: <root>/<name>/SKILL.md
+        if (child / "SKILL.md").exists():
+            candidates.append(child)
+            continue
+        # Legacy nested layout: <root>/<category>/<name>/SKILL.md
+        for nested in child.iterdir():
+            if nested.is_dir() and (nested / "SKILL.md").exists():
+                candidates.append(nested)
+    return candidates
+
+
+def _get_skill_path(name: str, loader: SkillsLoader, category: str | None = None) -> Path | None:
+    """Find a mutable workspace skill dir by name."""
+    normalized_name = (name or "").strip()
+    if not normalized_name:
+        return None
+
+    direct = loader.workspace_skills / normalized_name
+    if (direct / "SKILL.md").exists():
+        return direct
+
+    # Optional category hint for legacy nested layouts.
+    if category:
+        nested = loader.workspace_skills / category / normalized_name
+        if (nested / "SKILL.md").exists():
+            return nested
+
+    # Fallback: scan known layouts.
+    for skill_dir in _iter_skill_dirs(loader.workspace_skills):
+        if skill_dir.name == normalized_name:
             return skill_dir
-    
+
     return None
 
 
@@ -123,10 +142,9 @@ class SkillsListTool(Tool):
         return json.dumps({
             "skills": skills,
             "count": len(skills),
-            "skills_dir": str(SKILLS_DIR),
+            "skills_dir": str(loader.workspace_skills),
             "skills_dirs": [
                 str(loader.workspace_skills),
-                str(loader.managed_skills),
                 str(loader.builtin_skills),
             ],
         }, ensure_ascii=False)
@@ -225,6 +243,7 @@ class SkillManageTool(Tool):
     def description(self) -> str:
         return (
             "Manage skills (create, update, delete). Skills are procedural memory — reusable approaches for recurring task types. "
+            "Newly created skills are workspace-local by default (workspace/skills/<name>/SKILL.md). "
             "Create when: complex task succeeded (5+ calls), errors overcome, user-corrected approach worked, non-trivial workflow discovered. "
             "Update when: instructions stale/wrong, OS-specific failures, missing steps or pitfalls found during use."
         )
@@ -249,7 +268,7 @@ class SkillManageTool(Tool):
                 },
                 "category": {
                     "type": "string",
-                    "description": "Optional category/domain for organizing the skill (e.g. 'devops', 'data-science'). Creates a subdirectory grouping.",
+                    "description": "Optional lookup hint for legacy nested skill layouts when patching/editing/deleting.",
                 },
                 "old_string": {
                     "type": "string",
@@ -288,13 +307,14 @@ class SkillManageTool(Tool):
         file_content: str | None = None,
         **kwargs
     ) -> str:
+        loader = _get_loader(kwargs)
         
         if action == "create":
             if not content:
                 return json.dumps({"error": "content required for create action"}, ensure_ascii=False)
-            
-            category = category or "general"
-            skill_dir = SKILLS_DIR / category / name
+
+            # Bot-created skills are workspace-local by default.
+            skill_dir = loader.workspace_skills / name
             skill_dir.mkdir(parents=True, exist_ok=True)
             
             skill_file = skill_dir / "SKILL.md"
@@ -303,12 +323,12 @@ class SkillManageTool(Tool):
             return json.dumps({
                 "status": "created",
                 "name": name,
-                "category": category,
+                "source": "workspace",
                 "path": str(skill_dir),
             }, ensure_ascii=False)
         
         elif action == "patch":
-            skill_path = _get_skill_path(name, category)
+            skill_path = _get_skill_path(name, loader, category)
             if not skill_path:
                 return json.dumps({"error": f"Skill '{name}' not found"}, ensure_ascii=False)
             
@@ -333,6 +353,7 @@ class SkillManageTool(Tool):
             return json.dumps({
                 "status": "patched",
                 "name": name,
+                "source": "workspace",
                 "file": str(target_file),
             }, ensure_ascii=False)
         
@@ -340,7 +361,7 @@ class SkillManageTool(Tool):
             if not content:
                 return json.dumps({"error": "content required for edit action"}, ensure_ascii=False)
             
-            skill_path = _get_skill_path(name, category)
+            skill_path = _get_skill_path(name, loader, category)
             if not skill_path:
                 return json.dumps({"error": f"Skill '{name}' not found"}, ensure_ascii=False)
             
@@ -350,10 +371,11 @@ class SkillManageTool(Tool):
             return json.dumps({
                 "status": "edited",
                 "name": name,
+                "source": "workspace",
             }, ensure_ascii=False)
         
         elif action == "delete":
-            skill_path = _get_skill_path(name, category)
+            skill_path = _get_skill_path(name, loader, category)
             if not skill_path:
                 return json.dumps({"error": f"Skill '{name}' not found"}, ensure_ascii=False)
             
@@ -362,13 +384,14 @@ class SkillManageTool(Tool):
             return json.dumps({
                 "status": "deleted",
                 "name": name,
+                "source": "workspace",
             }, ensure_ascii=False)
         
         elif action == "write_file":
             if not file_path or not file_content:
                 return json.dumps({"error": "file_path and file_content required for write_file action"}, ensure_ascii=False)
             
-            skill_path = _get_skill_path(name, category)
+            skill_path = _get_skill_path(name, loader, category)
             if not skill_path:
                 return json.dumps({"error": f"Skill '{name}' not found"}, ensure_ascii=False)
             
@@ -384,6 +407,7 @@ class SkillManageTool(Tool):
             return json.dumps({
                 "status": "wrote_file",
                 "name": name,
+                "source": "workspace",
                 "file": file_path,
             }, ensure_ascii=False)
         
@@ -391,7 +415,7 @@ class SkillManageTool(Tool):
             if not file_path:
                 return json.dumps({"error": "file_path required for remove_file action"}, ensure_ascii=False)
             
-            skill_path = _get_skill_path(name, category)
+            skill_path = _get_skill_path(name, loader, category)
             if not skill_path:
                 return json.dumps({"error": f"Skill '{name}' not found"}, ensure_ascii=False)
             
@@ -404,6 +428,7 @@ class SkillManageTool(Tool):
             return json.dumps({
                 "status": "removed_file",
                 "name": name,
+                "source": "workspace",
                 "file": file_path,
             }, ensure_ascii=False)
         

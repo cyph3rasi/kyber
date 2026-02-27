@@ -130,6 +130,12 @@ def build_scan_description() -> tuple[str, str]:
 
     # Build skill-scanner env vars and CLI flags from kyber config
     skl_env, skl_flags = _build_skill_scanner_env_and_flags()
+    workspace_skills_path = "~/.kyber/workspace/skills"
+    try:
+        from kyber.config.loader import load_config
+        workspace_skills_path = str(load_config().workspace_path / "skills")
+    except Exception:
+        pass
 
     # Build previous-issues section
     outstanding = get_outstanding_issues()
@@ -244,18 +250,12 @@ Do NOT run clamscan or clamdscan yourself — just read the latest results.
 
 ## Step 2b: Skill Security Scan (Cisco AI Defense skill-scanner)
 
-If the output shows "skill-scanner installed", scan all user skill directories for prompt injection, data exfiltration, and malicious code patterns.
+If the output shows "skill-scanner installed", scan workspace skills for prompt injection, data exfiltration, and malicious code patterns.
 
 Run this in a single `exec` call:
 
 ```
-{skl_env}skill-scanner scan-all ~/.kyber/skills --recursive {skl_flags} --format json 2>&1
-```
-
-Then also scan workspace skills if they exist:
-
-```
-{skl_env}skill-scanner scan-all ~/kyber-workspace/skills --recursive {skl_flags} --format json 2>&1
+{skl_env}skill-scanner scan-all {workspace_skills_path} --recursive {skl_flags} --format json 2>&1
 ```
 
 For each finding from skill-scanner, create a report finding with:

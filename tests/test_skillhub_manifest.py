@@ -6,12 +6,9 @@ from pathlib import Path
 from kyber.skillhub import manager as m
 
 
-def test_reconcile_manifest_prunes_deleted_skills(tmp_path: Path, monkeypatch) -> None:
+def test_reconcile_manifest_prunes_deleted_skills(tmp_path: Path) -> None:
     managed = tmp_path / "skills"
     managed.mkdir(parents=True, exist_ok=True)
-
-    # Patch managed skills dir for this test.
-    monkeypatch.setattr(m, "MANAGED_SKILLS_DIR", managed)
 
     # Create two skills on disk.
     (managed / "a").mkdir()
@@ -36,7 +33,7 @@ def test_reconcile_manifest_prunes_deleted_skills(tmp_path: Path, monkeypatch) -
         encoding="utf-8",
     )
 
-    out = m.reconcile_manifest()
+    out = m.reconcile_manifest(skills_dir=managed)
     rec = out["installed"]["pkg"]
     assert rec["skills"] == ["a", "b"]
 
@@ -45,6 +42,6 @@ def test_reconcile_manifest_prunes_deleted_skills(tmp_path: Path, monkeypatch) -
     (managed / "b").rmdir()
     # Directory removal above fails if not empty; ensure empty:
     # (note: if rmdir fails, test will fail)
-    out2 = m.reconcile_manifest()
+    out2 = m.reconcile_manifest(skills_dir=managed)
     rec2 = out2["installed"]["pkg"]
     assert rec2["skills"] == ["a"]

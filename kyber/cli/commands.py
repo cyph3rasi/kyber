@@ -226,7 +226,7 @@ This file stores important information that should persist across sessions.
             "Drop custom skills here as folders containing a `SKILL.md`.\n\n"
             "Example:\n"
             "- `skills/my-skill/SKILL.md`\n\n"
-            "Kyber also supports managed skills in `~/.kyber/skills/<skill>/SKILL.md`.\n"
+            "This workspace is the canonical skills location.\n"
         )
         console.print("  [dim]Created skills/README.md[/dim]")
 
@@ -806,7 +806,7 @@ app.add_typer(skills_app, name="skills")
 
 @skills_app.command("list")
 def skills_list():
-    """List skills from workspace, managed (~/.kyber/skills), and builtin."""
+    """List skills from workspace and builtin skill sources."""
     from kyber.config.loader import load_config
     from kyber.agent.skills import SkillsLoader
 
@@ -832,10 +832,17 @@ def skills_add(
     skill: str | None = typer.Option(None, "--skill", help="Only install a specific skill directory name"),
     replace: bool = typer.Option(False, "--replace", help="Replace existing skill dirs if present"),
 ):
-    """Install skills into ~/.kyber/skills by cloning a repo and copying SKILL.md directories."""
+    """Install skills into the current workspace by cloning a repo and copying SKILL.md directories."""
+    from kyber.config.loader import load_config
     from kyber.skillhub.manager import install_from_source
 
-    res = install_from_source(source, skill=skill, replace=replace)
+    cfg = load_config()
+    res = install_from_source(
+        source,
+        skill=skill,
+        replace=replace,
+        skills_dir=cfg.workspace_path / "skills",
+    )
     installed = res.get("installed") or []
     if installed:
         console.print(f"[green]✓[/green] Installed: {', '.join(installed)}")
@@ -844,20 +851,24 @@ def skills_add(
 
 
 @skills_app.command("remove")
-def skills_remove(name: str = typer.Argument(..., help="Skill directory name under ~/.kyber/skills")):
-    """Remove a managed skill from ~/.kyber/skills."""
+def skills_remove(name: str = typer.Argument(..., help="Skill directory name under workspace/skills")):
+    """Remove a skill from the current workspace."""
+    from kyber.config.loader import load_config
     from kyber.skillhub.manager import remove_skill
 
-    remove_skill(name)
+    cfg = load_config()
+    remove_skill(name, skills_dir=cfg.workspace_path / "skills")
     console.print(f"[green]✓[/green] Removed: {name}")
 
 
 @skills_app.command("update-all")
 def skills_update_all():
-    """Update all managed skill sources recorded in the manifest."""
+    """Update all workspace skill sources recorded in the manifest."""
+    from kyber.config.loader import load_config
     from kyber.skillhub.manager import update_all
 
-    res = update_all(replace=True)
+    cfg = load_config()
+    res = update_all(replace=True, skills_dir=cfg.workspace_path / "skills")
     updated = res.get("updated") or []
     ok = [u for u in updated if not u.get("error")]
     bad = [u for u in updated if u.get("error")]
