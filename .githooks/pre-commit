@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "[pre-commit] bumping version..."
+./scripts/bump-version.sh
+
+echo "[pre-commit] syncing lockfile..."
+uv lock
+
+# Ensure updated metadata and lockfile are included in the same commit.
+git add pyproject.toml uv.lock

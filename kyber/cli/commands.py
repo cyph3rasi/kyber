@@ -521,17 +521,15 @@ def gateway(
             else:
                 return f"ClamAV scan error: {report.get('error', 'unknown')}"
 
-        # When the job has delivery configured, route through that channel
-        # so spawned background workers send completions to the right place.
-        channel = "cli"
-        chat_id = "direct"
-        if job.payload.deliver and job.payload.to:
-            channel = job.payload.channel or "discord"
-            chat_id = job.payload.to
+        from kyber.cron.runtime import resolve_job_context
+
+        # Cron runs should preserve the same conversation context whenever
+        # available, while still routing delivery to the requested channel.
+        session_key, channel, chat_id = resolve_job_context(job)
 
         response = await agent.process_direct(
             job.payload.message,
-            session_key=f"cron:{job.id}",
+            session_key=session_key,
             channel=channel,
             chat_id=chat_id,
         )

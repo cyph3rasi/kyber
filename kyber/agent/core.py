@@ -681,7 +681,13 @@ class AgentCore:
                 msg_tool.set_context(channel, chat_id)
             
             result = await registry.execute(
-                tc.name, tc.arguments, task_id=task_id, agent_core=self
+                tc.name,
+                tc.arguments,
+                task_id=task_id,
+                session_key=task_id,
+                context_channel=channel,
+                context_chat_id=chat_id,
+                agent_core=self,
             )
             
             # Truncate very long results

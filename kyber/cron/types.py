@@ -27,6 +27,8 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    # Optional conversation session to reuse for context/history.
+    session_key: str | None = None
 
 
 @dataclass

@@ -151,8 +151,8 @@ class ScheduleCronjobTool(Tool):
     def description(self) -> str:
         return (
             "Schedule an automated task to run the agent on a schedule.\n\n"
-            "The cronjob runs in a FRESH SESSION with NO CONTEXT from this conversation.\n"
-            "The prompt must be COMPLETELY SELF-CONTAINED with ALL necessary information.\n\n"
+            "Cron jobs run with the full kyber runtime (same tools, skills, and memory).\n"
+            "When scheduled from chat, they also reuse that chat session context by default.\n\n"
             "SCHEDULE FORMATS:\n"
             "- One-shot: \"30m\", \"2h\", \"1d\" (runs once after delay)\n"
             "- Interval: \"every 30m\", \"every 2h\" (recurring)\n"
@@ -163,10 +163,8 @@ class ScheduleCronjobTool(Tool):
             "- Intervals/cron: run forever by default\n"
             "- Set repeat=N to run exactly N times then auto-delete\n\n"
             "DELIVERY OPTIONS (where output goes):\n"
-            "- \"origin\": Back to current chat (default if in messaging platform)\n"
-            "- \"local\": Save to local files only (default if in CLI)\n"
-            "- \"telegram\": Send to Telegram home channel\n"
-            "- \"discord\": Send to Discord home channel\n"
+            "- \"origin\": Back to current chat\n"
+            "- \"local\": Save to local files only\n"
             "- \"telegram:123456\": Send to specific chat (if user provides ID)"
         )
 
@@ -177,7 +175,7 @@ class ScheduleCronjobTool(Tool):
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Complete, self-contained instructions. Must include ALL context - the future agent will have NO memory of this conversation.",
+                    "description": "Instructions for what the scheduled run should do.",
                 },
                 "schedule": {
                     "type": "string",
@@ -193,7 +191,7 @@ class ScheduleCronjobTool(Tool):
                 },
                 "deliver": {
                     "type": "string",
-                    "description": "Where to send output: 'origin' (back to this chat), 'local' (files only), 'telegram', 'discord', or 'platform:chat_id'",
+                    "description": "Where to send output: 'origin' (back to this chat), 'local' (files only), or 'platform:chat_id' (e.g. 'discord:12345')",
                 },
             },
             "required": ["prompt", "schedule"],
@@ -211,6 +209,12 @@ class ScheduleCronjobTool(Tool):
         import json
         
         service = _get_cron_service()
+
+        source_session_key = str(
+            kwargs.get("session_key") or kwargs.get("task_id") or ""
+        ).strip() or None
+        origin_channel = str(kwargs.get("context_channel") or "").strip()
+        origin_chat_id = str(kwargs.get("context_chat_id") or "").strip()
         
         try:
             cron_schedule = _parse_schedule(schedule)
@@ -231,8 +235,37 @@ class ScheduleCronjobTool(Tool):
         elif deliver.startswith("discord:"):
             channel = "discord"
             to = deliver.split(":", 1)[1]
+        elif deliver == "origin":
+            if origin_channel and origin_chat_id:
+                channel = origin_channel
+                to = origin_chat_id
+            else:
+                should_deliver = False
         elif deliver in ("telegram", "discord"):
             channel = deliver
+            if origin_channel == deliver and origin_chat_id:
+                to = origin_chat_id
+        elif deliver not in ("local",):
+            return json.dumps(
+                {
+                    "error": (
+                        "Invalid deliver target. Use 'local', 'origin', "
+                        "or 'platform:chat_id' (e.g. 'discord:12345')."
+                    )
+                },
+                ensure_ascii=False,
+            )
+
+        if should_deliver and not to:
+            return json.dumps(
+                {
+                    "error": (
+                        "Delivery target requires a chat ID. "
+                        "Use 'origin' or provide 'platform:chat_id'."
+                    )
+                },
+                ensure_ascii=False,
+            )
         
         job = service.add_job(
             name=name or "Agent Task",
@@ -241,6 +274,7 @@ class ScheduleCronjobTool(Tool):
             deliver=should_deliver,
             channel=channel,
             to=to,
+            session_key=source_session_key,
             delete_after_run=delete_after,
         )
         

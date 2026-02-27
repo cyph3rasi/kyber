@@ -108,6 +108,16 @@ class CronService:
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
                             to=j["payload"].get("to"),
+                            session_key=(
+                                j["payload"].get("sessionKey")
+                                if j.get("payload")
+                                else None
+                            )
+                            or (
+                                j["payload"].get("session_key")
+                                if j.get("payload")
+                                else None
+                            ),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -155,6 +165,7 @@ class CronService:
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
+                        "sessionKey": j.payload.session_key,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -290,6 +301,7 @@ class CronService:
         deliver: bool = False,
         channel: str | None = None,
         to: str | None = None,
+        session_key: str | None = None,
         delete_after_run: bool = False,
         job_id: str | None = None,
     ) -> CronJob:
@@ -314,6 +326,7 @@ class CronService:
                 deliver=deliver,
                 channel=channel,
                 to=to,
+                session_key=session_key,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now, self.timezone)),
             created_at_ms=now,
@@ -368,6 +381,7 @@ class CronService:
         deliver: bool | None = None,
         channel: str | None = None,
         to: str | None = None,
+        session_key: str | None = None,
         delete_after_run: bool | None = None,
     ) -> CronJob | None:
         """Update an existing job's fields."""
@@ -388,6 +402,8 @@ class CronService:
                     job.payload.channel = channel or None
                 if to is not None:
                     job.payload.to = to or None
+                if session_key is not None:
+                    job.payload.session_key = session_key or None
                 if delete_after_run is not None:
                     job.delete_after_run = delete_after_run
                 job.updated_at_ms = _now_ms()
