@@ -21,19 +21,6 @@ except ImportError:
     DISCORD_AVAILABLE = False
     discord = None
 
-# Kawaii faces for status messages
-KAWAII_THINKING = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
-
-THINKING_VERBS = [
-    "pondering", "contemplating", "musing", "cogitating", "ruminating",
-    "deliberating", "mulling", "reflecting", "processing", "reasoning",
-    "analyzing", "computing", "synthesizing", "formulating", "brainstorming",
-]
-
-
-import random
-
-
 class DiscordChannel(BaseChannel):
     """
     Discord channel implementation.
@@ -347,9 +334,7 @@ class DiscordChannel(BaseChannel):
             if channel is None:
                 return
             
-            face = random.choice(KAWAII_THINKING)
-            verb = random.choice(THINKING_VERBS)
-            content = f"{face} {verb}..."
+            content = "💎 Working..."
             msg = await channel.send(content)
             self._status_messages[scope_key] = (msg, time.time(), [])
         except Exception as e:
@@ -385,8 +370,7 @@ class DiscordChannel(BaseChannel):
             
             try:
                 elapsed = time.time() - start_time
-                face = random.choice(KAWAII_THINKING)
-                header = f"{face} working... ({format_duration(elapsed)})\n"
+                header = f"💎 Working... ({format_duration(elapsed)})\n"
                 content = header + "\n".join(tool_lines)
                 
                 # Discord message limit is 2000 chars

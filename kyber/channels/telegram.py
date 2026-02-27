@@ -389,7 +389,7 @@ class TelegramChannel(BaseChannel):
                 pass
 
         try:
-            msg = await self._app.bot.send_message(chat_id=chat_id, text="working...")
+            msg = await self._app.bot.send_message(chat_id=chat_id, text="💎 Working...")
             self._status_messages[scope_key] = (msg.message_id, time.time(), [])
         except Exception as e:
             logger.debug(f"Failed to create Telegram status message: {e}")
@@ -412,7 +412,7 @@ class TelegramChannel(BaseChannel):
                 tool_lines = tool_lines[-15:]
 
             elapsed = time.time() - start_time
-            content = f"working... ({format_duration(elapsed)})\n" + "\n".join(tool_lines)
+            content = f"💎 Working... ({format_duration(elapsed)})\n" + "\n".join(tool_lines)
             if len(content) > 3900:
                 content = content[:3900] + "\n..."
 

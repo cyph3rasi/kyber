@@ -35,6 +35,7 @@ AGENT_MESSAGE_TIMEOUT_SECONDS = 600.0
 AGENT_LOOP_TIMEOUT_SECONDS = 600.0
 AGENT_SINGLE_LLM_TIMEOUT_SECONDS = 600.0
 AGENT_SINGLE_TOOL_TIMEOUT_SECONDS = 600.0
+AGENT_STATUS_SUMMARY_TIMEOUT_SECONDS = 4.0
 
 
 class AgentCore:
@@ -341,7 +342,7 @@ class AgentCore:
             run_session = Session(key=session_key)
         
         status_key = str(msg.metadata.get("message_id") or f"run-{time.time_ns()}")
-        status_intro = self._build_status_intro(msg.content)
+        status_intro = await self._build_status_intro(msg.content)
 
         # Run the tool-calling loop
         response_text = await self._run_loop(
@@ -540,7 +541,7 @@ class AgentCore:
                             await self.progress_callback(
                                 context_channel,
                                 context_chat_id,
-                                context_status_intro or "Working...",
+                                context_status_intro or "✅ Task: In progress.",
                                 context_status_key,
                             )
                             status_started = True
@@ -648,14 +649,63 @@ class AgentCore:
                 except Exception:
                     pass
 
-    def _build_status_intro(self, content: str, limit: int = 120) -> str:
+    async def _build_status_intro(self, content: str, limit: int = 120) -> str:
         """Build a short status line that identifies the request being worked on."""
         text = " ".join((content or "").strip().split())
         if not text:
-            return "Working..."
+            return "✅ Task: In progress."
+
+        summary = await self._summarize_task_for_status(text, limit=limit)
+        if summary:
+            return f"✅ Task: {summary}"
+
         if len(text) > limit:
             text = text[: max(0, limit - 3)].rstrip() + "..."
-        return f"Working on: {text}"
+        return f"✅ Task: {text}"
+
+    async def _summarize_task_for_status(self, content: str, limit: int = 120) -> str | None:
+        """Ask the model for a compact one-sentence task summary for status UI."""
+        prompt_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Rewrite the user's request as one concise action sentence for status UI. "
+                    "Do not copy the input verbatim. "
+                    "Return plain text only, no markdown, no label."
+                ),
+            },
+            {"role": "user", "content": content},
+        ]
+
+        try:
+            response = await asyncio.wait_for(
+                self.provider.chat(
+                    messages=prompt_messages,
+                    tools=None,
+                    model=self.model,
+                    max_tokens=48,
+                    temperature=0.2,
+                ),
+                timeout=AGENT_STATUS_SUMMARY_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+
+        summary = " ".join((response.content or "").strip().split())
+        if not summary:
+            return None
+
+        for prefix in ("✅ Task:", "Task:", "TASK:", "- "):
+            if summary.startswith(prefix):
+                summary = summary[len(prefix):].strip()
+                break
+
+        summary = summary.strip(" \"'")
+        if not summary:
+            return None
+        if len(summary) > limit:
+            summary = summary[: max(0, limit - 3)].rstrip() + "..."
+        return summary
 
     def _build_task_label(self, content: str, limit: int = 80) -> str:
         """Build a concise task label from user input for dashboard lists."""
