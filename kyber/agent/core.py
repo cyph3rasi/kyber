@@ -567,7 +567,23 @@ class AgentCore:
                                 current_action=action_line,
                             )
 
-                        tool_start_time = time.time()
+                        # Emit status before tool execution so users see what is
+                        # starting, not only what has already finished.
+                        if self.progress_callback:
+                            try:
+                                status_line = get_cute_tool_message(
+                                    tc.name,
+                                    tc.arguments,
+                                    0.0,
+                                )
+                                await self.progress_callback(
+                                    context_channel,
+                                    context_chat_id,
+                                    status_line,
+                                    context_status_key,
+                                )
+                            except Exception:
+                                pass
 
                         # Execute the tool
                         try:
@@ -584,26 +600,6 @@ class AgentCore:
                             result = json.dumps(
                                 {"error": f"Tool '{tc.name}' timed out after {int(max_single_tool_seconds)}s"}
                             )
-
-                        tool_duration = time.time() - tool_start_time
-
-                        # Send cute progress update with timing
-                        if self.progress_callback:
-                            try:
-                                status_line = get_cute_tool_message(
-                                    tc.name,
-                                    tc.arguments,
-                                    tool_duration,
-                                    result=result[:500] if result else None,
-                                )
-                                await self.progress_callback(
-                                    context_channel,
-                                    context_chat_id,
-                                    status_line,
-                                    context_status_key,
-                                )
-                            except Exception:
-                                pass
 
                         # Add tool result to conversation
                         tool_msg = {

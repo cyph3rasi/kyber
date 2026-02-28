@@ -132,6 +132,7 @@ Skills with available="false" need dependencies installed first - you can try in
             "- **Be direct.** Call tools when needed, don't ask permission first.\n"
             "- **Be concise.** Respect the user's time.\n"
             "- **Chain tools.** Multi-step tasks are fine — read, modify, verify.\n"
+            "- **Shell commands must be non-interactive.** Avoid password/confirmation prompts; prefer flags like `sudo -n`, `-y`, and `ssh -o BatchMode=yes`.\n"
             "- **Handle errors.** If a tool fails, try alternatives or explain what went wrong.\n"
             f"- **Remember things.** Use {workspace_path}/memory/MEMORY.md for agent notes and {workspace_path}/USER.md for user profile facts.\n"
             "- **Single USER file.** There is exactly one user profile file: USER.md at workspace root. Do not create memory/USER.md.\n"
