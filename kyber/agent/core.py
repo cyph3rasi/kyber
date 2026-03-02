@@ -480,24 +480,6 @@ class AgentCore:
         status_started = False
 
         try:
-            if self.progress_callback:
-                try:
-                    await self.progress_callback(
-                        context_channel,
-                        context_chat_id,
-                        "__KYBER_STATUS_START__",
-                        context_status_key,
-                    )
-                    await self.progress_callback(
-                        context_channel,
-                        context_chat_id,
-                        context_status_intro or "✅ Task: In progress.",
-                        context_status_key,
-                    )
-                    status_started = True
-                except Exception:
-                    pass
-
             while True:
                 if self.max_iterations > 0 and iteration >= self.max_iterations:
                     break
@@ -536,6 +518,24 @@ class AgentCore:
                 
                 # If the LLM returned tool calls — execute them
                 if response.has_tool_calls:
+                    if self.progress_callback and not status_started:
+                        try:
+                            await self.progress_callback(
+                                context_channel,
+                                context_chat_id,
+                                "__KYBER_STATUS_START__",
+                                context_status_key,
+                            )
+                            await self.progress_callback(
+                                context_channel,
+                                context_chat_id,
+                                context_status_intro or "✅ Task: In progress.",
+                                context_status_key,
+                            )
+                            status_started = True
+                        except Exception:
+                            pass
+
                     if not tracked_task_id:
                         task = self.registry.create(
                             description=tracked_task_description,

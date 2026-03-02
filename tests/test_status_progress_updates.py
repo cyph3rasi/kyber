@@ -99,7 +99,7 @@ def test_status_intro_emits_immediately_before_tool_updates() -> None:
     asyncio.run(_run())
 
 
-def test_status_intro_emits_for_no_tool_response() -> None:
+def test_status_intro_not_emitted_for_no_tool_response() -> None:
     async def _run() -> None:
         with TemporaryDirectory() as td:
             events: list[str] = []
@@ -132,10 +132,6 @@ def test_status_intro_emits_for_no_tool_response() -> None:
             )
 
             assert out == "done"
-            assert events == [
-                "__KYBER_STATUS_START__",
-                "✅ Task: say done",
-                "__KYBER_STATUS_END__",
-            ]
+            assert events == []
 
     asyncio.run(_run())
