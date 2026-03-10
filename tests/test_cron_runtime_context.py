@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from kyber.cron.runtime import resolve_job_context
 from kyber.cron.service import CronService
 from kyber.cron.types import CronJob, CronPayload, CronSchedule
@@ -71,3 +73,54 @@ def test_cron_service_persists_session_key(tmp_path) -> None:
     jobs = reloaded.list_jobs(include_disabled=True)
     assert len(jobs) == 1
     assert jobs[0].payload.session_key == "discord:1374747874885369889"
+
+
+@pytest.mark.asyncio
+async def test_running_service_reload_keeps_external_delete(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    runner = CronService(store_path)
+    job = runner.add_job(
+        name="delete me",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="ping",
+        job_id="job-delete",
+    )
+
+    editor = CronService(store_path)
+    assert editor.remove_job(job.id) is True
+
+    await runner._on_timer()
+
+    reloaded = CronService(store_path)
+    assert reloaded.list_jobs(include_disabled=True) == []
+
+
+@pytest.mark.asyncio
+async def test_running_service_reload_keeps_external_update(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    runner = CronService(store_path)
+    job = runner.add_job(
+        name="before",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="old message",
+        job_id="job-update",
+    )
+
+    editor = CronService(store_path)
+    updated = editor.update_job(
+        job.id,
+        name="after",
+        message="new message",
+        schedule=CronSchedule(kind="cron", expr="0 9 * * *"),
+    )
+    assert updated is not None
+
+    await runner._on_timer()
+
+    reloaded = CronService(store_path)
+    jobs = reloaded.list_jobs(include_disabled=True)
+    assert len(jobs) == 1
+    assert jobs[0].name == "after"
+    assert jobs[0].payload.message == "new message"
+    assert jobs[0].schedule.kind == "cron"
+    assert jobs[0].schedule.expr == "0 9 * * *"

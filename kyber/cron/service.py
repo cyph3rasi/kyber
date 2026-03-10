@@ -73,19 +73,30 @@ class CronService:
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
         timezone: str | None = None,
+        sync_interval_ms: int = 2_000,
     ):
         self.store_path = store_path
         self.on_job = on_job  # Callback to execute job, returns response text
         self.timezone = timezone  # Global user timezone for cron expressions
+        self.sync_interval_ms = max(250, sync_interval_ms)
         self._store: CronStore | None = None
+        self._store_mtime_ns: int | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
-    
-    def _load_store(self) -> CronStore:
+
+    def _get_store_mtime_ns(self) -> int | None:
+        try:
+            return self.store_path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+
+    def _load_store(self, force: bool = False) -> CronStore:
         """Load jobs from disk."""
-        if self._store:
+        if self._store and not force:
             return self._store
-        
+
         if self.store_path.exists():
             try:
                 data = json.loads(self.store_path.read_text())
@@ -129,22 +140,35 @@ class CronService:
                         updated_at_ms=j.get("updatedAtMs", 0),
                         delete_after_run=j.get("deleteAfterRun", False),
                     ))
-                self._store = CronStore(jobs=jobs)
+                self._store = CronStore(version=data.get("version", 1), jobs=jobs)
+                self._store_mtime_ns = self._get_store_mtime_ns()
             except Exception as e:
                 logger.warning(f"Failed to load cron store: {e}")
                 self._store = CronStore()
+                self._store_mtime_ns = self._get_store_mtime_ns()
         else:
             self._store = CronStore()
-        
+            self._store_mtime_ns = None
+
         return self._store
-    
+
+    def _refresh_store(self, force: bool = False) -> CronStore:
+        """Reload the store if the backing file changed."""
+        if self._store is None:
+            return self._load_store(force=True)
+
+        current_mtime = self._get_store_mtime_ns()
+        if force or current_mtime != self._store_mtime_ns:
+            return self._load_store(force=True)
+        return self._store
+
     def _save_store(self) -> None:
         """Save jobs to disk."""
         if not self._store:
             return
-        
+
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         data = {
             "version": self._store.version,
             "jobs": [
@@ -180,13 +204,18 @@ class CronService:
                 for j in self._store.jobs
             ]
         }
-        
-        self.store_path.write_text(json.dumps(data, indent=2))
-    
+
+        temp_path = self.store_path.with_name(
+            f"{self.store_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        temp_path.write_text(json.dumps(data, indent=2))
+        temp_path.replace(self.store_path)
+        self._store_mtime_ns = self._get_store_mtime_ns()
+
     async def start(self) -> None:
         """Start the cron service."""
         self._running = True
-        self._load_store()
+        self._refresh_store(force=True)
         self._recompute_next_runs()
         self._save_store()
         self._arm_timer()
@@ -220,35 +249,39 @@ class CronService:
         """Schedule the next timer tick."""
         if self._timer_task:
             self._timer_task.cancel()
-        
-        next_wake = self._get_next_wake_ms()
-        if not next_wake or not self._running:
+
+        if not self._running:
             return
-        
-        delay_ms = max(0, next_wake - _now_ms())
+
+        next_wake = self._get_next_wake_ms()
+        poll_wake = _now_ms() + self.sync_interval_ms
+        target_wake = poll_wake if next_wake is None else min(next_wake, poll_wake)
+
+        delay_ms = max(0, target_wake - _now_ms())
         delay_s = delay_ms / 1000
-        
+
         async def tick():
             await asyncio.sleep(delay_s)
             if self._running:
                 await self._on_timer()
-        
+
         self._timer_task = asyncio.create_task(tick())
-    
+
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
+        self._refresh_store()
         if not self._store:
             return
-        
+
         now = _now_ms()
         due_jobs = [
             j for j in self._store.jobs
             if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
         ]
-        
+
         for job in due_jobs:
             await self._execute_job(job)
-        
+
         self._save_store()
         self._arm_timer()
     
@@ -289,7 +322,7 @@ class CronService:
     
     def list_jobs(self, include_disabled: bool = False) -> list[CronJob]:
         """List all jobs."""
-        store = self._load_store()
+        store = self._refresh_store()
         jobs = store.jobs if include_disabled else [j for j in store.jobs if j.enabled]
         return sorted(jobs, key=lambda j: j.state.next_run_at_ms or float('inf'))
     
@@ -306,7 +339,7 @@ class CronService:
         job_id: str | None = None,
     ) -> CronJob:
         """Add a new job. If job_id is provided and already exists, return the existing job."""
-        store = self._load_store()
+        store = self._refresh_store(force=True)
         now = _now_ms()
 
         # If a fixed ID was requested, check for duplicates
@@ -343,7 +376,7 @@ class CronService:
     
     def remove_job(self, job_id: str) -> bool:
         """Remove a job by ID."""
-        store = self._load_store()
+        store = self._refresh_store(force=True)
         before = len(store.jobs)
         store.jobs = [j for j in store.jobs if j.id != job_id]
         removed = len(store.jobs) < before
@@ -357,7 +390,7 @@ class CronService:
     
     def enable_job(self, job_id: str, enabled: bool = True) -> CronJob | None:
         """Enable or disable a job."""
-        store = self._load_store()
+        store = self._refresh_store(force=True)
         for job in store.jobs:
             if job.id == job_id:
                 job.enabled = enabled
@@ -385,7 +418,7 @@ class CronService:
         delete_after_run: bool | None = None,
     ) -> CronJob | None:
         """Update an existing job's fields."""
-        store = self._load_store()
+        store = self._refresh_store(force=True)
         for job in store.jobs:
             if job.id == job_id:
                 if name is not None:
@@ -419,7 +452,7 @@ class CronService:
     
     async def run_job(self, job_id: str, force: bool = False) -> bool:
         """Manually run a job."""
-        store = self._load_store()
+        store = self._refresh_store(force=True)
         for job in store.jobs:
             if job.id == job_id:
                 if not force and not job.enabled:
@@ -432,7 +465,7 @@ class CronService:
     
     def status(self) -> dict:
         """Get service status."""
-        store = self._load_store()
+        store = self._refresh_store()
         return {
             "enabled": self._running,
             "jobs": len(store.jobs),
