@@ -35,8 +35,9 @@ Most assistants are fine for simple Q&A, then fall apart when the real work star
 - `Actually concurrent` Long-running tasks do not block new messages
 - `Background execution` Start complex work and keep chatting
 - `Chat anywhere` Discord, Telegram, WhatsApp, dashboard, or CLI
-- `Tooling built in` Shell, file I/O, web search/fetch, cron, skills
+- `Tooling built in` Shell, file I/O, web search/fetch, cron, notebook, remote tools, and skills
 - `Runs anywhere` Laptop, VPS, homelab, Raspberry Pi
+- `Multi-machine aware` Pair machines, run commands remotely, and share notes across your fleet
 - `Observable` Real-time task status, progress, and cancellation
 - `Secure by default` Secrets in `.env`, not raw config JSON
 
@@ -56,6 +57,11 @@ Most assistants are fine for simple Q&A, then fall apart when the real work star
 - Schedule recurring tasks with cron
 - Send proactive updates into your channels
 - Keep workflows running without babysitting
+
+### Work Across Machines
+- Pair your laptop and VPS so one Kyber can reach the other
+- Run remote commands and inspect files on connected peers
+- Share durable notes through the built-in notebook
 
 ### Operate Confidently
 - Track active and completed tasks in the dashboard
@@ -101,6 +107,7 @@ kyber: schedules cron -> runs checks -> posts concise summaries on schedule
 - Provider/model configuration
 - Cron job management
 - Skills discovery and installation
+- Notebook visibility across paired machines
 - Security scan controls and report views
 
 ## Dashboard Preview
@@ -125,6 +132,10 @@ kyber: schedules cron -> runs checks -> posts concise summaries on schedule
 
 ### Discord Bot Personas
 ![Kyber Dashboard Discord Bot Personas](.github/assets/readme/discordbotpersonas.png)
+
+## What’s New in the Current Architecture
+
+Kyber now supports a host/spoke network model for paired machines. Your laptop can talk to a VPS, a VPS can expose a notebook and selected tools, and the agent can choose whether work should happen locally, remotely, or as shared context. The command surface is broader too, with notebook tools, remote execution primitives, and richer CLI/TUI plumbing alongside the original local shell/file/web toolkit.
 
 ## Security And Reliability
 
