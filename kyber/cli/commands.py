@@ -104,6 +104,92 @@ def migrate_secrets_cmd():
     console.print(f"  .env file permissions set to [cyan]600[/cyan] (owner only).")
 
 
+@app.command("codex-models")
+def codex_models_cmd(
+    format: str = typer.Option("text", "--format", "-f", help="Output format: text | json"),
+):
+    """Print available OpenAI Codex models for the current ChatGPT login.
+
+    Used by the installer and dashboard to populate the model picker when
+    the user has selected the ChatGPT subscription provider. Reads tokens
+    from ~/.codex/auth.json and refreshes them if needed.
+    """
+    import asyncio
+    import json as _json
+
+    from kyber.providers.codex_auth import CodexAuthError, find_codex_auth
+    from kyber.providers.codex_provider import fetch_available_models
+
+    if find_codex_auth() is None:
+        console.print(
+            "[red]No Codex login found at ~/.codex/auth.json. "
+            "Run `codex login` first.[/red]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        models = asyncio.run(fetch_available_models())
+    except CodexAuthError as e:
+        console.print(f"[red]Codex auth error: {e}[/red]")
+        raise typer.Exit(1)
+
+    if format == "json":
+        typer.echo(_json.dumps(models))
+    else:
+        for m in models:
+            typer.echo(m)
+
+
+@app.command("chat")
+def chat_cmd(
+    session: str = typer.Option(
+        "default",
+        "--session",
+        "-s",
+        help="Session id for this conversation. Each id gets its own history.",
+    ),
+    plain: bool = typer.Option(
+        False,
+        "--plain",
+        help="Use the minimal prompt_toolkit REPL instead of the full TUI.",
+    ),
+):
+    """Open an interactive chat with your Kyber agent.
+
+    Default mode is the full Textual TUI — conversation pane, live status
+    sidebar, footer key hints. Pass ``--plain`` for the minimal REPL.
+
+    Talks to the running gateway (same one Discord/Telegram/dashboard use),
+    so conversations appear in the usual task history.
+    """
+    if plain:
+        from kyber.cli.chat_repl import run_chat
+
+        rc = run_chat(session_id=session)
+        raise typer.Exit(rc)
+
+    from kyber.cli.tui import run_tui
+
+    rc = run_tui(session_id=session)
+    raise typer.Exit(rc)
+
+
+@app.command("tui")
+def tui_cmd(
+    session: str = typer.Option(
+        "default",
+        "--session",
+        "-s",
+        help="Session id for this conversation.",
+    ),
+):
+    """Launch the full Textual TUI (alias for `kyber chat`)."""
+    from kyber.cli.tui import run_tui
+
+    rc = run_tui(session_id=session)
+    raise typer.Exit(rc)
+
+
 @app.command("show-dashboard-token")
 def show_dashboard_token():
     """Print the dashboard auth token."""
@@ -117,6 +203,110 @@ def show_dashboard_token():
         raise typer.Exit(1)
 
     console.print(token)
+
+
+@app.command("dashboard-info")
+def dashboard_info(
+    open_browser: bool = typer.Option(
+        False,
+        "--open",
+        "-o",
+        help="Open the one-click login URL in your default browser.",
+    ),
+    plain: bool = typer.Option(
+        False,
+        "--plain",
+        help="Print a single URL only (useful for scripts / `$(kyber dashboard-info --plain)`).",
+    ),
+):
+    """Show dashboard status, token, and a one-click login URL.
+
+    Probes the configured dashboard port to report whether it's up, prints
+    the auth token, and produces a ``http://host:port/?token=...`` link
+    that signs you in automatically when clicked.
+    """
+    import urllib.parse
+    import urllib.request
+    import webbrowser
+
+    from kyber.config.loader import load_config
+    from rich.panel import Panel
+    from rich.table import Table
+
+    config = load_config()
+    host = (config.dashboard.host or "127.0.0.1").strip()
+    # Dashboards bound to 0.0.0.0 / :: listen everywhere but are opened
+    # locally — point users at a browsable address.
+    display_host = (
+        "127.0.0.1" if host in ("0.0.0.0", "", "::", "::0") else host
+    )
+    port = int(config.dashboard.port or 18890)
+    token = (config.dashboard.auth_token or "").strip()
+
+    base_url = f"http://{display_host}:{port}"
+    login_url = (
+        f"{base_url}/?token={urllib.parse.quote(token, safe='')}"
+        if token
+        else base_url
+    )
+
+    # Probe the dashboard. GET / is public (serves index.html).
+    status_ok = False
+    status_detail = ""
+    try:
+        req = urllib.request.Request(base_url, method="GET")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:  # noqa: S310
+            status_ok = 200 <= resp.status < 400
+            status_detail = f"HTTP {resp.status}"
+    except Exception as e:
+        status_detail = type(e).__name__
+
+    # Service mode state (best-effort).
+    service_state = ""
+    try:
+        from kyber.service import service_status
+
+        info = service_status()
+        dash_unit = info.dashboard
+        if dash_unit.installed and dash_unit.active:
+            service_state = f"{info.backend} · active"
+        elif dash_unit.installed:
+            service_state = f"{info.backend} · installed (inactive)"
+        else:
+            service_state = "manual (no service installed)"
+    except Exception:
+        service_state = "unknown"
+
+    if plain:
+        console.print(login_url if token else base_url)
+    else:
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="dim", justify="right")
+        table.add_column()
+        status_line = (
+            "[green]● running[/green]" if status_ok
+            else f"[yellow]● not reachable[/yellow] [dim]({status_detail})[/dim]"
+        )
+        table.add_row("status", status_line)
+        table.add_row("mode", service_state)
+        table.add_row("url", f"[cyan]{base_url}[/cyan]")
+        table.add_row("token", token or "[dim](none)[/dim]")
+        if token:
+            table.add_row("login url", f"[link={login_url}][cyan]{login_url}[/cyan][/link]")
+            table.add_row("", "[dim]click the link above — you'll land signed in[/dim]")
+        console.print(Panel(table, title="Kyber Dashboard", border_style="magenta", expand=False))
+
+        if not status_ok:
+            console.print(
+                "[dim]The dashboard doesn't appear to be running. Start it with:[/dim]"
+            )
+            console.print("  [cyan]kyber service install[/cyan]   (run as background service)")
+            console.print("  [cyan]kyber dashboard[/cyan]          (run in this terminal)")
+
+    if open_browser:
+        if not token:
+            console.print("[yellow]No token available; opening bare URL.[/yellow]")
+        webbrowser.open(login_url)
 
 
 def _create_workspace_templates(workspace: Path):
@@ -270,42 +460,105 @@ def _create_agent(
     provider_name_str = str(provider_name or "")
     provider_name_lc = provider_name_str.lower()
 
-    # Normalize accidental "Bearer <key>" pastes. SDK adds "Bearer" itself.
-    if isinstance(api_key, str):
-        token = api_key.strip()
-        if token.lower().startswith("bearer "):
-            token = token[7:].strip()
-        api_key = token
+    # Subscription providers (ChatGPT via Codex OAuth, Claude via Claude
+    # Code OAuth) take a different code path — they read tokens from the
+    # official CLI's credential store and talk to a non-OpenAI-compatible
+    # API shape. One branch per subscription kind.
+    _subscription_active = False
+    if details.get("is_subscription"):
+        kind = str(details.get("subscription_kind") or "")
+        if kind == "chatgpt":
+            from kyber.providers.codex_auth import CodexAuthError, find_codex_auth
+            from kyber.providers.codex_provider import CodexProvider
 
-    # Custom-provider key fallback from env (useful for manual env setup).
-    if details.get("is_custom", False) and not api_key:
-        from kyber.config.loader import custom_provider_env_key
+            if find_codex_auth() is None:
+                console.print(
+                    "[red]ChatGPT subscription provider is selected but no "
+                    "Codex login was found at ~/.codex/auth.json.[/red]"
+                )
+                console.print(
+                    "[yellow]Run `codex login` (install with "
+                    "`npm i -g @openai/codex` if needed), then start "
+                    "Kyber again.[/yellow]"
+                )
+                raise typer.Exit(1)
 
-        env_key_name = custom_provider_env_key(provider_name_str) or ""
-        api_key = (os.environ.get(env_key_name, "") or "").strip() if env_key_name else ""
-        if not api_key and "minimax" in provider_name_lc:
-            api_key = (os.environ.get("MINIMAX_API_KEY", "") or "").strip()
-    
-    if details.get("is_custom", False) and not api_key:
-        console.print(f"[red]Error: Custom provider '{provider_name}' requires an API key.[/red]")
-        raise typer.Exit(1)
-    
-    # Map provider name to OpenAIProvider's expected format
-    provider_type = "openrouter"  # default
-    if "openai" in provider_name_lc:
-        provider_type = "openai"
-    elif "anthropic" in provider_name_lc:
-        provider_type = "anthropic"
-    elif "z.ai" in provider_name_lc or details.get("is_custom"):
-        # z.ai and other custom providers use OpenAI-compatible API
-        provider_type = "openai"
-    
-    provider = OpenAIProvider(
-        api_key=api_key,
-        api_base=api_base,
-        provider=provider_type,
-        default_model=model,
-    )
+            try:
+                provider = CodexProvider(default_model=model)
+            except CodexAuthError as e:
+                console.print(f"[red]Codex auth error: {e}[/red]")
+                if e.relogin_required:
+                    console.print(
+                        "[yellow]Run `codex login` to re-authenticate.[/yellow]"
+                    )
+                raise typer.Exit(1)
+
+        elif kind == "claude":
+            # Removed in 2026.4.21.53. Reusing Claude Code's OAuth token
+            # from third-party clients has been getting accounts banned,
+            # so Kyber no longer ships this path. Print a loud migration
+            # message and refuse to start — safer than silently routing
+            # traffic that might bonk the user's subscription.
+            console.print(
+                "[red]Claude subscription provider was removed for safety.[/red]"
+            )
+            console.print(
+                "[yellow]Anthropic has been banning accounts that use the "
+                "Claude Code OAuth token from non-CLI clients.\n"
+                "Switch to ChatGPT/Codex, an OpenRouter key, or a direct "
+                "Anthropic API key in the dashboard or config.json.[/yellow]"
+            )
+            raise typer.Exit(1)
+
+        else:
+            console.print(
+                f"[red]Unknown subscription kind {kind!r}; cannot build "
+                "provider.[/red]"
+            )
+            raise typer.Exit(1)
+
+        _subscription_active = True
+
+    if not _subscription_active:
+        # Normalize accidental "Bearer <key>" pastes. SDK adds "Bearer" itself.
+        if isinstance(api_key, str):
+            token = api_key.strip()
+            if token.lower().startswith("bearer "):
+                token = token[7:].strip()
+            api_key = token
+
+        # Custom-provider key fallback from env (useful for manual env setup).
+        if details.get("is_custom", False) and not api_key:
+            from kyber.config.loader import custom_provider_env_key
+
+            env_key_name = custom_provider_env_key(provider_name_str) or ""
+            api_key = (os.environ.get(env_key_name, "") or "").strip() if env_key_name else ""
+            if not api_key and "minimax" in provider_name_lc:
+                api_key = (os.environ.get("MINIMAX_API_KEY", "") or "").strip()
+
+        if details.get("is_custom", False) and not api_key:
+            console.print(f"[red]Error: Custom provider '{provider_name}' requires an API key.[/red]")
+            raise typer.Exit(1)
+
+        # Map provider name to OpenAIProvider's expected format
+        provider_type = "openrouter"  # default
+        if "openai" in provider_name_lc:
+            provider_type = "openai"
+        elif "anthropic" in provider_name_lc:
+            provider_type = "anthropic"
+        elif "z.ai" in provider_name_lc or details.get("is_custom"):
+            # z.ai and other custom providers use OpenAI-compatible API
+            provider_type = "openai"
+
+        provider = OpenAIProvider(
+            api_key=api_key,
+            api_base=api_base,
+            provider=provider_type,
+            default_model=model,
+            enable_prompt_cache=bool(
+                getattr(config.agents.defaults, "enable_prompt_cache", True)
+            ),
+        )
 
     # ── Persona ──
     workspace = config.workspace_path
@@ -346,6 +599,20 @@ def _create_agent(
                 pass
 
     # ── AgentCore (hermes-style) ──
+    defaults = config.agents.defaults
+    per_channel_policy: dict[str, dict[str, list[str]]] = {}
+    try:
+        raw_policy = getattr(config.tools, "per_channel", {}) or {}
+        for ch_name, policy in raw_policy.items():
+            per_channel_policy[str(ch_name).strip().lower()] = {
+                "allow": list(getattr(policy, "allow", []) or []),
+                "deny": list(getattr(policy, "deny", []) or []),
+            }
+    except Exception:
+        # Malformed per-channel policy shouldn't block agent startup —
+        # just fall through with an empty policy (full tool catalog).
+        pass
+
     return AgentCore(
         bus=bus,
         provider=provider,
@@ -353,8 +620,13 @@ def _create_agent(
         persona_prompt=persona or None,
         model=model,
         task_history_path=task_history_path,
-        timezone=config.agents.defaults.timezone or None,
+        timezone=defaults.timezone or None,
         progress_callback=_progress_callback if channels else None,
+        tool_result_max_chars=int(getattr(defaults, "tool_result_max_chars", 20_000)),
+        tool_result_keep_recent=int(getattr(defaults, "tool_result_keep_recent", 3)),
+        history_summary_trigger=int(getattr(defaults, "history_summary_trigger", 30)),
+        history_summary_keep_recent=int(getattr(defaults, "history_summary_keep_recent", 12)),
+        per_channel_tool_policy=per_channel_policy,
     )
 
 
@@ -449,7 +721,28 @@ def gateway(
     port: int | None = typer.Option(None, "--port", "-p", help="Gateway port (defaults to config.gateway.port)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
-    """Start the kyber gateway."""
+    """Start the kyber gateway.
+
+    Must run under a service manager (launchd on macOS, systemd --user on
+    Linux). Running it standalone caused most of the port-conflict /
+    orphan / restart-loop bugs, so Kyber now refuses to start this way.
+    """
+    from kyber.service import running_under_service_manager
+
+    if not running_under_service_manager():
+        console.print(
+            "[red]kyber gateway must run under a service manager.[/red]\n"
+            "Kyber enforces this because running the gateway in a bare shell was "
+            "causing port conflicts, orphan processes, and restart loops.\n\n"
+            "[bold]Set up (or repair) service mode:[/bold]\n"
+            "  [cyan]kyber service install[/cyan]   # installs + starts both services\n"
+            "  [cyan]kyber service status[/cyan]    # confirm they're healthy\n\n"
+            "[dim]If you are a developer who genuinely wants a foreground "
+            "process for debugging, set KYBER_FORCE_FOREGROUND=1 in the "
+            "environment.[/dim]"
+        )
+        raise typer.Exit(2)
+
     from kyber.config.loader import load_config, get_data_dir
     from kyber.config.loader import save_config
     from kyber.bus.queue import MessageBus
@@ -534,7 +827,12 @@ def gateway(
         task_history_path=get_data_dir() / "tasks" / "history.jsonl",
         channels=channels,
     )
-    
+
+    # Hand the agent down to every channel so the shared slash-command
+    # dispatcher can reach it for /cancel, /usage, etc. No-op for
+    # channels that are currently disabled.
+    channels.attach_agent(agent)
+
     # Note: Discord typing indicators are handled directly in DiscordChannel class
     
     # Create cron service
@@ -626,6 +924,20 @@ def gateway(
             # Start local gateway API for dashboard task management first.
             # If bind fails, avoid starting channels/cron/heartbeat.
             import uvicorn
+
+            # Self-heal common port-already-in-use crash loop: if a previous
+            # kyber gateway is still squatting the port (manual invocation,
+            # slow-exiting service, etc.), kill it and wait for release.
+            from kyber.service import ensure_port_free as _ensure_port_free
+
+            free, msg = _ensure_port_free(port)
+            if not free:
+                console.print(
+                    f"[red]✗[/red] Cannot start gateway: {msg}. "
+                    "Free the port and retry."
+                )
+                return 1
+
             api_app = create_gateway_app(agent, config.dashboard.auth_token)
             api_config = uvicorn.Config(
                 api_app,
@@ -655,10 +967,54 @@ def gateway(
             await cron.start()
             await heartbeat.start()
 
-            agent_task = asyncio.create_task(agent.run())
-            channels_task = asyncio.create_task(channels.start_all())
-            await asyncio.gather(agent_task, channels_task, api_task)
-            return 0
+            # Kyber network: if this instance is configured as a spoke, keep
+            # a live WebSocket to its host. Host-side routes are mounted
+            # inside create_gateway_app, so no extra startup is needed there.
+            spoke_client = None
+            if (config.network.role or "").strip().lower() == "spoke":
+                from kyber.network.spoke import get_spoke_client
+
+                spoke_client = get_spoke_client()
+                await spoke_client.start()
+
+            agent_task = asyncio.create_task(agent.run(), name="agent")
+            channels_task = asyncio.create_task(channels.start_all(), name="channels")
+            # api_task is already created above as the uvicorn server.
+
+            # All three should run until the process is signalled to stop.
+            # If ANY of them ends (cleanly or with an error), the gateway is
+            # no longer functional and we should exit non-zero so systemd's
+            # Restart=on-failure policy brings us back. Without this guard a
+            # benign early-return from e.g. channels.start_all() (no channels
+            # configured) used to trigger a tight restart loop.
+            try:
+                done, pending = await asyncio.wait(
+                    {agent_task, channels_task, api_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                first = next(iter(done))
+                name = first.get_name() if hasattr(first, "get_name") else "task"
+                exc = first.exception()
+                if exc is not None:
+                    console.print(
+                        f"[red]✗[/red] Gateway subtask [yellow]{name}[/yellow] "
+                        f"failed: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    console.print(
+                        f"[yellow]![/yellow] Gateway subtask [bold]{name}[/bold] "
+                        "exited unexpectedly. Shutting down so the service "
+                        "manager can restart us cleanly."
+                    )
+                for t in pending:
+                    t.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await t
+                return 1
+            finally:
+                if spoke_client is not None:
+                    with suppress(Exception):
+                        await spoke_client.stop()
         except KeyboardInterrupt:
             console.print("\nShutting down...")
             return 0
@@ -749,7 +1105,23 @@ def dashboard(
     port: int | None = typer.Option(None, "--port", help="Dashboard port"),
     show_token: bool = typer.Option(False, "--show-token", help="Print dashboard token"),
 ):
-    """Start the kyber web dashboard."""
+    """Start the kyber web dashboard.
+
+    Like ``kyber gateway``, this requires a service manager — manual
+    foreground invocations caused port conflicts and orphans.
+    """
+    from kyber.service import running_under_service_manager
+
+    if not running_under_service_manager():
+        console.print(
+            "[red]kyber dashboard must run under a service manager.[/red]\n\n"
+            "[bold]Set up (or repair) service mode:[/bold]\n"
+            "  [cyan]kyber service install[/cyan]   # installs + starts both services\n"
+            "  [cyan]kyber dashboard-info[/cyan]    # then view the URL + token\n\n"
+            "[dim]For foreground debugging set KYBER_FORCE_FOREGROUND=1.[/dim]"
+        )
+        raise typer.Exit(2)
+
     import secrets
 
     from kyber.config.loader import load_config, save_config
@@ -776,8 +1148,26 @@ def dashboard(
         console.print("[green]✓[/green] Generated new dashboard token and saved to config")
 
     if dash.host not in {"127.0.0.1", "localhost", "::1"} and not dash.allowed_hosts:
-        console.print("[red]Refusing to bind dashboard to a non-local host without allowedHosts configured.[/red]")
-        console.print("Set dashboard.allowedHosts in ~/.kyber/config.json to the hostnames you expect.")
+        # Non-loopback binds (including the 0.0.0.0 default) are allowed but
+        # noted. TrustedHostMiddleware drops its DNS-rebinding guard in this
+        # mode — every endpoint is still bearer-token-protected, so the
+        # dashboard isn't broadly exposed, just reachable by IP (e.g. over
+        # Tailscale, LAN, or a VPS floating IP).
+        console.print(
+            f"[dim]Dashboard bound to {dash.host}:{dash.port} — reachable on "
+            "all interfaces; auth enforced by bearer token.[/dim]"
+        )
+        console.print(
+            "[dim]To restrict by Host header, set `dashboard.allowedHosts` "
+            "in ~/.kyber/config.json.[/dim]"
+        )
+
+    # Self-heal port conflicts from stale kyber dashboards.
+    from kyber.service import ensure_port_free as _ensure_port_free
+
+    free, msg = _ensure_port_free(int(dash.port))
+    if not free:
+        console.print(f"[red]✗[/red] Cannot start dashboard: {msg}.")
         raise typer.Exit(1)
 
     app = create_dashboard_app(config)
@@ -1264,6 +1654,530 @@ def restart_dashboard():
     else:
         console.print(f"[red]✗[/red] {msg}")
         raise typer.Exit(1)
+
+
+# ============================================================================
+# System Service Management
+# ============================================================================
+
+service_app = typer.Typer(help="Manage the background gateway + dashboard services")
+app.add_typer(service_app, name="service")
+
+
+def _render_service_info(info, action: str) -> None:
+    """Pretty-print a ServiceInfo block."""
+    from kyber.service import ServiceInfo
+
+    assert isinstance(info, ServiceInfo)
+    console.print(f"[dim]Backend:[/dim] {info.backend}")
+    for unit in (info.gateway, info.dashboard):
+        state = "[green]active[/green]" if unit.active else "[yellow]inactive[/yellow]"
+        file_bit = "✓" if unit.installed else "✗"
+        console.print(
+            f"  {unit.name:<9}  file: {file_bit}  status: {state}  "
+            f"[dim]({unit.identifier})[/dim]"
+        )
+    if action == "install" and info.gateway.active and info.dashboard.active:
+        console.print("[green]Services installed and running.[/green]")
+    elif action == "install":
+        console.print(
+            "[yellow]Services installed but one or more did not start.[/yellow] "
+            "Run `kyber service status` to check."
+        )
+
+
+@service_app.command("install")
+def service_install():
+    """Install and start the gateway + dashboard as background services.
+
+    Uses launchd on macOS and systemd --user on Linux. Safe to run
+    repeatedly — rewrites the unit files and reloads.
+    """
+    from kyber.service import install_services, UnsupportedPlatformError
+
+    console.print(f"{__logo__} Installing kyber services...")
+    try:
+        info = install_services()
+    except UnsupportedPlatformError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    _render_service_info(info, "install")
+
+
+@service_app.command("uninstall")
+def service_uninstall():
+    """Stop and remove the background gateway + dashboard services."""
+    from kyber.service import uninstall_services, UnsupportedPlatformError
+
+    console.print(f"{__logo__} Uninstalling kyber services...")
+    try:
+        info = uninstall_services()
+    except UnsupportedPlatformError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    _render_service_info(info, "uninstall")
+    console.print(
+        "[dim]You can still run `kyber gateway` and `kyber dashboard` manually.[/dim]"
+    )
+
+
+@service_app.command("status")
+def service_status_cmd():
+    """Show whether gateway + dashboard services are installed and running."""
+    from kyber.service import service_status, UnsupportedPlatformError
+
+    try:
+        info = service_status()
+    except UnsupportedPlatformError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    _render_service_info(info, "status")
+
+
+@service_app.command("restart")
+def service_restart():
+    """Reload the unit files and restart both services."""
+    from kyber.service import restart_services, UnsupportedPlatformError
+
+    console.print(f"{__logo__} Restarting kyber services...")
+    try:
+        info = restart_services()
+    except UnsupportedPlatformError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    _render_service_info(info, "restart")
+
+
+@app.command("upgrade")
+def upgrade_cmd():
+    """One-shot: install latest kyber-chat from PyPI + fully restart services.
+
+    Does the whole dance so you don't have to:
+
+    1. Records the currently installed version.
+    2. Runs ``uv tool install --force --no-cache kyber-chat`` to pull the
+       newest wheel from PyPI (bypassing any stale uv cache).
+    3. Kills any stray ``kyber gateway`` / ``kyber dashboard`` processes
+       (including ones systemd/launchd has lost track of).
+    4. Restarts the service-managed copies so they load the new code.
+    5. Polls the gateway's ``/version`` endpoint and confirms it reports
+       the same version the installer just put on disk.
+
+    If step 5 fails it prints what it saw so you can tell me.
+    """
+    import shutil
+    import subprocess
+    import time as _time
+    import urllib.request
+
+    from kyber import __version__ as pre_version
+    from kyber.config.loader import load_config
+    from kyber.service import (
+        kill_orphan_kyber_processes,
+        restart_services,
+        UnsupportedPlatformError,
+    )
+
+    console.print(f"{__logo__} Kyber upgrade")
+    console.print(f"  [dim]current installed:[/dim] {pre_version}")
+
+    uv_path = shutil.which("uv")
+    if uv_path is None:
+        console.print(
+            "[red]`uv` is not on PATH.[/red] Install uv or upgrade manually: "
+            "[cyan]pip install --upgrade kyber-chat[/cyan]"
+        )
+        raise typer.Exit(1)
+
+    console.print("  [dim]installing latest wheel from PyPI…[/dim]")
+    try:
+        result = subprocess.run(
+            [uv_path, "tool", "install", "--force", "--no-cache", "kyber-chat"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        console.print("[red]`uv tool install` timed out after 180s.[/red]")
+        raise typer.Exit(1)
+
+    if result.returncode != 0:
+        console.print("[red]uv tool install failed:[/red]")
+        if result.stderr:
+            console.print(result.stderr.strip()[:2000])
+        raise typer.Exit(result.returncode)
+
+    console.print("  [green]✓[/green] wheel installed")
+
+    console.print("  [dim]stopping running gateway + dashboard…[/dim]")
+    killed = kill_orphan_kyber_processes()
+    if killed:
+        # This includes the healthy service-managed processes (1 gateway +
+        # 1 dashboard) that we're about to restart. Counts above 2 usually
+        # mean you had a manually-run copy alongside the service; those
+        # get cleaned up here too.
+        console.print(
+            f"  [dim]stopped {len(killed)} process(es) "
+            "(the running services + any manually-started copies)[/dim]"
+        )
+
+    console.print("  [dim]restarting services…[/dim]")
+    try:
+        info = restart_services()
+    except UnsupportedPlatformError as e:
+        console.print(
+            f"[yellow]{e}[/yellow] — install complete, restart your "
+            "`kyber gateway` / `kyber dashboard` manually."
+        )
+        raise typer.Exit(0)
+
+    # Wait for the gateway to report the new version on its /version endpoint.
+    cfg = load_config()
+    port = cfg.gateway.port
+    url = f"http://127.0.0.1:{port}/version"
+    expected = _read_expected_version()
+
+    # Gateway startup does a lot (agent init, tool discovery, channels,
+    # cron, heartbeat). On a busy VPS this can take 30-60s; poll patiently
+    # and print progress every 5s so the user knows we're not hung.
+    running: str | None = None
+    total_wait = 90.0
+    deadline = _time.monotonic() + total_wait
+    last_dot = _time.monotonic()
+    import json as _json
+
+    console.print(f"  [dim]waiting for gateway to report version on {url}…[/dim]")
+    while _time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2.0) as resp:  # noqa: S310
+                if resp.status == 200:
+                    running = str(_json.loads(resp.read().decode("utf-8")).get("version") or "")
+                    if running == expected:
+                        break
+        except Exception:
+            pass
+        if _time.monotonic() - last_dot >= 5.0:
+            elapsed = int(_time.monotonic() - (deadline - total_wait))
+            console.print(f"  [dim]… still waiting ({elapsed}s)[/dim]")
+            last_dot = _time.monotonic()
+        _time.sleep(0.5)
+
+    if running is None:
+        console.print(
+            f"[yellow]Upgrade finished but the gateway didn't respond to /version "
+            f"within {int(total_wait)}s. Services report active, so the process "
+            "is up — it may be slow to bootstrap (channels/skills/MCP). Tail:\n"
+            "  [cyan]journalctl --user -u kyber-gateway.service -n 40 --no-pager[/cyan] "
+            "(Linux)\n"
+            "  [cyan]tail -n 60 ~/.kyber/logs/gateway.err.log[/cyan] (macOS)[/yellow]"
+        )
+    elif running != expected:
+        console.print(
+            f"[yellow]Gateway is still reporting version {running} (expected "
+            f"{expected}). Something held the old process alive — try:[/yellow]"
+        )
+        console.print(
+            "  [cyan]pkill -9 -f 'kyber gateway'; pkill -9 -f 'kyber dashboard'; "
+            "kyber service restart[/cyan]"
+        )
+    else:
+        console.print(f"  [green]✓[/green] gateway reports {running} — upgrade complete")
+
+    _render_service_info(info, "restart")
+
+
+def _read_expected_version() -> str:
+    """Read kyber's __version__ from the freshly-installed wheel on disk.
+
+    Importing ``kyber.__version__`` inside this process gets us the version
+    we booted with (the OLD one). We want what the just-installed wheel
+    advertises, so we shell out to the tool's own Python binary.
+    """
+    import shutil
+    import subprocess
+    import sys
+
+    kyber_tool_path = shutil.which("kyber")
+    if kyber_tool_path is None:
+        return ""
+    try:
+        result = subprocess.run(
+            [kyber_tool_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    out = (result.stdout or "").strip()
+    if " " in out:
+        out = out.split()[-1]
+    # `kyber --version` prefixes with "v"; the gateway's /version endpoint
+    # returns the bare semver. Strip so the comparison can succeed.
+    return out.lstrip("v").strip()
+
+
+# ============================================================================
+# Kyber Network
+# ============================================================================
+
+network_app = typer.Typer(
+    help="Pair Kyber instances across machines and share state between them"
+)
+app.add_typer(network_app, name="network")
+
+
+def _save_network_role(role: str) -> None:
+    """Persist a new role into config.json without touching other fields."""
+    from kyber.config.loader import load_config, save_config
+
+    cfg = load_config()
+    cfg.network.role = role
+    save_config(cfg)
+
+
+@network_app.command("status")
+def network_status():
+    """Show this machine's network mode and paired peers."""
+    from kyber.config.loader import load_config
+    from kyber.network.host import host_list_peers_with_status
+    from kyber.network.state import ROLE_HOST, ROLE_SPOKE, load_state
+    from rich.panel import Panel
+    from rich.table import Table
+
+    cfg = load_config()
+    state = load_state()
+    role = (cfg.network.role or "standalone").strip().lower()
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="dim", justify="right")
+    table.add_column()
+    table.add_row("role", role)
+    table.add_row("peer id", state.peer_id or "[dim](none)[/dim]")
+    table.add_row("name", state.name or "[dim](none)[/dim]")
+
+    if role == ROLE_HOST:
+        peers = host_list_peers_with_status()
+        if peers:
+            peer_lines = "\n".join(
+                f"[cyan]{p['name']}[/cyan] "
+                f"{'[green]●[/green]' if p['connected'] else '[yellow]●[/yellow]'} "
+                f"[dim]{p['peer_id'][:12]}…[/dim]"
+                for p in peers
+            )
+            table.add_row("peers", peer_lines)
+        else:
+            table.add_row("peers", "[dim](none yet — run `kyber network pair`)[/dim]")
+    elif role == ROLE_SPOKE:
+        if state.host_peer is not None:
+            table.add_row("host", f"[cyan]{state.host_peer.name}[/cyan] [dim]{state.host_url}[/dim]")
+            from kyber.network.spoke import get_spoke_client
+
+            st = get_spoke_client().status
+            running = "[green]running[/green]" if st["running"] else "[yellow]not running[/yellow]"
+            table.add_row("link", f"{running} [dim]{st.get('last_error') or ''}[/dim]")
+        else:
+            table.add_row("host", "[yellow]not paired — run `kyber network join`[/yellow]")
+
+    console.print(Panel(table, title="Kyber Network", border_style="magenta", expand=False))
+
+
+@network_app.command("pair")
+def network_pair(
+    name: str | None = typer.Option(
+        None, "--name", help="Optional label for the spoke you're about to pair."
+    ),
+):
+    """Generate a one-time pairing code (run on the host).
+
+    The host must already be configured with ``network.role = host`` — this
+    command flips the role automatically if it's still the default.
+
+    The code expires in 5 minutes and can be used exactly once. Run
+    ``kyber network join <host-url> <code>`` on the other machine.
+    """
+    from kyber.config.loader import load_config
+    from kyber.network.host import host_generate_pairing_code
+    from kyber.network.state import ROLE_HOST, get_or_create_identity
+
+    from kyber.network.state import load_state, save_state
+
+    cfg = load_config()
+    role = (cfg.network.role or "standalone").strip().lower()
+    if role != ROLE_HOST:
+        console.print(
+            "[yellow]This instance isn't in host mode yet — switching to host.[/yellow]"
+        )
+        _save_network_role(ROLE_HOST)
+    get_or_create_identity()  # ensure peer_id + name exist
+
+    # Also flip the state-file role so the pair + pair-code endpoints (which
+    # read state, not config) accept requests without a gateway restart.
+    state = load_state()
+    if state.role != ROLE_HOST:
+        state.role = ROLE_HOST
+        save_state(state)
+
+    code = host_generate_pairing_code(expected_name=name)
+    gw_host = cfg.gateway.host
+    gw_port = cfg.gateway.port
+    display_host = (
+        "127.0.0.1" if gw_host in ("", "0.0.0.0", "::", "::0") else gw_host
+    )
+    url = f"http://{display_host}:{gw_port}"
+    console.print(
+        f"[bold magenta]Pairing code:[/bold magenta] [cyan]{code}[/cyan]  "
+        f"[dim](expires in 5 minutes)[/dim]\n"
+        f"Run on the other machine:\n"
+        f"  [cyan]kyber network join {url} {code} --as <name>[/cyan]\n"
+        f"[yellow]Note:[/yellow] the URL must be reachable from that machine — "
+        f"use a LAN IP or Tailscale address if they're on different networks."
+    )
+    if role == ROLE_HOST:
+        from kyber.network.state import load_state
+
+        live = load_state()
+        if not live.paired_peers:
+            console.print(
+                "[dim]Restart the gateway after pairing so the host handler is "
+                "mounted on the listening port: `kyber service restart`.[/dim]"
+            )
+
+
+@network_app.command("join")
+def network_join(
+    host_url: str = typer.Argument(..., help="Host URL, e.g. http://10.0.0.5:18790"),
+    code: str = typer.Argument(..., help="Pairing code from `kyber network pair`."),
+    as_name: str = typer.Option(
+        None, "--as", help="Display name for this machine (defaults to hostname)."
+    ),
+):
+    """Pair this machine as a spoke to the given host."""
+    import asyncio
+
+    from kyber.network.spoke import pair_with_host
+    from kyber.network.state import get_or_create_identity
+
+    get_or_create_identity()
+    try:
+        state = asyncio.run(
+            pair_with_host(host_url, code, display_name=as_name)
+        )
+    except RuntimeError as e:
+        console.print(f"[red]Pairing failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    # Flip role to spoke in config.json too.
+    _save_network_role("spoke")
+    host = state.host_peer
+    console.print(
+        f"[green]✓[/green] Paired with [cyan]{host.name if host else 'host'}[/cyan] "
+        f"at [cyan]{state.host_url}[/cyan] "
+        f"as [cyan]{state.name}[/cyan]."
+    )
+    console.print(
+        "[dim]Restart the gateway to start the live link: `kyber service restart`.[/dim]"
+    )
+
+
+@network_app.command("leave")
+def network_leave(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+):
+    """Disconnect this machine from its host (spoke-side)."""
+    from kyber.network.state import (
+        ROLE_SPOKE,
+        ROLE_STANDALONE,
+        load_state,
+        save_state,
+    )
+
+    state = load_state()
+    if not state.host_peer or not state.host_url:
+        console.print("[yellow]Not currently paired with a host.[/yellow]")
+        raise typer.Exit(0)
+    if not yes:
+        console.print(
+            f"About to forget host [cyan]{state.host_peer.name}[/cyan] at "
+            f"[cyan]{state.host_url}[/cyan]."
+        )
+        if not typer.confirm("Proceed?"):
+            raise typer.Exit(0)
+
+    state.role = ROLE_STANDALONE
+    state.host_url = ""
+    state.host_peer = None
+    save_state(state)
+    _save_network_role(ROLE_STANDALONE)
+    console.print("[green]✓[/green] Removed host pairing. Restart the gateway to take effect.")
+
+
+@network_app.command("expose")
+def network_expose(
+    tools: list[str] = typer.Argument(
+        ...,
+        help='Tool names, OR "all" to expose every registered tool, OR "none" to disable.',
+    ),
+):
+    """Set which local tools paired Kybers can invoke over the network.
+
+    Examples::
+
+        kyber network expose all                   # full mesh (new default)
+        kyber network expose none                  # disable remote invocation
+        kyber network expose exec read_file        # explicit list
+
+    Writes ``config.network.exposedTools`` and persists. Takes effect on
+    the next gateway restart.
+    """
+    from kyber.config.loader import load_config, save_config
+
+    cfg = load_config()
+    normalized = [t.strip() for t in tools if t and t.strip()]
+    if len(normalized) == 1 and normalized[0].lower() == "all":
+        cfg.network.exposed_tools = ["*"]
+    elif len(normalized) == 1 and normalized[0].lower() == "none":
+        cfg.network.exposed_tools = []
+    else:
+        cfg.network.exposed_tools = normalized
+    save_config(cfg)
+    value = cfg.network.exposed_tools
+    if not value:
+        human = "[yellow](none — remote invocation disabled)[/yellow]"
+    elif value == ["*"]:
+        human = "[green]every registered tool[/green]"
+    else:
+        human = ", ".join(value)
+    console.print(
+        f"[green]✓[/green] exposedTools set to: {human}\n"
+        "[dim]Restart the gateway so it picks up the change: "
+        "[cyan]kyber service restart[/cyan][/dim]"
+    )
+
+
+@network_app.command("unpair")
+def network_unpair(
+    peer_id: str = typer.Argument(..., help="Peer id (or prefix) to remove."),
+):
+    """Revoke a paired spoke (host-side)."""
+    from kyber.network.host import host_unpair
+    from kyber.network.state import load_state
+
+    state = load_state()
+    matches = [p for p in state.paired_peers if p.peer_id.startswith(peer_id)]
+    if not matches:
+        console.print(f"[yellow]No paired peer matches id prefix {peer_id!r}.[/yellow]")
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        console.print("[yellow]Ambiguous peer id prefix — be more specific:[/yellow]")
+        for p in matches:
+            console.print(f"  {p.peer_id}  {p.name}")
+        raise typer.Exit(1)
+    target = matches[0]
+    if host_unpair(target.peer_id):
+        console.print(f"[green]✓[/green] Removed peer [cyan]{target.name}[/cyan].")
+    else:
+        console.print(f"[yellow]Nothing removed for {target.peer_id}.[/yellow]")
 
 
 # ============================================================================

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kyber-chat"
-version = "2026.3.10.1"
+version = "2026.4.21.58"
 description = "A lightweight personal AI assistant framework"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.12"
@@ -29,6 +29,7 @@ dependencies = [
     "loguru>=0.7.0",
     "readability-lxml>=0.8.0",
     "rich>=13.0.0",
+    "prompt_toolkit>=3.0",
     "croniter>=2.0.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
@@ -38,6 +39,7 @@ dependencies = [
     "cisco-ai-skill-scanner>=0.1.0",
     "openhands-sdk>=1.11.4",
     "openhands-tools>=1.11.4",
+    "textual>=0.80",
 ]
 
 [project.urls]

@@ -44,8 +44,36 @@ class AgentDefaults(BaseModel):
     workspace: str = "~/.kyber/workspace"
     provider: str = "openrouter"  # Which provider to use (references a key in providers or custom name)
     max_tokens: int = 8192
-    temperature: float = 0.7
     timezone: str = ""  # User timezone (e.g. "America/New_York"). Empty = system local time.
+
+    # --- Token-saving knobs (2026.4.21.54) ---
+
+    # Enable prompt caching hints for providers that support them (Anthropic
+    # native API or its OpenAI-compatible endpoint). OpenAI and OpenRouter
+    # auto-cache stable prefixes ≥1024 tokens regardless of this flag — the
+    # setting only controls explicit cache_control markers.
+    enable_prompt_cache: bool = True
+
+    # Hard cap on the size of a single tool result before it enters the
+    # message list. Tool results this large almost always contain noise the
+    # LLM only needs a summary of.
+    tool_result_max_chars: int = 20_000
+
+    # How many recent tool results to keep in full inside the ongoing LLM
+    # loop. Older tool messages get compacted to a short summary so they
+    # don't dominate the context window on long multi-step tasks.
+    tool_result_keep_recent: int = 3
+
+    # When session history exceeds this many messages, older turns are
+    # summarized into a compact system block instead of being sent
+    # verbatim. Keeps long chats cheap without losing continuity.
+    history_summary_trigger: int = 30
+    history_summary_keep_recent: int = 12
+
+    # Kept only so old configs that still set `temperature` continue to
+    # parse. We never send temperature to any provider now — modern models
+    # either reject it (Anthropic) or handle it server-side (Codex).
+    temperature: float = 0.7
 
 
 class AgentsConfig(BaseModel):
@@ -70,7 +98,21 @@ class CustomProviderConfig(BaseModel):
 
 class ChatGPTSubscriptionProviderConfig(BaseModel):
     """ChatGPT Plus/Pro subscription provider configuration."""
-    model: str = "gpt-5.2-codex"
+    model: str = "gpt-5.3-codex"
+
+
+class ClaudeSubscriptionProviderConfig(BaseModel):
+    """DEPRECATED placeholder for old configs.
+
+    The Claude Pro/Max OAuth integration was removed in 2026.4.21.53
+    because Anthropic has been banning accounts that use Claude Code's
+    OAuth token from non-CLI clients. This class still exists so older
+    ``config.json`` files that mention ``claude_subscription`` continue
+    to parse cleanly; the gateway refuses to start against it and
+    prints a migration hint pointing users at Codex, OpenRouter, or a
+    direct Anthropic API key instead.
+    """
+    model: str = ""
 
 
 class ProvidersConfig(BaseModel):
@@ -84,10 +126,17 @@ class ProvidersConfig(BaseModel):
     chatgpt_subscription: ChatGPTSubscriptionProviderConfig = Field(
         default_factory=ChatGPTSubscriptionProviderConfig
     )
+    claude_subscription: ClaudeSubscriptionProviderConfig = Field(
+        default_factory=ClaudeSubscriptionProviderConfig
+    )
     custom: list[CustomProviderConfig] = Field(default_factory=list)
 
 
-# Built-in provider names (order matters for fallback detection)
+# Built-in provider names (order matters for fallback detection).
+# ``claude_subscription`` is intentionally absent — the integration was
+# removed because Anthropic bans accounts that reuse Claude Code's OAuth
+# token from non-CLI clients. The schema class for it still exists so
+# old configs parse, but the gateway refuses to start against it.
 BUILTIN_PROVIDERS = [
     "openrouter",
     "deepseek",
@@ -103,6 +152,28 @@ class GatewayConfig(BaseModel):
     port: int = 18790
 
 
+class NetworkConfig(BaseModel):
+    """Kyber network (multi-machine) configuration.
+
+    Actual pairing state (peer ids, HMAC secrets, host URL) lives in
+    ``~/.kyber/network.json`` because it contains secrets. This config
+    section only decides what this instance should DO — whether to host,
+    act as a spoke, or stay alone.
+    """
+
+    # "standalone" | "host" | "spoke"
+    role: str = "standalone"
+
+    # Tools in the local tool registry that other paired Kybers are allowed
+    # to invoke remotely. The default ``["*"]`` exposes everything
+    # registered on this node — appropriate for a fleet you own end to
+    # end. Replace with an explicit list (e.g. ``["exec", "read_file"]``)
+    # on shared/untrusted machines, or ``[]`` to disable remote invocation
+    # entirely. Matching is case-sensitive and exact; ``*`` is not a glob,
+    # it's a literal "everything" sentinel.
+    exposed_tools: list[str] = Field(default_factory=lambda: ["*"])
+
+
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
     api_key: str = ""  # Brave Search API key
@@ -116,7 +187,10 @@ class WebToolsConfig(BaseModel):
 
 class DashboardConfig(BaseModel):
     """Web dashboard configuration."""
-    host: str = "127.0.0.1"
+    # Bind on all interfaces by default so Tailscale / LAN clients can reach
+    # the dashboard on a VPS or homelab. The bearer token still gates every
+    # request — binding to 0.0.0.0 doesn't expose anything without it.
+    host: str = "0.0.0.0"
     port: int = 18890
     auth_token: str = ""  # Bearer token for dashboard access
     allowed_hosts: list[str] = Field(default_factory=list)  # Extra allowed Host headers
@@ -159,12 +233,36 @@ class MCPToolsConfig(BaseModel):
     servers: list[MCPServerConfig] = Field(default_factory=list)
 
 
+class ChannelToolPolicy(BaseModel):
+    """Per-channel tool allow/deny policy.
+
+    Channels are identified by the value of ``InboundMessage.channel``
+    (``"discord"``, ``"telegram"``, ``"whatsapp"``, ``"dashboard"``,
+    ``"cli"``, ``"tui"``, ...). Allowing a subset of tools per channel
+    shrinks the tool schema sent on every LLM call — a big savings when
+    long loops repeatedly re-send the same catalog.
+
+    Rules:
+    - Empty ``allow`` (the default) means *every* tool in the registry.
+    - ``allow`` accepts a wildcard ``"*"`` that means "everything".
+    - Entries in ``deny`` are always removed, even if ``allow`` is
+      ``["*"]``. Deny wins over allow.
+    """
+
+    allow: list[str] = Field(default_factory=list)
+    deny: list[str] = Field(default_factory=list)
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     skill_scanner: SkillScannerConfig = Field(default_factory=SkillScannerConfig)
     mcp: MCPToolsConfig = Field(default_factory=MCPToolsConfig)
+
+    # Per-channel tool exposure. Missing channel = no filter (full catalog).
+    # Keys match ``InboundMessage.channel`` (lowercase).
+    per_channel: dict[str, ChannelToolPolicy] = Field(default_factory=dict)
 
 
 class Config(BaseSettings):
@@ -175,6 +273,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    network: NetworkConfig = Field(default_factory=NetworkConfig)
     
     @property
     def workspace_path(self) -> Path:
@@ -198,7 +297,9 @@ class Config(BaseSettings):
         """Get API key for the active provider."""
         preferred = self._preferred_provider()
         if preferred:
-            if preferred == "chatgpt_subscription":
+            if preferred in ("chatgpt_subscription", "claude_subscription"):
+                # claude_subscription is a deprecated graveyard entry;
+                # handled further down in get_provider_details.
                 return None
             # Check built-in providers first
             provider = getattr(self.providers, preferred, None)
@@ -220,7 +321,7 @@ class Config(BaseSettings):
         """Get API base URL for the active provider."""
         preferred = self._preferred_provider()
         if preferred:
-            if preferred == "chatgpt_subscription":
+            if preferred in ("chatgpt_subscription", "claude_subscription"):
                 return None
             # Check custom providers
             cp = self._find_custom_provider(preferred)
@@ -256,7 +357,12 @@ class Config(BaseSettings):
         if preferred:
             if preferred == "chatgpt_subscription":
                 model = (self.providers.chatgpt_subscription.model or "").strip()
-                return model or "gpt-5.2-codex"
+                return model or "gpt-5.3-codex"
+            if preferred == "claude_subscription":
+                # Deprecated; surface the last-known model so the gateway's
+                # migration error can reference it, but callers should not
+                # actually use this provider.
+                return (self.providers.claude_subscription.model or "").strip()
             # Check built-in
             provider = getattr(self.providers, preferred, None)
             if provider and isinstance(provider, ProviderConfig) and provider.model:
@@ -286,13 +392,29 @@ class Config(BaseSettings):
             name = prov_name.strip().lower()
             if name == "chatgpt_subscription":
                 return {
-                    # Runtime provider remains OpenAI; auth happens via OpenHands OAuth.
+                    # Runtime provider remains OpenAI; auth happens via Codex OAuth.
                     "provider_name": "openai",
                     "configured_provider_name": "chatgpt_subscription",
                     "api_key": None,
                     "api_base": None,
                     "is_custom": False,
                     "is_subscription": True,
+                    "subscription_kind": "chatgpt",
+                    "model": self.get_model(),
+                }
+            if name == "claude_subscription":
+                # Deprecated — flag it so the factory prints a migration
+                # message instead of trying to import a provider that no
+                # longer exists.
+                return {
+                    "provider_name": "anthropic",
+                    "configured_provider_name": "claude_subscription",
+                    "api_key": None,
+                    "api_base": None,
+                    "is_custom": False,
+                    "is_subscription": True,
+                    "subscription_kind": "claude",
+                    "is_deprecated": True,
                     "model": self.get_model(),
                 }
             # Check custom providers

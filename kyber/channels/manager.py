@@ -70,6 +70,21 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Discord channel not available: {e}")
     
+    def attach_agent(self, agent: Any) -> None:
+        """Hand every channel a reference to the running AgentCore.
+
+        Used by slash commands (``/cancel``, ``/usage``) that need live
+        agent state. Safe to call multiple times; only the most recent
+        agent is retained per channel.
+        """
+        for ch in self.channels.values():
+            try:
+                ch.agent = agent
+            except Exception:
+                # Defensive — channels can override ``agent`` however they
+                # like. Never let a quirky override break startup.
+                pass
+
     async def start_all(self) -> None:
         """Start WhatsApp channel and the outbound dispatcher."""
         if not self.channels:

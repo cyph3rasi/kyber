@@ -73,6 +73,18 @@ const SECTIONS = {
     title: 'Gateway',
     desc: 'Host and port for the Kyber gateway server.',
   },
+  service: {
+    title: 'Background Service',
+    desc: 'Run the gateway + dashboard as system services so they start automatically.',
+  },
+  network: {
+    title: 'Kyber Network',
+    desc: 'Pair Kyber instances across machines to share state and delegate actions.',
+  },
+  notebook: {
+    title: 'Shared Notebook',
+    desc: 'The shared brain — a key/value store every paired Kyber can read and write.',
+  },
   skills: {
     title: 'Skills',
     desc: 'Install and manage SKILL.md packages (skills.sh compatible).',
@@ -103,7 +115,17 @@ const SECTIONS = {
   },
 };
 
-const BUILTIN_PROVIDERS = ['anthropic', 'openai', 'openrouter', 'deepseek'];
+const BUILTIN_PROVIDERS = ['anthropic', 'openai', 'openrouter', 'deepseek', 'chatgpt_subscription'];
+
+// Config is served in camelCase on the wire but compared against snake_case
+// keys internally (agents.defaults.provider expects snake_case). Look up a
+// provider object under either spelling.
+function getProviderConfig(providers, snakeName) {
+  if (!providers) return undefined;
+  if (providers[snakeName] !== undefined) return providers[snakeName];
+  const camel = snakeName.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+  return providers[camel];
+}
 
 // ── Helpers ──
 function showToast(msg, type = 'info') {
@@ -115,12 +137,37 @@ function showToast(msg, type = 'info') {
 
 function getToken() { return sessionStorage.getItem(TOKEN_KEY) || ''; }
 function setToken(t) { sessionStorage.setItem(TOKEN_KEY, t); }
+
+// Auto-login via ?token=... URL parameter. Printed by `kyber dashboard-info`
+// so users can click a single link from the terminal and land signed in.
+// We strip the token from the URL after consuming it so it doesn't end up
+// in browser history or shoulder-surfed from the address bar.
+(function consumeTokenFromURL() {
+  try {
+    const url = new URL(window.location.href);
+    const t = url.searchParams.get('token');
+    if (t && t.trim()) {
+      setToken(t.trim());
+      url.searchParams.delete('token');
+      const clean = url.pathname + (url.searchParams.toString() ? '?' + url.searchParams.toString() : '') + url.hash;
+      window.history.replaceState({}, document.title, clean);
+    }
+  } catch (_) {
+    // No-op if URL API is unavailable.
+  }
+})();
 function getSavedSection() { return localStorage.getItem(LAST_SECTION_KEY) || ''; }
 function setSavedSection(s) { localStorage.setItem(LAST_SECTION_KEY, s); }
 function getSavedScroll(section) { return Number(sessionStorage.getItem(SCROLL_KEY_PREFIX + section) || '0') || 0; }
 function setSavedScroll(section, y) { sessionStorage.setItem(SCROLL_KEY_PREFIX + section, String(Math.max(0, y || 0))); }
 
+// Labels that need wording clearer than the auto-humanized key.
+const FIELD_LABEL_OVERRIDES = {
+  allowGuilds: 'Allow Guilds/Servers',
+};
+
 function humanize(key) {
+  if (FIELD_LABEL_OVERRIDES[key]) return FIELD_LABEL_OVERRIDES[key];
   return key
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .replace(/_/g, ' ')
@@ -371,6 +418,9 @@ function renderSection() {
   if (activeSection === 'skills') { renderSkills(); finishRender(); return; }
   if (activeSection === 'cron') { renderCron(); finishRender(); return; }
   if (activeSection === 'security') { renderSecurity(); finishRender(); return; }
+  if (activeSection === 'service') { renderService(); finishRender(); return; }
+  if (activeSection === 'network') { renderNetwork(); finishRender(); return; }
+  if (activeSection === 'notebook') { renderNotebook(); finishRender(); return; }
 
   const data = config[activeSection];
   if (!data || !isObj(data)) {
@@ -750,10 +800,116 @@ function renderProviderCard(name, provObj, configPath, opts = {}) {
 
 // ── Section-specific renderers ──
 
+// ── ChatGPT Subscription provider card ──
+// Auth lives in ~/.codex/auth.json (Codex CLI). There's no API key to paste;
+// we show login status + a model dropdown populated from the backend.
+function renderChatGPTSubscriptionCard(provObj, configPath) {
+  const card = makeCard('ChatGPT Subscription');
+
+  // Status row (filled in asynchronously)
+  const statusRow = document.createElement('div');
+  statusRow.className = 'field-row';
+  const statusLabel = document.createElement('div');
+  statusLabel.className = 'field-label';
+  statusLabel.textContent = 'Status';
+  statusRow.appendChild(statusLabel);
+  const statusWrap = document.createElement('div');
+  statusWrap.className = 'field-input';
+  const statusValue = document.createElement('div');
+  statusValue.textContent = 'Checking…';
+  statusWrap.appendChild(statusValue);
+  statusRow.appendChild(statusWrap);
+  card.body.appendChild(statusRow);
+
+  // Model row
+  const modelRow = document.createElement('div');
+  modelRow.className = 'field-row';
+  const modelLabel = document.createElement('div');
+  modelLabel.className = 'field-label';
+  modelLabel.textContent = 'Model';
+  modelRow.appendChild(modelLabel);
+  const modelWrap = document.createElement('div');
+  modelWrap.className = 'field-input';
+  modelRow.appendChild(modelWrap);
+  card.body.appendChild(modelRow);
+
+  const currentModel = (provObj.model || '').trim();
+
+  function renderModelDropdown(models) {
+    modelWrap.innerHTML = '';
+    const sel = document.createElement('select');
+    const empty = document.createElement('option');
+    empty.value = '';
+    empty.textContent = '— Select a model —';
+    sel.appendChild(empty);
+    for (const m of models) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      if (m === currentModel) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    if (currentModel && !models.includes(currentModel)) {
+      const opt = document.createElement('option');
+      opt.value = currentModel;
+      opt.textContent = currentModel + ' (not in catalog)';
+      opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener('change', () => {
+      setPath(config, [...configPath, 'model'], sel.value);
+      markDirty();
+    });
+    modelWrap.appendChild(sel);
+  }
+
+  // Hit the status endpoint to populate auth state + model list in one round trip.
+  apiFetch(`${API}/providers/chatgpt_subscription/status`)
+    .then((res) => res.json())
+    .then((info) => {
+      const authed = !!info.authenticated;
+      statusValue.innerHTML = '';
+      const dot = document.createElement('span');
+      dot.className = 'card-badge ' + (authed ? 'on' : '');
+      dot.textContent = authed ? 'Signed in' : 'Not signed in';
+      statusValue.appendChild(dot);
+      if (authed && info.email) {
+        const em = document.createElement('span');
+        em.style.marginLeft = '8px';
+        em.style.opacity = '0.75';
+        em.textContent = info.email;
+        statusValue.appendChild(em);
+      }
+      if (!authed) {
+        const hint = document.createElement('div');
+        hint.className = 'model-hint';
+        hint.style.marginTop = '8px';
+        hint.textContent = info.loginInstruction
+          || 'Run `codex login` in your terminal, then refresh.';
+        statusValue.appendChild(hint);
+      }
+      renderModelDropdown(Array.isArray(info.models) ? info.models : []);
+    })
+    .catch((err) => {
+      statusValue.textContent = 'Status unavailable';
+      console.warn('chatgpt_subscription status failed', err);
+      renderModelDropdown([]);
+    });
+
+  return card;
+}
+
+
 function renderProviders(data) {
   for (const name of BUILTIN_PROVIDERS) {
-    const prov = data[name];
+    const prov = getProviderConfig(data, name);
     if (!prov) continue;
+    if (name === 'chatgpt_subscription') {
+      // On the wire the key is camelCase ('chatgptSubscription'); store edits
+      // under the same key so the PUT round-trips cleanly.
+      renderChatGPTSubscriptionCard(prov, ['providers', 'chatgptSubscription']);
+      continue;
+    }
     const opts = {};
     renderProviderCard(name, prov, ['providers', name], opts);
   }
@@ -858,11 +1014,15 @@ function renderAgents(data) {
     const selected = (currentValue || '').toLowerCase();
 
     for (const name of BUILTIN_PROVIDERS) {
-      const prov = providers[name];
+      const prov = getProviderConfig(providers, name);
       if (!prov) continue;
       const model = (prov.model || '').trim();
       const hasKey = !!(prov.apiKey || prov.api_key);
-      if (!hasKey) continue;
+      // Subscription providers (ChatGPT via Codex) have no API key — auth
+      // lives in the CLI's credential store. Treat them as configured
+      // whenever their block is present at all.
+      const isSubscription = name === 'chatgpt_subscription';
+      if (!hasKey && !isSubscription) continue;
       const opt = document.createElement('option');
       opt.value = name;
       const modelInfo = model ? ` (${model})` : '';
@@ -3151,6 +3311,994 @@ let _secNeedsRefresh = false;  // set when scan finishes while on another tab
 function _secStopPolling() {
   if (_secPollTimer) { clearInterval(_secPollTimer); _secPollTimer = null; }
 }
+
+// ── Background Service section ──
+// Wraps `kyber service install/uninstall/restart/status` so users who didn't
+// enable service mode at install time can toggle it from the dashboard.
+// ── Kyber Network section ──
+// Multi-machine pairing: one Kyber is a host, others are spokes that open
+// a persistent WebSocket to it. Conversations and (future) shared state
+// flow over that link. Everything here can be driven from the dashboard —
+// the CLI commands are a fallback for scripting.
+function renderNetwork() {
+  const card = makeCard('Kyber Network');
+
+  // Intro banner — short, plain-English, no raw <code> tags (those inherit
+  // browser defaults and look unstyled against the rest of the dashboard).
+  const intro = document.createElement('div');
+  intro.style.marginBottom = '14px';
+  intro.style.opacity = '0.85';
+  intro.style.lineHeight = '1.5';
+  intro.textContent =
+    'Connect two or more machines running Kyber so they can share state '
+    + 'and (in a later release) delegate actions to each other. Pick one '
+    + 'machine to be the host; every other machine joins it as a spoke.';
+  card.body.appendChild(intro);
+
+  // Role summary row (pill + editable machine name + refresh).
+  const header = document.createElement('div');
+  header.style.display = 'flex';
+  header.style.alignItems = 'center';
+  header.style.gap = '12px';
+  header.style.marginBottom = '16px';
+  header.style.flexWrap = 'wrap';
+  card.body.appendChild(header);
+
+  const content = document.createElement('div');
+  card.body.appendChild(content);
+
+  function setRolePill(role) {
+    header.innerHTML = '';
+
+    const pill = document.createElement('span');
+    pill.className = 'card-badge on';
+    pill.textContent = role;
+    header.appendChild(pill);
+
+    // Editable "this machine" name. Shows as a label; click the pencil to edit.
+    const nameWrap = document.createElement('span');
+    nameWrap.style.display = 'inline-flex';
+    nameWrap.style.alignItems = 'center';
+    nameWrap.style.gap = '6px';
+    nameWrap.style.opacity = '0.85';
+
+    const nameLabel = document.createElement('span');
+    nameLabel.id = 'nw-self-name';
+    nameWrap.appendChild(nameLabel);
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'btn btn-ghost';
+    editBtn.style.padding = '2px 6px';
+    editBtn.style.fontSize = '0.85em';
+    editBtn.title = 'Rename this machine';
+    editBtn.textContent = '✎';
+    editBtn.addEventListener('click', startRename);
+    nameWrap.appendChild(editBtn);
+
+    header.appendChild(nameWrap);
+
+    // Refresh button sits on the right end of the header row.
+    const spacer = document.createElement('span');
+    spacer.style.flex = '1';
+    header.appendChild(spacer);
+
+    const refreshBtn = document.createElement('button');
+    refreshBtn.className = 'btn btn-ghost';
+    refreshBtn.textContent = '↻ Refresh';
+    refreshBtn.title = 'Re-poll peer state';
+    refreshBtn.addEventListener('click', () => refresh({ manual: true }));
+    header.appendChild(refreshBtn);
+  }
+
+  function setSelfName(name) {
+    const el = header.querySelector('#nw-self-name');
+    if (el) el.textContent = name ? `this machine: ${name}` : '';
+  }
+
+  async function startRename() {
+    const current = (header.querySelector('#nw-self-name') || {}).textContent || '';
+    const match = current.match(/this machine:\s*(.*)$/);
+    const currentName = match ? match[1] : '';
+    const next = prompt('Rename this machine:', currentName);
+    if (next === null) return;
+    const trimmed = next.trim();
+    if (!trimmed) return;
+    if (trimmed === currentName) return;
+    try {
+      const res = await apiFetch(`${API}/network/self`, {
+        method: 'POST',
+        body: JSON.stringify({ name: trimmed }),
+      });
+      let info = {};
+      try { info = await res.json(); } catch {}
+      if (!res.ok) {
+        if (res.status === 404) {
+          showToast(
+            'Gateway is on an older version. Run `uv tool install --force --no-cache kyber-chat && kyber service restart`.',
+            'error'
+          );
+        } else {
+          showToast(info.detail || info.error || `HTTP ${res.status}`, 'error');
+        }
+        return;
+      }
+      showToast(`Renamed to ${info.name}`, 'success');
+      refresh({ manual: true });
+    } catch (e) {
+      showToast(`Rename failed: ${e.message || e}`, 'error');
+    }
+  }
+
+  // ── Host mode: peer table + pair-code issuer ──
+  function renderHost(data) {
+    content.innerHTML = '';
+
+    const peers = Array.isArray(data.peers) ? data.peers : [];
+
+    const actionsRow = document.createElement('div');
+    actionsRow.className = 'field-row';
+    actionsRow.style.gap = '8px';
+    actionsRow.style.flexWrap = 'wrap';
+    actionsRow.style.marginBottom = '12px';
+
+    const pairBtn = document.createElement('button');
+    pairBtn.className = 'btn btn-primary';
+    pairBtn.textContent = 'Invite another machine';
+    pairBtn.addEventListener('click', issueCode);
+
+    const revokeBtn = document.createElement('button');
+    revokeBtn.className = 'btn btn-ghost';
+    revokeBtn.textContent = 'Stop hosting';
+    revokeBtn.addEventListener('click', () => changeRole('standalone',
+      'Stop hosting? All paired peers will stop being able to reach this machine.'));
+
+    actionsRow.appendChild(pairBtn);
+    actionsRow.appendChild(revokeBtn);
+    content.appendChild(actionsRow);
+
+    // Code display area (hidden until user clicks invite).
+    const codeBox = document.createElement('div');
+    codeBox.style.display = 'none';
+    codeBox.style.marginBottom = '14px';
+    codeBox.style.padding = '12px';
+    codeBox.style.border = '1px solid var(--border, rgba(255,255,255,0.1))';
+    codeBox.style.borderRadius = '8px';
+    codeBox.style.background = 'var(--panel, rgba(255,255,255,0.03))';
+    content.appendChild(codeBox);
+
+    async function issueCode() {
+      pairBtn.disabled = true;
+      try {
+        const res = await apiFetch(`${API}/network/pair-code`, {
+          method: 'POST',
+          body: JSON.stringify({}),
+        });
+        const info = await res.json();
+        if (!res.ok) {
+          showToast(info.error || `Error: HTTP ${res.status}`, 'error');
+          return;
+        }
+        const mins = Math.round((info.expires_in || 300) / 60);
+        const cmd = 'kyber network join ' + window.location.origin.replace(
+          /:\d+$/,
+          ':18790'
+        ) + ' ' + info.code + ' --as <name>';
+        codeBox.style.display = '';
+        codeBox.innerHTML = '';
+
+        const line1 = document.createElement('div');
+        line1.style.marginBottom = '6px';
+        line1.style.opacity = '0.8';
+        line1.textContent = `Pairing code (expires in ~${mins} min):`;
+        codeBox.appendChild(line1);
+
+        const codeEl = document.createElement('div');
+        codeEl.style.fontSize = '1.3em';
+        codeEl.style.fontWeight = '700';
+        codeEl.style.letterSpacing = '2px';
+        codeEl.style.marginBottom = '10px';
+        codeEl.textContent = info.code;
+        codeBox.appendChild(codeEl);
+
+        const hint = document.createElement('div');
+        hint.style.opacity = '0.7';
+        hint.style.marginBottom = '6px';
+        hint.textContent = 'On the other machine, either:';
+        codeBox.appendChild(hint);
+
+        const cliLine = document.createElement('div');
+        cliLine.style.fontFamily = 'ui-monospace, Menlo, Consolas, monospace';
+        cliLine.style.fontSize = '0.9em';
+        cliLine.style.opacity = '0.85';
+        cliLine.style.marginBottom = '6px';
+        cliLine.textContent = cmd;
+        codeBox.appendChild(cliLine);
+
+        const uiLine = document.createElement('div');
+        uiLine.style.opacity = '0.7';
+        uiLine.style.fontSize = '0.9em';
+        uiLine.textContent = '…or open its dashboard → Network → "Join another Kyber" and paste this code.';
+        codeBox.appendChild(uiLine);
+      } catch (err) {
+        showToast(`Could not generate code: ${err.message || err}`, 'error');
+      } finally {
+        pairBtn.disabled = false;
+      }
+    }
+
+    // Peer list
+    const peersHead = document.createElement('div');
+    peersHead.style.marginBottom = '6px';
+    peersHead.style.opacity = '0.85';
+    peersHead.textContent = peers.length
+      ? `Paired machines (${peers.length})`
+      : 'No other machines have joined yet.';
+    content.appendChild(peersHead);
+
+    if (peers.length) {
+      const table = document.createElement('table');
+      table.style.width = '100%';
+      table.style.borderCollapse = 'collapse';
+      const head = document.createElement('thead');
+      head.innerHTML = `
+        <tr>
+          <th style="text-align:left;padding:6px 8px 6px 0;opacity:0.6;">Name</th>
+          <th style="text-align:left;padding:6px 8px;opacity:0.6;">Status</th>
+          <th style="text-align:left;padding:6px 8px;opacity:0.6;">Last seen</th>
+          <th></th>
+        </tr>`;
+      table.appendChild(head);
+      const tbody = document.createElement('tbody');
+      for (const p of peers) {
+        const tr = document.createElement('tr');
+        const lastSeen = p.last_seen
+          ? new Date(p.last_seen * 1000).toLocaleString()
+          : '—';
+        const dot = document.createElement('span');
+        dot.textContent = p.connected ? '● online' : '● offline';
+        dot.style.color = p.connected ? '#72f1b8' : '#fede5d';
+        dot.style.fontWeight = '600';
+
+        const nameCell = document.createElement('td');
+        nameCell.style.padding = '8px 8px 8px 0';
+        nameCell.innerHTML =
+          `<div style="font-weight:600;">${p.name}</div>`
+          + `<div style="font-family:ui-monospace,Menlo,Consolas,monospace;opacity:0.55;font-size:0.85em;">`
+          + `${p.peer_id.slice(0, 12)}…</div>`;
+
+        const statusCell = document.createElement('td');
+        statusCell.style.padding = '8px';
+        statusCell.appendChild(dot);
+
+        const seenCell = document.createElement('td');
+        seenCell.style.padding = '8px';
+        seenCell.style.opacity = '0.75';
+        seenCell.textContent = lastSeen;
+
+        const actionCell = document.createElement('td');
+        actionCell.style.textAlign = 'right';
+        const rm = document.createElement('button');
+        rm.className = 'btn btn-ghost';
+        rm.textContent = 'Unpair';
+        rm.addEventListener('click', async () => {
+          if (!confirm(`Unpair ${p.name}?`)) return;
+          try {
+            await apiFetch(`${API}/network/unpair`, {
+              method: 'POST',
+              body: JSON.stringify({ peer_id: p.peer_id }),
+            });
+            showToast('Peer removed', 'success');
+            refresh();
+          } catch (e) {
+            showToast(`Unpair failed: ${e.message || e}`, 'error');
+          }
+        });
+        actionCell.appendChild(rm);
+
+        tr.appendChild(nameCell);
+        tr.appendChild(statusCell);
+        tr.appendChild(seenCell);
+        tr.appendChild(actionCell);
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      content.appendChild(table);
+    }
+  }
+
+  // ── Spoke mode: show host + "leave" action ──
+  function renderSpoke(data) {
+    content.innerHTML = '';
+    const host = data.host || {};
+    const lastSeen = host.last_seen
+      ? new Date(host.last_seen * 1000).toLocaleString()
+      : '—';
+
+    const info = document.createElement('div');
+    info.style.padding = '12px';
+    info.style.border = '1px solid var(--border, rgba(255,255,255,0.1))';
+    info.style.borderRadius = '8px';
+    info.style.marginBottom = '12px';
+    info.style.background = 'var(--panel, rgba(255,255,255,0.03))';
+
+    const line1 = document.createElement('div');
+    line1.style.marginBottom = '6px';
+    line1.innerHTML = `Paired with <b>${host.name || '(unknown)'}</b>`;
+    info.appendChild(line1);
+
+    const line2 = document.createElement('div');
+    line2.style.opacity = '0.7';
+    line2.style.fontFamily = 'ui-monospace, Menlo, Consolas, monospace';
+    line2.style.fontSize = '0.9em';
+    line2.textContent = host.url || '';
+    info.appendChild(line2);
+
+    const line3 = document.createElement('div');
+    line3.style.opacity = '0.7';
+    line3.style.marginTop = '6px';
+    line3.textContent = `Last contact: ${lastSeen}`;
+    info.appendChild(line3);
+
+    content.appendChild(info);
+
+    const leaveBtn = document.createElement('button');
+    leaveBtn.className = 'btn btn-ghost';
+    leaveBtn.textContent = 'Leave host';
+    leaveBtn.addEventListener('click', () => changeRole(
+      'standalone',
+      'Leave this host? The link will be dropped and you can pair again later.'
+    ));
+    content.appendChild(leaveBtn);
+  }
+
+  // ── Standalone mode: host/join chooser ──
+  function renderStandalone() {
+    content.innerHTML = '';
+
+    const grid = document.createElement('div');
+    grid.style.display = 'grid';
+    grid.style.gridTemplateColumns = '1fr 1fr';
+    grid.style.gap = '12px';
+    grid.style.marginBottom = '16px';
+
+    // ── Host card
+    const hostCard = document.createElement('div');
+    hostCard.style.padding = '14px';
+    hostCard.style.border = '1px solid var(--border, rgba(255,255,255,0.1))';
+    hostCard.style.borderRadius = '8px';
+    hostCard.innerHTML = `
+      <div style="font-weight:600;margin-bottom:4px;">Become the host</div>
+      <div style="opacity:0.75;font-size:0.9em;margin-bottom:12px;">
+        Other machines connect to this one. Pick this for your always-on box
+        (homelab, desktop, VPS).
+      </div>
+    `;
+    const hostBtn = document.createElement('button');
+    hostBtn.className = 'btn btn-primary';
+    hostBtn.textContent = 'Make this the host';
+    hostBtn.addEventListener('click', () => changeRole(
+      'host',
+      'Make this machine the host? Other Kyber instances will be able to join it.'
+    ));
+    hostCard.appendChild(hostBtn);
+    grid.appendChild(hostCard);
+
+    // ── Join card
+    const joinCard = document.createElement('div');
+    joinCard.style.padding = '14px';
+    joinCard.style.border = '1px solid var(--border, rgba(255,255,255,0.1))';
+    joinCard.style.borderRadius = '8px';
+    joinCard.innerHTML = `
+      <div style="font-weight:600;margin-bottom:4px;">Join an existing host</div>
+      <div style="opacity:0.75;font-size:0.9em;margin-bottom:12px;">
+        This machine will connect outbound to a host you already run elsewhere.
+      </div>
+    `;
+    const joinBtn = document.createElement('button');
+    joinBtn.className = 'btn btn-primary';
+    joinBtn.textContent = 'Join another Kyber';
+    joinBtn.addEventListener('click', showJoinForm);
+    joinCard.appendChild(joinBtn);
+    grid.appendChild(joinCard);
+
+    content.appendChild(grid);
+
+    // Inline join form (revealed by button above).
+    const formWrap = document.createElement('div');
+    formWrap.id = 'nw-join-form';
+    formWrap.style.display = 'none';
+    content.appendChild(formWrap);
+
+    function showJoinForm() {
+      joinFormVisible = true;  // pauses auto-refresh until cancel/submit
+      formWrap.style.display = '';
+      formWrap.innerHTML = '';
+
+      const box = document.createElement('div');
+      box.style.padding = '14px';
+      box.style.border = '1px solid var(--border, rgba(255,255,255,0.1))';
+      box.style.borderRadius = '8px';
+
+      box.appendChild(buildLabeledInput('Host URL', 'host_url', 'http://192.168.1.10:18790'));
+      box.appendChild(buildLabeledInput('Pairing code', 'code', 'ABCD-1234'));
+      // No name field — the backend uses this machine's existing display
+      // name automatically. Rename later via the pencil if you want.
+
+      const row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.gap = '8px';
+      row.style.marginTop = '8px';
+
+      const submitBtn = document.createElement('button');
+      submitBtn.className = 'btn btn-primary';
+      submitBtn.textContent = 'Pair';
+      submitBtn.addEventListener('click', async () => {
+        const hostUrl = box.querySelector('[data-field=host_url]').value.trim();
+        const code = box.querySelector('[data-field=code]').value.trim();
+        if (!hostUrl || !code) {
+          showToast('Host URL and code are required', 'error');
+          return;
+        }
+        submitBtn.disabled = true;
+        try {
+          const res = await apiFetch(`${API}/network/join`, {
+            method: 'POST',
+            body: JSON.stringify({ host_url: hostUrl, code }),
+          });
+          let info = {};
+          try { info = await res.json(); } catch { /* empty body */ }
+          if (!res.ok) {
+            if (res.status === 404) {
+              showToast(
+                'This action requires a newer gateway. Run `kyber service restart` in a terminal.',
+                'error'
+              );
+            } else {
+              showToast(info.detail || info.error || `HTTP ${res.status}`, 'error');
+            }
+            return;
+          }
+          showToast('Paired — restart gateway to start the link.', 'success');
+          joinFormVisible = false;
+          refresh({ manual: true });
+        } catch (e) {
+          showToast(`Join failed: ${e.message || e}`, 'error');
+        } finally {
+          submitBtn.disabled = false;
+        }
+      });
+      row.appendChild(submitBtn);
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'btn btn-ghost';
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.addEventListener('click', () => {
+        joinFormVisible = false;
+        formWrap.style.display = 'none';
+        formWrap.innerHTML = '';
+      });
+      row.appendChild(cancelBtn);
+
+      box.appendChild(row);
+      formWrap.appendChild(box);
+    }
+
+    function buildLabeledInput(label, field, placeholder) {
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      const lbl = document.createElement('div');
+      lbl.className = 'field-label';
+      lbl.textContent = label;
+      row.appendChild(lbl);
+      const wrap = document.createElement('div');
+      wrap.className = 'field-input';
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.dataset.field = field;
+      inp.placeholder = placeholder;
+      wrap.appendChild(inp);
+      row.appendChild(wrap);
+      return row;
+    }
+  }
+
+  async function changeRole(newRole, confirmMsg) {
+    if (confirmMsg && !confirm(confirmMsg)) return;
+    try {
+      const res = await apiFetch(`${API}/network/role`, {
+        method: 'POST',
+        body: JSON.stringify({ role: newRole }),
+      });
+      let info = {};
+      try { info = await res.json(); } catch { /* empty body */ }
+      if (!res.ok) {
+        // 404 here almost always means the gateway is still running an
+        // older wheel. Tell the user how to fix it.
+        if (res.status === 404) {
+          showToast(
+            'Gateway is on an older version. In a terminal: '
+            + '`uv tool install --force --no-cache kyber-chat && kyber service restart`',
+            'error'
+          );
+        } else {
+          showToast(info.detail || info.error || `HTTP ${res.status}`, 'error');
+        }
+        return;
+      }
+      showToast(`Role → ${newRole}. Restart gateway to finish.`, 'success');
+      refresh();
+    } catch (e) {
+      showToast(`Could not change role: ${e.message || e}`, 'error');
+    }
+  }
+
+  // Explicit flag set while the inline "join another Kyber" form is open.
+  // Without this, the auto-refresh ticks and tears down the form even when
+  // the user hasn't focused or typed in anything yet.
+  let joinFormVisible = false;
+
+  function userIsTyping() {
+    if (joinFormVisible) return true;  // form open = treat as in-progress
+    const root = card.body;
+    if (document.activeElement && root.contains(document.activeElement)) {
+      const tag = (document.activeElement.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return true;
+    }
+    const inputs = root.querySelectorAll('input, textarea');
+    for (const el of inputs) {
+      if ((el.value || '').length > 0) return true;
+    }
+    return false;
+  }
+
+  async function refresh({ manual = false } = {}) {
+    if (!manual && userIsTyping()) return;  // don't clobber active forms
+    try {
+      const res = await apiFetch(`${API}/network/peers`);
+      const data = await res.json();
+      const role = (data.role || 'standalone').toLowerCase();
+      setRolePill(role);
+      setSelfName((data.self && data.self.name) || '');
+      if (role === 'host') renderHost(data);
+      else if (role === 'spoke') renderSpoke(data);
+      else renderStandalone();
+      if (manual) showToast('Network state refreshed', 'success');
+    } catch (err) {
+      content.textContent = 'Network info unavailable.';
+      console.warn('network peers fetch failed', err);
+    }
+  }
+
+  // Auto-refresh intentionally removed — it kept tearing down the
+  // "join another Kyber" form while users were filling it in. Use the
+  // ↻ Refresh button in the header for updates.
+
+  refresh();
+}
+
+
+// ── Shared Notebook section ──
+// Shows entries from the cross-machine notebook. On the host, reads
+// directly from SQLite; on a spoke, the gateway forwards our requests to
+// the host over the paired WebSocket. Either way the dashboard talks to
+// the local gateway with the same endpoints.
+function renderNotebook() {
+  const card = makeCard('Shared Notebook');
+
+  const intro = document.createElement('div');
+  intro.style.marginBottom = '14px';
+  intro.style.opacity = '0.85';
+  intro.style.lineHeight = '1.5';
+  intro.textContent =
+    'Every paired Kyber can read and write this notebook. Agents on any '
+    + 'machine can call `notebook_write`, `notebook_read`, `notebook_list`, '
+    + 'and `notebook_search` — those round-trip to the host over the network link.';
+  card.body.appendChild(intro);
+
+  // Write form
+  const writeBox = document.createElement('div');
+  writeBox.style.padding = '14px';
+  writeBox.style.border = '1px solid var(--border, rgba(255,255,255,0.1))';
+  writeBox.style.borderRadius = '8px';
+  writeBox.style.marginBottom = '16px';
+
+  const writeTitle = document.createElement('div');
+  writeTitle.style.fontWeight = '600';
+  writeTitle.style.marginBottom = '8px';
+  writeTitle.textContent = 'Write an entry';
+  writeBox.appendChild(writeTitle);
+
+  function buildLabeledInput(label, field, placeholder, multi = false) {
+    const row = document.createElement('div');
+    row.className = 'field-row';
+    const lbl = document.createElement('div');
+    lbl.className = 'field-label';
+    lbl.textContent = label;
+    row.appendChild(lbl);
+    const wrap = document.createElement('div');
+    wrap.className = 'field-input';
+    const inp = multi ? document.createElement('textarea') : document.createElement('input');
+    if (!multi) inp.type = 'text';
+    else inp.rows = 4;
+    inp.dataset.field = field;
+    inp.placeholder = placeholder;
+    wrap.appendChild(inp);
+    row.appendChild(wrap);
+    return row;
+  }
+
+  writeBox.appendChild(buildLabeledInput('Key', 'key', 'project-alpha/status'));
+  writeBox.appendChild(buildLabeledInput('Value', 'value', 'free-form text or JSON', true));
+  writeBox.appendChild(buildLabeledInput('Tags', 'tags', 'comma,separated,optional'));
+
+  const writeActions = document.createElement('div');
+  writeActions.style.display = 'flex';
+  writeActions.style.gap = '8px';
+  writeActions.style.marginTop = '4px';
+
+  const writeBtn = document.createElement('button');
+  writeBtn.className = 'btn btn-primary';
+  writeBtn.textContent = 'Save';
+  writeActions.appendChild(writeBtn);
+
+  const replaceChk = document.createElement('label');
+  replaceChk.style.display = 'flex';
+  replaceChk.style.alignItems = 'center';
+  replaceChk.style.gap = '6px';
+  replaceChk.style.opacity = '0.8';
+  const chk = document.createElement('input');
+  chk.type = 'checkbox';
+  chk.dataset.field = 'replace';
+  replaceChk.appendChild(chk);
+  const lbl = document.createElement('span');
+  lbl.textContent = 'Replace prior entries with same key';
+  replaceChk.appendChild(lbl);
+  writeActions.appendChild(replaceChk);
+
+  writeBox.appendChild(writeActions);
+  card.body.appendChild(writeBox);
+
+  // Toolbar: search + refresh
+  const toolbar = document.createElement('div');
+  toolbar.style.display = 'flex';
+  toolbar.style.gap = '8px';
+  toolbar.style.marginBottom = '10px';
+  toolbar.style.alignItems = 'center';
+
+  const searchInput = document.createElement('input');
+  searchInput.type = 'text';
+  searchInput.placeholder = 'Search keys, values, tags…';
+  searchInput.style.flex = '1';
+  toolbar.appendChild(searchInput);
+
+  const searchBtn = document.createElement('button');
+  searchBtn.className = 'btn btn-ghost';
+  searchBtn.textContent = 'Search';
+  toolbar.appendChild(searchBtn);
+
+  const refreshBtn = document.createElement('button');
+  refreshBtn.className = 'btn btn-ghost';
+  refreshBtn.textContent = '↻ Refresh';
+  toolbar.appendChild(refreshBtn);
+
+  card.body.appendChild(toolbar);
+
+  const list = document.createElement('div');
+  card.body.appendChild(list);
+
+  function formatTs(ts) {
+    if (!ts) return '—';
+    return new Date(ts * 1000).toLocaleString();
+  }
+
+  function renderEntries(entries) {
+    list.innerHTML = '';
+    if (!entries || !entries.length) {
+      list.innerHTML = '<div style="opacity:0.6;padding:12px;">Notebook is empty.</div>';
+      return;
+    }
+    for (const e of entries) {
+      const row = document.createElement('div');
+      row.style.padding = '12px';
+      row.style.border = '1px solid var(--border, rgba(255,255,255,0.1))';
+      row.style.borderRadius = '8px';
+      row.style.marginBottom = '8px';
+
+      const head = document.createElement('div');
+      head.style.display = 'flex';
+      head.style.justifyContent = 'space-between';
+      head.style.gap = '8px';
+      head.style.marginBottom = '6px';
+
+      const meta = document.createElement('div');
+      const tags = (e.tags || []).map(t =>
+        `<span style="display:inline-block;padding:1px 6px;margin-right:4px;border-radius:4px;background:var(--panel,rgba(255,255,255,0.06));font-size:0.8em;">${t}</span>`
+      ).join('');
+      meta.innerHTML =
+        `<div style="font-weight:600;">${e.key || '(no key)'} `
+        + `<span style="opacity:0.45;font-size:0.85em;font-family:ui-monospace,Menlo,Consolas,monospace;">#${e.id}</span></div>`
+        + `<div style="opacity:0.7;font-size:0.85em;margin-top:2px;">${e.author_name || '(unknown)'} · ${formatTs(e.created_at)}</div>`
+        + (tags ? `<div style="margin-top:4px;">${tags}</div>` : '');
+      head.appendChild(meta);
+
+      const del = document.createElement('button');
+      del.className = 'btn btn-ghost';
+      del.style.alignSelf = 'flex-start';
+      del.textContent = 'Delete';
+      del.addEventListener('click', async () => {
+        if (!confirm(`Delete entry #${e.id}?`)) return;
+        try {
+          const res = await apiFetch(`${API}/network/notebook/delete`, {
+            method: 'POST',
+            body: JSON.stringify({ id: e.id }),
+          });
+          let info = {};
+          try { info = await res.json(); } catch {}
+          if (!res.ok) {
+            showToast(info.detail || `HTTP ${res.status}`, 'error');
+            return;
+          }
+          showToast('Entry deleted', 'success');
+          refresh();
+        } catch (err) {
+          showToast(`Delete failed: ${err.message || err}`, 'error');
+        }
+      });
+      head.appendChild(del);
+
+      row.appendChild(head);
+
+      const value = document.createElement('div');
+      value.style.whiteSpace = 'pre-wrap';
+      value.style.fontFamily = 'ui-monospace, Menlo, Consolas, monospace';
+      value.style.fontSize = '0.9em';
+      value.style.opacity = '0.9';
+      value.textContent = e.value || '';
+      row.appendChild(value);
+
+      list.appendChild(row);
+    }
+  }
+
+  async function loadList(query = '') {
+    const path = query
+      ? `${API}/network/notebook/search`
+      : `${API}/network/notebook/list`;
+    const payload = query ? { query, limit: 100 } : { limit: 50 };
+    try {
+      const res = await apiFetch(path, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      let info = {};
+      try { info = await res.json(); } catch {}
+      if (!res.ok) {
+        if (res.status === 404) {
+          list.innerHTML = '<div style="opacity:0.7;padding:12px;">Gateway is on an older version — run `uv tool install --force --no-cache kyber-chat && kyber service restart`.</div>';
+        } else if (res.status === 409) {
+          list.innerHTML = `<div style="opacity:0.7;padding:12px;">${info.detail || 'Kyber network is not configured.'}</div>`;
+        } else {
+          list.innerHTML = `<div style="opacity:0.7;padding:12px;">Error: ${info.detail || 'HTTP ' + res.status}</div>`;
+        }
+        return;
+      }
+      renderEntries(info.entries || []);
+    } catch (err) {
+      list.innerHTML = `<div style="opacity:0.7;padding:12px;">Could not load notebook: ${err.message || err}</div>`;
+    }
+  }
+
+  async function refresh() {
+    const q = searchInput.value.trim();
+    await loadList(q);
+  }
+
+  writeBtn.addEventListener('click', async () => {
+    const key = writeBox.querySelector('[data-field=key]').value.trim();
+    const value = writeBox.querySelector('[data-field=value]').value;
+    const tagsRaw = writeBox.querySelector('[data-field=tags]').value.trim();
+    const replace = writeBox.querySelector('[data-field=replace]').checked;
+    if (!key) {
+      showToast('Key is required', 'error');
+      return;
+    }
+    const tags = tagsRaw
+      ? tagsRaw.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
+    writeBtn.disabled = true;
+    try {
+      const res = await apiFetch(`${API}/network/notebook/write`, {
+        method: 'POST',
+        body: JSON.stringify({ key, value, tags, replace }),
+      });
+      let info = {};
+      try { info = await res.json(); } catch {}
+      if (!res.ok) {
+        showToast(info.detail || `HTTP ${res.status}`, 'error');
+        return;
+      }
+      showToast('Entry saved', 'success');
+      writeBox.querySelector('[data-field=value]').value = '';
+      refresh();
+    } catch (err) {
+      showToast(`Save failed: ${err.message || err}`, 'error');
+    } finally {
+      writeBtn.disabled = false;
+    }
+  });
+
+  searchBtn.addEventListener('click', refresh);
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') refresh();
+  });
+  refreshBtn.addEventListener('click', refresh);
+
+  refresh();
+}
+
+
+function renderService() {
+  const card = makeCard('Background Service');
+
+  const summary = document.createElement('div');
+  summary.style.marginBottom = '12px';
+  summary.style.opacity = '0.8';
+  summary.textContent =
+    'When enabled, Kyber runs the gateway and dashboard as system services '
+    + '(launchd on macOS, systemd --user on Linux) so they start automatically '
+    + 'at login and restart if they crash.';
+  card.body.appendChild(summary);
+
+  // Status rows (filled in after fetch)
+  const statusWrap = document.createElement('div');
+  statusWrap.style.marginBottom = '16px';
+  card.body.appendChild(statusWrap);
+
+  // Action buttons row
+  const actions = document.createElement('div');
+  actions.className = 'field-row';
+  actions.style.gap = '8px';
+  actions.style.flexWrap = 'wrap';
+
+  const enableBtn = document.createElement('button');
+  enableBtn.className = 'btn btn-primary';
+  enableBtn.textContent = 'Enable';
+
+  const disableBtn = document.createElement('button');
+  disableBtn.className = 'btn btn-ghost';
+  disableBtn.textContent = 'Disable';
+
+  const restartBtn = document.createElement('button');
+  restartBtn.className = 'btn btn-ghost';
+  restartBtn.textContent = 'Restart';
+
+  actions.appendChild(enableBtn);
+  actions.appendChild(disableBtn);
+  actions.appendChild(restartBtn);
+  card.body.appendChild(actions);
+
+  // Hint row shows contextual instructions (e.g. about manually running dashboard)
+  const hint = document.createElement('div');
+  hint.className = 'model-hint';
+  hint.style.marginTop = '12px';
+  hint.textContent = '';
+  card.body.appendChild(hint);
+
+  function setBusy(busy) {
+    enableBtn.disabled = busy;
+    disableBtn.disabled = busy;
+    restartBtn.disabled = busy;
+  }
+
+  function renderStatus(info) {
+    statusWrap.innerHTML = '';
+
+    if (info && info.supported === false) {
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      row.textContent = info.error || 'Unsupported platform.';
+      statusWrap.appendChild(row);
+      setBusy(true);
+      return;
+    }
+
+    if (!info) {
+      statusWrap.textContent = 'Status unavailable.';
+      return;
+    }
+
+    const backendRow = document.createElement('div');
+    backendRow.style.marginBottom = '8px';
+    backendRow.innerHTML = `<span style="opacity:0.65;">Backend:</span> <b>${info.backend}</b>`;
+    statusWrap.appendChild(backendRow);
+
+    const enabled = !!info.enabled;
+    const pill = document.createElement('span');
+    pill.className = 'card-badge' + (enabled ? ' on' : '');
+    pill.textContent = enabled ? 'Enabled' : 'Disabled';
+    pill.style.marginBottom = '8px';
+    statusWrap.appendChild(pill);
+
+    for (const unit of [info.gateway, info.dashboard]) {
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      row.style.padding = '6px 0';
+      const label = document.createElement('div');
+      label.className = 'field-label';
+      label.textContent = humanize(unit.name);
+      const val = document.createElement('div');
+      val.className = 'field-input';
+      const installed = unit.installed ? 'installed' : 'not installed';
+      const state = unit.active ? 'active' : 'inactive';
+      const stateColor = unit.active ? '#16a34a' : (unit.installed ? '#ca8a04' : '#6b7280');
+      val.innerHTML =
+        `<span>${installed}</span>`
+        + ` &middot; <span style="color:${stateColor};">${state}</span>`
+        + ` &middot; <span style="opacity:0.55;font-family:monospace;font-size:0.85em;">${unit.identifier}</span>`;
+      row.appendChild(label);
+      row.appendChild(val);
+      statusWrap.appendChild(row);
+    }
+
+    // Update button states
+    enableBtn.disabled = false;
+    disableBtn.disabled = !enabled;
+    restartBtn.disabled = !enabled;
+
+    if (enabled && (!info.gateway.active || !info.dashboard.active)) {
+      hint.textContent =
+        'Services are installed but one or more is not running. This usually '
+        + 'means you still have `kyber gateway` or `kyber dashboard` running '
+        + 'manually on the same ports — stop those processes and click Restart.';
+    } else if (!enabled) {
+      hint.textContent =
+        'Tip: if you currently have `kyber dashboard` running manually in a '
+        + 'terminal, enabling the service will try to start a second copy that '
+        + 'will fail to bind the port until you stop the manual one.';
+    } else {
+      hint.textContent = '';
+    }
+  }
+
+  async function refresh() {
+    try {
+      const res = await apiFetch(`${API}/service/status`);
+      const info = await res.json();
+      renderStatus(info);
+    } catch (err) {
+      statusWrap.textContent = `Status unavailable: ${err.message || err}`;
+    }
+  }
+
+  async function callAction(path, successMsg) {
+    setBusy(true);
+    try {
+      const res = await apiFetch(`${API}/service/${path}`, { method: 'POST' });
+      const info = await res.json();
+      if (!res.ok) {
+        showToast(info.error || `Service ${path} failed`, 'error');
+      } else {
+        showToast(successMsg, 'success');
+      }
+      renderStatus(info);
+    } catch (err) {
+      showToast(`Service ${path} failed: ${err.message || err}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  enableBtn.addEventListener('click', () => callAction('install', 'Services enabled'));
+  disableBtn.addEventListener('click', () => {
+    if (!confirm('Disable background services? The gateway and dashboard will stop running automatically.')) return;
+    callAction('uninstall', 'Services disabled');
+  });
+  restartBtn.addEventListener('click', () => callAction('restart', 'Services restarted'));
+
+  // Kick off the initial fetch.
+  refresh();
+}
+
 
 function renderSecurity() {
 

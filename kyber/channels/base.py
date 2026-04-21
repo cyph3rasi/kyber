@@ -17,6 +17,12 @@ class BaseChannel(ABC):
     
     name: str = "base"
     
+    # Filled in later by ChannelManager.attach_agent so slash commands
+    # that need live agent state (/cancel, /usage) can reach it. Stays
+    # None on instances that were never attached, in which case those
+    # commands degrade with a friendly message.
+    agent: Any = None
+
     def __init__(self, config: Any, bus: MessageBus):
         """
         Initialize the channel.
@@ -91,9 +97,10 @@ class BaseChannel(ABC):
     ) -> None:
         """
         Handle an incoming message from the chat platform.
-        
-        This method checks permissions and forwards to the bus.
-        
+
+        This method checks permissions, handles slash commands directly,
+        and forwards ordinary messages to the bus.
+
         Args:
             sender_id: The sender's identifier.
             chat_id: The chat/channel identifier.
@@ -103,7 +110,13 @@ class BaseChannel(ABC):
         """
         if not self.is_allowed(sender_id):
             return
-        
+
+        # Slash commands are handled inline — no bus, no LLM, no token
+        # cost. Every channel that inherits from BaseChannel gets this
+        # behaviour automatically; no per-channel wiring needed.
+        if await self._maybe_handle_slash_command(sender_id, chat_id, content):
+            return
+
         msg = InboundMessage(
             channel=self.name,
             sender_id=str(sender_id),
@@ -112,8 +125,66 @@ class BaseChannel(ABC):
             media=media or [],
             metadata=metadata or {}
         )
-        
+
         await self.bus.publish_inbound(msg)
+
+    async def _maybe_handle_slash_command(
+        self,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+    ) -> bool:
+        """If ``content`` is a slash command, dispatch + reply. Return True.
+
+        Slash dispatch needs the live AgentCore for commands like /cancel
+        and /usage. Channels that don't hand us an agent in the
+        constructor still get the simpler commands (/help, /model, /peers,
+        etc.) that only touch config.
+        """
+        from kyber.commands import CommandContext, dispatch, is_slash_command
+
+        if not is_slash_command(content):
+            return False
+
+        try:
+            from kyber.config.loader import load_config
+
+            cfg = load_config()
+        except Exception:
+            cfg = None
+
+        ctx = CommandContext(
+            channel=self.name,
+            session_id=str(chat_id),
+            sender_id=str(sender_id),
+            sender_name=str(sender_id),
+            agent=getattr(self, "agent", None),
+            session_key=f"{self.name}:{chat_id}",
+            config=cfg,
+            supports_markdown=True,
+        )
+        result = await dispatch(content, ctx)
+        if result is None:
+            # `is_slash_command` passed but dispatcher didn't consume it —
+            # fall back to the normal bus path rather than eating the
+            # message.
+            return False
+
+        reply = (result.reply_text or "").strip()
+        if reply:
+            await self.bus.publish_outbound(
+                OutboundMessage(channel=self.name, chat_id=str(chat_id), content=reply)
+            )
+        if result.reset_session and getattr(self, "agent", None) is not None:
+            try:
+                reset = getattr(self.agent, "reset_session", None)
+                if callable(reset):
+                    maybe = reset(f"{self.name}:{chat_id}")
+                    if hasattr(maybe, "__await__"):
+                        await maybe
+            except Exception:
+                pass
+        return True
     
     @property
     def is_running(self) -> bool:

@@ -18,16 +18,23 @@ from kyber.utils.helpers import ensure_dir, safe_filename
 class Session:
     """
     A conversation session.
-    
+
     Stores messages in JSONL format for easy reading and persistence.
+
+    ``started_at`` is bumped every time the session is explicitly cleared
+    (``/new``). ``/usage`` uses it as a boundary so "This session" only
+    counts tasks that happened after the most recent reset — previously
+    ``session_key`` was sticky per Discord channel so ``/new`` silently
+    never reset the counter.
     """
-    
+
     key: str  # channel:chat_id
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
+    started_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
-    
+
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
         msg = {
@@ -38,27 +45,29 @@ class Session:
         }
         self.messages.append(msg)
         self.updated_at = datetime.now()
-    
+
     def get_history(self, max_messages: int = 20) -> list[dict[str, Any]]:
         """
         Get message history for LLM context.
-        
+
         Args:
             max_messages: Maximum messages to return.
-        
+
         Returns:
             List of messages in LLM format.
         """
         # Get recent messages
         recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
-        
+
         # Convert to LLM format (just role and content)
         return [{"role": m["role"], "content": m["content"]} for m in recent]
-    
+
     def clear(self) -> None:
-        """Clear all messages in the session."""
+        """Clear all messages and mark a fresh session boundary."""
+        now = datetime.now()
         self.messages = []
-        self.updated_at = datetime.now()
+        self.updated_at = now
+        self.started_at = now
 
 
 class SessionManager:
@@ -113,8 +122,9 @@ class SessionManager:
             messages = []
             metadata = {}
             created_at = None
+            started_at = None
             malformed_lines = 0
-            
+
             with open(path) as f:
                 for line in f:
                     line = line.strip()
@@ -140,6 +150,12 @@ class SessionManager:
                                 created_at = datetime.fromisoformat(str(created_raw))
                             except Exception:
                                 created_at = None
+                        started_raw = data.get("started_at")
+                        if started_raw:
+                            try:
+                                started_at = datetime.fromisoformat(str(started_raw))
+                            except Exception:
+                                started_at = None
                     else:
                         messages.append(data)
 
@@ -148,11 +164,15 @@ class SessionManager:
                     f"Session {key} contained {malformed_lines} malformed line(s); "
                     "loaded remaining valid entries."
                 )
-            
+
             return Session(
                 key=key,
                 messages=messages,
                 created_at=created_at or datetime.now(),
+                # Fall back to created_at so legacy sessions (written before
+                # started_at existed) get a sensible boundary — otherwise
+                # /usage would think the whole session started "now".
+                started_at=started_at or created_at or datetime.now(),
                 metadata=metadata
             )
         except Exception as e:
@@ -203,6 +223,7 @@ class SessionManager:
                         "_type": "metadata",
                         "created_at": session.created_at.isoformat(),
                         "updated_at": session.updated_at.isoformat(),
+                        "started_at": session.started_at.isoformat(),
                         "metadata": session.metadata,
                     }
                     tmp_file.write(json.dumps(metadata_line) + "\n")
@@ -224,6 +245,19 @@ class SessionManager:
         except Exception as e:
             logger.warning(f"Failed to save session {session.key}: {e}")
     
+    def clear(self, key: str) -> Session:
+        """Clear a session's history and mark a fresh ``started_at`` boundary.
+
+        Used by ``/new`` — we don't ``delete`` the session file because we
+        want ``started_at`` to persist across gateway restarts so usage
+        reporting stays honest after a reboot. Returns the cleared session
+        so callers can observe the new boundary.
+        """
+        session = self.get_or_create(key)
+        session.clear()
+        self.save(session)
+        return session
+
     def delete(self, key: str) -> bool:
         """
         Delete a session.

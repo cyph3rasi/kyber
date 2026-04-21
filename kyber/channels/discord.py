@@ -14,6 +14,8 @@ from kyber.config.schema import DiscordConfig
 
 try:
     import discord
+    from discord.ext import commands
+    from discord import app_commands
     DISCORD_AVAILABLE = True
 except ImportError:
     DISCORD_AVAILABLE = False
@@ -35,7 +37,7 @@ class DiscordChannel(BaseChannel):
     def __init__(self, config: DiscordConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: DiscordConfig = config
-        self._client: "discord.Client | None" = None
+        self._client: "commands.Bot | None" = None
         self._ready = asyncio.Event()
         self._bot_user_id: int | None = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
@@ -61,13 +63,23 @@ class DiscordChannel(BaseChannel):
         intents.dm_messages = True
         intents.message_content = True
         
-        self._client = discord.Client(intents=intents)
+        self._client = commands.Bot(command_prefix="!", intents=intents)
         
         @self._client.event
         async def on_ready():
             if not self._client or not self._client.user:
                 return
             self._bot_user_id = self._client.user.id
+            
+            # Register native slash commands from kyber registry.
+            # Failures here must NOT prevent _ready from being set —
+            # otherwise the bot stays in "not ready" limbo and can
+            # never send replies (typing forever).
+            try:
+                await self._setup_native_commands()
+            except Exception as e:
+                logger.warning(f"Failed to set up native slash commands: {e}")
+            
             self._ready.set()
             logger.info(f"Discord bot connected as {self._client.user}")
         
@@ -84,6 +96,69 @@ class DiscordChannel(BaseChannel):
             logger.error(f"Discord client error: {e}")
         finally:
             self._running = False
+
+    async def _setup_native_commands(self) -> None:
+        """Bridge kyber registry commands to Discord native slash commands."""
+        if not self._client:
+            return
+
+        from kyber.commands.registry import list_commands, CommandContext, dispatch
+
+        # Collect commands for the group
+        for cmd in list_commands():
+            # Build a callback whose signature discord.py can introspect
+            # to produce the slash-command parameter list.
+            # We use a default-valued `args: str` so discord.py sees
+            # one optional string parameter.
+            async def _make_callback(
+                interaction: discord.Interaction,
+                args: str = "",
+                *,
+                _name: str = cmd.name,
+            ):
+                await interaction.response.defer()
+
+                # session_key must match the key the agent records usage
+                # under (``InboundMessage.session_key`` == ``<channel>:<chat_id>``).
+                # Without this, /usage showed 0 tokens "This session" while the
+                # "Top sessions" list showed the real usage under the correct
+                # key — discord:<channel_id>.
+                chat_id = str(interaction.channel_id)
+                ctx = CommandContext(
+                    channel="discord",
+                    session_id=chat_id,
+                    session_key=f"discord:{chat_id}",
+                    sender_id=str(interaction.user.id),
+                    sender_name=interaction.user.name,
+                    agent=getattr(self, "agent", None),
+                    extra={"interaction": interaction},
+                )
+
+                full_text = f"/{_name} {args}".strip()
+                result = await dispatch(full_text, ctx)
+
+                if result and result.reply_text:
+                    await interaction.followup.send(result.reply_text)
+                else:
+                    await interaction.followup.send(f"Command `/{_name}` executed.")
+
+            clean_name = cmd.name.lower().replace("_", "-")
+            app_cmd = app_commands.Command(
+                name=clean_name,
+                description=cmd.summary or f"Run kyber {cmd.name}",
+                callback=_make_callback,
+            )
+            self._client.tree.add_command(app_cmd)
+
+        # /sync — manually trigger slash-command registration with Discord
+        @self._client.tree.command(name="sync", description="Sync slash commands with Discord")
+        async def sync(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            try:
+                await self._client.tree.sync()
+                await interaction.followup.send("Successfully synced slash commands!")
+            except Exception as e:
+                await interaction.followup.send(f"Failed to sync: {e}")
     
     async def stop(self) -> None:
         """Stop the Discord bot."""

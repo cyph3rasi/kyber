@@ -387,22 +387,10 @@ class MemoryTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Save important information to persistent memory that survives across sessions. "
-            "Your memory appears in your system prompt at session start -- it's how you "
-            "remember things about the user and your environment between conversations.\n\n"
-            "WHEN TO SAVE (do this proactively, don't wait to be asked):\n"
-            "- User shares a preference, habit, or personal detail (name, role, timezone, coding style)\n"
-            "- You discover something about the environment (OS, installed tools, project structure)\n"
-            "- User corrects you or says 'remember this' / 'don't do that again'\n"
-            "- You learn a convention, API quirk, or workflow specific to this user's setup\n"
-            "- You completed something - log it like a diary entry\n\n"
-            "TWO TARGETS:\n"
-            "- 'user': who the user is -- writes to workspace USER.md (single profile file)\n"
-            "- 'memory': your notes -- writes to workspace memory/MEMORY.md\n\n"
-            "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-            "remove (delete -- old_text identifies it).\n"
-            "Capacity shown in system prompt. When >80%, consolidate entries before adding new ones.\n\n"
-            "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps."
+            "Persist notes across sessions. target=`user` writes USER.md "
+            "(who the user is), target=`memory` writes memory/MEMORY.md "
+            "(your own notes). Save user preferences, env facts, and "
+            "corrections proactively; skip trivia and rediscoverable data."
         )
 
     @property
@@ -410,23 +398,12 @@ class MemoryTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["add", "replace", "remove"],
-                    "description": "The action to perform."
-                },
-                "target": {
-                    "type": "string",
-                    "enum": ["memory", "user"],
-                    "description": "Which memory store: 'memory' for personal notes (memory/MEMORY.md), 'user' for user profile (USER.md)."
-                },
-                "content": {
-                    "type": "string",
-                    "description": "The entry content. Required for 'add' and 'replace'."
-                },
+                "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+                "target": {"type": "string", "enum": ["memory", "user"]},
+                "content": {"type": "string", "description": "Entry text (for add/replace)."},
                 "old_text": {
                     "type": "string",
-                    "description": "Short unique substring identifying the entry to replace or remove."
+                    "description": "Unique substring of the entry to replace/remove.",
                 },
             },
             "required": ["action", "target"],

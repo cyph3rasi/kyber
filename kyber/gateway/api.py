@@ -118,9 +118,40 @@ def create_gateway_app(agent: AgentCore, token: str) -> FastAPI:
             chat_locks[session_key] = lock
         return lock
 
+    # Kyber network (host side). These routes are always mounted; their
+    # handlers check network state internally and no-op when this instance
+    # is not configured as a host. Admin-only endpoints (generate pairing
+    # code, unpair) are gated behind the same bearer-token auth as the
+    # rest of the gateway.
+    try:
+        from kyber.network.host import mount_host_routes
+
+        mount_host_routes(app, require=require)
+    except Exception:  # pragma: no cover
+        # Never let network wiring block gateway startup — but do log it
+        # loudly so we're not flying blind when the dashboard returns 404
+        # on /network/role.
+        import logging as _logging
+        _logging.getLogger("kyber.gateway").exception(
+            "Failed to mount Kyber network routes"
+        )
+
     @app.get("/health")
     async def health() -> JSONResponse:
         return JSONResponse({"ok": True})
+
+    @app.get("/version")
+    async def version() -> JSONResponse:
+        """Return the version string of the running gateway process.
+
+        The installed wheel reports whatever ``kyber --version`` prints
+        from its import metadata, but that only tells you what's on disk.
+        This endpoint reports what the running process actually loaded,
+        so `kyber upgrade` can verify a restart took effect.
+        """
+        from kyber import __version__
+
+        return JSONResponse({"version": __version__})
 
     @app.get("/tasks", dependencies=[Depends(require)])
     async def list_tasks() -> JSONResponse:
@@ -266,6 +297,46 @@ def create_gateway_app(agent: AgentCore, token: str) -> FastAPI:
         session_id = _normalize_session_id(raw_session_id)
         session_key = f"dashboard:{session_id}"
         lock = _chat_lock(session_key)
+
+        # Slash commands short-circuit the LLM: every channel runs user
+        # input through the shared dispatcher first. If the input is a
+        # slash command, we return the result directly — no agent call,
+        # no token usage.
+        from kyber.commands import CommandContext, dispatch, is_slash_command
+        from kyber.config.loader import load_config
+
+        if is_slash_command(message):
+            from kyber.commands.registry import is_slash_command as _is  # ruff friendliness
+            ctx = CommandContext(
+                channel="dashboard",
+                session_id=session_id,
+                sender_id="dashboard",
+                sender_name="dashboard",
+                agent=agent,
+                session_key=session_key,
+                config=load_config(),
+                supports_markdown=True,
+            )
+            result = await dispatch(message, ctx)
+            if result is not None:
+                if result.reset_session:
+                    try:
+                        reset = getattr(agent, "reset_session", None)
+                        if callable(reset):
+                            maybe = reset(session_key)
+                            if hasattr(maybe, "__await__"):
+                                await maybe
+                    except Exception:
+                        pass
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "session_id": session_id,
+                        "sessionId": session_id,
+                        "response": result.reply_text,
+                        "slashCommand": True,
+                    }
+                )
 
         try:
             async with lock:

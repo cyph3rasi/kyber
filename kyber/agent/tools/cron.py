@@ -82,14 +82,7 @@ class ListCronjobsTool(Tool):
 
     @property
     def description(self) -> str:
-        return (
-            "List all scheduled cronjobs with their IDs, schedules, and status.\n\n"
-            "Use this to:\n"
-            "- See what jobs are currently scheduled\n"
-            "- Find job IDs for removal with remove_cronjob\n"
-            "- Check job status and next run times\n\n"
-            "Returns job_id, name, schedule, repeat status, next/last run times."
-        )
+        return "List scheduled cronjobs with IDs, schedules, and next/last run times."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -98,7 +91,7 @@ class ListCronjobsTool(Tool):
             "properties": {
                 "include_disabled": {
                     "type": "boolean",
-                    "description": "Include disabled/completed jobs in the list (default: false)",
+                    "description": "Include disabled/completed jobs.",
                 },
             },
             "required": [],
@@ -150,22 +143,10 @@ class ScheduleCronjobTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Schedule an automated task to run the agent on a schedule.\n\n"
-            "Cron jobs run with the full kyber runtime (same tools, skills, and memory).\n"
-            "When scheduled from chat, they also reuse that chat session context by default.\n\n"
-            "SCHEDULE FORMATS:\n"
-            "- One-shot: \"30m\", \"2h\", \"1d\" (runs once after delay)\n"
-            "- Interval: \"every 30m\", \"every 2h\" (recurring)\n"
-            "- Cron: \"0 9 * * *\" (cron expression for precise scheduling)\n"
-            "- Timestamp: \"2026-02-03T14:00:00\" (specific date/time)\n\n"
-            "REPEAT BEHAVIOR:\n"
-            "- One-shot schedules: run once by default\n"
-            "- Intervals/cron: run forever by default\n"
-            "- Set repeat=N to run exactly N times then auto-delete\n\n"
-            "DELIVERY OPTIONS (where output goes):\n"
-            "- \"origin\": Back to current chat\n"
-            "- \"local\": Save to local files only\n"
-            "- \"telegram:123456\": Send to specific chat (if user provides ID)"
+            "Schedule the agent to run later. Schedule formats: '30m'/'2h'/'1d' "
+            "(one-shot), 'every 30m' (recurring), '0 9 * * *' (cron), ISO "
+            "timestamp. `deliver`: 'origin' (this chat), 'local' (files), or "
+            "'discord:<id>' / 'telegram:<id>'."
         )
 
     @property
@@ -173,25 +154,16 @@ class ScheduleCronjobTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Instructions for what the scheduled run should do.",
-                },
-                "schedule": {
-                    "type": "string",
-                    "description": "When to run: '30m' (once in 30min), 'every 30m' (recurring), '0 9 * * *' (cron), or ISO timestamp",
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Optional human-friendly name for the job",
-                },
+                "prompt": {"type": "string", "description": "What the scheduled run should do."},
+                "schedule": {"type": "string", "description": "See description for formats."},
+                "name": {"type": "string", "description": "Optional human-friendly label."},
                 "repeat": {
                     "type": "integer",
-                    "description": "Number of times to run. Omit for default (once for one-shot, forever for recurring).",
+                    "description": "N runs then auto-delete. Default: 1 for one-shot, forever for recurring.",
                 },
                 "deliver": {
                     "type": "string",
-                    "description": "Where to send output: 'origin' (back to this chat), 'local' (files only), or 'platform:chat_id' (e.g. 'discord:12345')",
+                    "description": "'origin' | 'local' | 'platform:chat_id'.",
                 },
             },
             "required": ["prompt", "schedule"],
@@ -298,23 +270,13 @@ class RemoveCronjobTool(Tool):
 
     @property
     def description(self) -> str:
-        return (
-            "Remove a scheduled cronjob by its ID.\n\n"
-            "Use list_cronjobs first to find the job_id of the job you want to remove.\n"
-            "Jobs that have completed their repeat count are auto-removed, but you can\n"
-            "use this to cancel a job before it completes."
-        )
+        return "Cancel a scheduled cronjob by its ID (use list_cronjobs to find it)."
 
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
-            "properties": {
-                "job_id": {
-                    "type": "string",
-                    "description": "The ID of the cronjob to remove (from list_cronjobs output)",
-                },
-            },
+            "properties": {"job_id": {"type": "string"}},
             "required": ["job_id"],
         }
 

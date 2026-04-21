@@ -62,6 +62,16 @@ class Task:
     result: str | None = None
     error: str | None = None
     completion_reference: str | None = None  # ✅ reference on completion
+
+    # Token usage, summed across every LLM round-trip this task made.
+    # Populated by AgentCore when each LLMResponse comes back. Zero if
+    # the provider didn't return usage info.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    # Provider + model at time of first LLM call, so /cost can look up rates.
+    provider: str = ""
+    model: str = ""
     
     def to_progress_summary(self) -> str:
         """Short progress summary for context injection."""
@@ -382,6 +392,40 @@ class TaskRegistry:
                 task.current_action = current_action
             if action_completed:
                 task.actions_completed.append(action_completed)
+
+    def add_usage(
+        self,
+        task_id: str,
+        usage: dict[str, int] | None,
+        *,
+        provider: str = "",
+        model: str = "",
+    ) -> None:
+        """Accumulate a single LLM round-trip's usage into the task record.
+
+        Called once per ``LLMResponse`` by AgentCore. Providers that
+        don't report usage (some local models, OpenAI-compatible shims)
+        pass None and we no-op. The ``provider``/``model`` fields stick
+        to whatever the first call recorded so /cost can price the
+        session even if the user swaps mid-conversation.
+        """
+        if not usage:
+            return
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        task.input_tokens += int(usage.get("prompt_tokens", 0) or 0)
+        task.output_tokens += int(usage.get("completion_tokens", 0) or 0)
+        # Use the provider-reported total when present, otherwise derive.
+        reported_total = int(usage.get("total_tokens", 0) or 0)
+        task.total_tokens += reported_total or (
+            int(usage.get("prompt_tokens", 0) or 0)
+            + int(usage.get("completion_tokens", 0) or 0)
+        )
+        if not task.provider and provider:
+            task.provider = provider
+        if not task.model and model:
+            task.model = model
 
     def get_active_tasks(self) -> list[Task]:
         """Get all active (queued or running) tasks."""

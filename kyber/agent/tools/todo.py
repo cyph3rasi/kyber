@@ -114,18 +114,10 @@ class TodoTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Manage your task list for the current session. Use for complex tasks "
-            "with 3+ steps or when the user provides multiple tasks. "
-            "Call with no parameters to read the current list.\n\n"
-            "Writing:\n"
-            "- Provide 'todos' array to create/update items\n"
-            "- merge=false (default): replace the entire list with a fresh plan\n"
-            "- merge=true: update existing items by id, add any new ones\n\n"
-            "Each item: {id: string, content: string, status: pending|in_progress|completed|cancelled}\n"
-            "List order is priority. Only ONE item in_progress at a time.\n"
-            "Mark items completed immediately when done. If something fails, "
-            "cancel it and add a revised item.\n\n"
-            "Always returns the full current list."
+            "Session task list. Omit args to read. Use for 3+ step work. "
+            "Exactly one item `in_progress` at a time; mark `completed` as "
+            "you finish. `merge=false` (default) replaces the list; "
+            "`merge=true` updates by id."
         )
 
     @property
@@ -135,28 +127,23 @@ class TodoTool(Tool):
             "properties": {
                 "todos": {
                     "type": "array",
-                    "description": "Task items to write. Omit to read current list.",
+                    "description": "Items to write (omit to read).",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Unique item identifier"},
-                            "content": {"type": "string", "description": "Task description"},
+                            "id": {"type": "string"},
+                            "content": {"type": "string"},
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed", "cancelled"],
-                                "description": "Current status"
-                            }
+                            },
                         },
-                        "required": ["id", "content", "status"]
-                    }
+                        "required": ["id", "content", "status"],
+                    },
                 },
-                "merge": {
-                    "type": "boolean",
-                    "description": "true: update existing items by id, add new ones. false (default): replace the entire list.",
-                    "default": False
-                }
+                "merge": {"type": "boolean", "default": False},
             },
-            "required": []
+            "required": [],
         }
 
     @property

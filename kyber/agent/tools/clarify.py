@@ -24,20 +24,10 @@ class ClarifyTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Ask the user a question when you need clarification, feedback, or a "
-            "decision before proceeding. Supports two modes:\n\n"
-            "1. **Multiple choice** — provide up to 4 choices. The user picks one "
-            "or types their own answer via a 5th 'Other' option.\n"
-            "2. **Open-ended** — omit choices entirely. The user types a free-form "
-            "response.\n\n"
-            "Use this tool when:\n"
-            "- The task is ambiguous and you need the user to choose an approach\n"
-            "- You want post-task feedback ('How did that work out?')\n"
-            "- You want to offer to save a skill or update memory\n"
-            "- A decision has meaningful trade-offs the user should weigh in on\n\n"
-            "Do NOT use this tool for simple yes/no confirmation of dangerous "
-            "commands (the terminal tool handles that). Prefer making a reasonable "
-            "default choice yourself when the decision is low-stakes."
+            "Ask the user before proceeding when a decision is ambiguous. "
+            "Pass up to 4 `choices` for multiple-choice, or omit for open-"
+            "ended. Don't use for yes/no confirmation of risky shell "
+            "commands — the shell tool handles that."
         )
 
     @property
@@ -45,19 +35,12 @@ class ClarifyTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "The question to present to the user."
-                },
+                "question": {"type": "string"},
                 "choices": {
                     "type": "array",
                     "items": {"type": "string"},
                     "maxItems": MAX_CHOICES,
-                    "description": (
-                        "Up to 4 answer choices. Omit this parameter entirely to "
-                        "ask an open-ended question. When provided, the UI "
-                        "automatically appends an 'Other (type your answer)' option."
-                    ),
+                    "description": "Up to 4 options; an 'Other' fallback is added automatically.",
                 },
             },
             "required": ["question"],

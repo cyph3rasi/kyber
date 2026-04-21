@@ -117,17 +117,14 @@ class SkillsListTool(Tool):
 
     @property
     def description(self) -> str:
-        return "List available skills (name + description). Use skill_view(name) to load full content."
+        return "List available skills (name + description). Call skill_view for full content."
 
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
             "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Optional category filter to narrow results",
-                },
+                "category": {"type": "string", "description": "Optional category filter."},
             },
             "required": [],
         }
@@ -162,9 +159,8 @@ class SkillViewTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Skills allow for loading information about specific tasks and workflows. "
-            "Load a skill's full content or access its linked files (references, templates, scripts). "
-            "First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts."
+            "Load a skill's SKILL.md plus `linked_files` index. "
+            "Pass `file_path` to read a specific references/templates/scripts file."
         )
 
     @property
@@ -172,13 +168,10 @@ class SkillViewTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "The skill name (use skills_list to see available skills)",
-                },
+                "name": {"type": "string", "description": "Skill name (see skills_list)."},
                 "file_path": {
                     "type": "string",
-                    "description": "OPTIONAL: Path to a linked file within the skill (e.g. 'references/api.md'). Omit to get the main SKILL.md content.",
+                    "description": "Optional linked file, e.g. 'references/api.md'.",
                 },
             },
             "required": ["name"],
@@ -242,10 +235,9 @@ class SkillManageTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Manage skills (create, update, delete). Skills are procedural memory — reusable approaches for recurring task types. "
-            "Newly created skills are workspace-local by default (workspace/skills/<name>/SKILL.md). "
-            "Create when: complex task succeeded (5+ calls), errors overcome, user-corrected approach worked, non-trivial workflow discovered. "
-            "Update when: instructions stale/wrong, OS-specific failures, missing steps or pitfalls found during use."
+            "Create/update/delete workspace skills (procedural memory for "
+            "recurring tasks). Save one after a non-trivial workflow "
+            "succeeds so future turns don't re-figure it out."
         )
 
     @property
@@ -256,40 +248,18 @@ class SkillManageTool(Tool):
                 "action": {
                     "type": "string",
                     "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
-                    "description": "The action to perform.",
                 },
-                "name": {
-                    "type": "string",
-                    "description": "Skill name (lowercase, hyphens/underscores, max 64 chars). Must match an existing skill for patch/edit/delete.",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full SKILL.md content (YAML frontmatter + markdown body). Required for 'create' and 'edit'.",
-                },
-                "category": {
-                    "type": "string",
-                    "description": "Optional lookup hint for legacy nested skill layouts when patching/editing/deleting.",
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "Text to find in the file (required for 'patch'). Must be unique unless replace_all=true.",
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "Replacement text (required for 'patch'). Can be empty string to delete the matched text.",
-                },
-                "replace_all": {
-                    "type": "boolean",
-                    "description": "For 'patch': replace all occurrences instead of requiring a unique match.",
-                },
+                "name": {"type": "string", "description": "Skill name (lowercase, hyphens/underscores)."},
+                "content": {"type": "string", "description": "Full SKILL.md (for create/edit)."},
+                "category": {"type": "string", "description": "Legacy-layout hint for patch/edit/delete."},
+                "old_string": {"type": "string", "description": "For patch: text to replace."},
+                "new_string": {"type": "string", "description": "For patch: replacement text."},
+                "replace_all": {"type": "boolean", "description": "For patch: replace every match."},
                 "file_path": {
                     "type": "string",
-                    "description": "Path to a supporting file within the skill directory. For 'write_file'/'remove_file': required, must be under references/, templates/, scripts/, or assets/.",
+                    "description": "For write_file/remove_file: path under references/, templates/, scripts/, or assets/.",
                 },
-                "file_content": {
-                    "type": "string",
-                    "description": "Content for the file. Required for 'write_file'.",
-                },
+                "file_content": {"type": "string", "description": "For write_file: file body."},
             },
             "required": ["action", "name"],
         }

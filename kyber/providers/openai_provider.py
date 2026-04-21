@@ -49,6 +49,16 @@ def _normalize_api_key(value: str | None) -> str:
     return token
 
 
+def _without_private_flags(msg: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``msg`` with any ``_kyber_*`` internal flags stripped.
+
+    Agent core marks messages with ``_kyber_cache_pin`` etc. to coordinate
+    with the provider layer. Those private keys must never hit the wire —
+    OpenAI's strict endpoints reject unknown fields.
+    """
+    return {k: v for k, v in msg.items() if not k.startswith("_kyber_")}
+
+
 def _strip_leading_think_blocks(text: str | None) -> str | None:
     """Remove leaked leading <think>...</think> blocks from model output.
 
@@ -91,9 +101,10 @@ class OpenAIProvider(LLMProvider):
         default_model: str | None = None,
         max_retries: int = 3,
         timeout: float = 600.0,
+        enable_prompt_cache: bool = True,
     ):
         """Initialize the OpenAI-compatible provider.
-        
+
         Args:
             api_key: API key. Falls back to env vars (OPENROUTER_API_KEY, OPENAI_API_KEY, etc.)
             api_base: API base URL. Auto-detected from provider if not set.
@@ -101,8 +112,13 @@ class OpenAIProvider(LLMProvider):
             default_model: Default model to use. Auto-detected from provider if not set.
             max_retries: Max retries on transient errors.
             timeout: Request timeout in seconds.
+            enable_prompt_cache: If True, inject Anthropic-style ``cache_control``
+                markers when the provider is anthropic (or an openrouter model
+                that routes to anthropic). OpenAI-compat providers auto-cache
+                stable prefixes regardless of this flag.
         """
         self.provider = provider.lower()
+        self.enable_prompt_cache = enable_prompt_cache
         
         # Resolve API key
         if api_key:
@@ -161,34 +177,44 @@ class OpenAIProvider(LLMProvider):
         temperature: float = 0.7,
     ) -> LLMResponse:
         """Send a chat completion request.
-        
+
         Args:
             messages: Conversation messages in OpenAI format.
             tools: Tool definitions in OpenAI format.
             model: Model to use (defaults to provider default).
             tool_choice: Tool choice mode ("auto", "none", "required", or specific tool).
             max_tokens: Maximum response tokens.
-            temperature: Sampling temperature.
-        
+            temperature: Kept for back-compat; **not sent** to any provider.
+                Modern Anthropic models reject it, Codex overrides it server
+                side, and omitting it from OpenAI-compat providers doesn't
+                change output quality but keeps the prompt prefix stable for
+                caching.
+
         Returns:
             LLMResponse with content and/or tool calls.
         """
+        del temperature  # intentionally never sent — see docstring
         model = model or self._default_model
-        
-        # Build request kwargs
+
+        # Optionally mark the static prefix for Anthropic's prompt cache.
+        # Messages are mutated by reference to avoid an expensive deep copy —
+        # callers treat the list as ephemeral per request.
+        prepared_messages = self._prepare_messages_for_caching(messages, model)
+        prepared_tools = self._prepare_tools_for_caching(tools, model)
+
+        # Build request kwargs. No temperature, no extraneous fields.
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": prepared_messages,
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
-        
+
         # Add tools if provided
-        if tools:
-            kwargs["tools"] = tools
+        if prepared_tools:
+            kwargs["tools"] = prepared_tools
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
-        
+
         try:
             response = await self.client.chat.completions.create(**kwargs)
             return self._parse_response(response)
@@ -201,6 +227,84 @@ class OpenAIProvider(LLMProvider):
                     "(no 'Bearer ' prefix) and is configured for the active provider."
                 ) from e
             raise
+
+    def _routes_to_anthropic(self, model: str) -> bool:
+        """True when the configured endpoint terminates at Anthropic.
+
+        Covers direct Anthropic, OpenRouter's ``anthropic/*`` models, and
+        any other route whose model id includes ``claude``.
+        """
+        if self.provider == "anthropic":
+            return True
+        m = (model or "").lower()
+        return "claude" in m or m.startswith("anthropic/")
+
+    def _prepare_messages_for_caching(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+    ) -> list[dict[str, Any]]:
+        """Mark the last pinned system message with an Anthropic cache hint.
+
+        Only applied when ``enable_prompt_cache`` is on AND the route ends
+        at Anthropic. For OpenAI-compatible endpoints pointed elsewhere we
+        send messages through unchanged — those providers auto-cache any
+        stable prefix ≥1024 tokens without explicit markers.
+
+        Agent core tags the system message it considers "static" with a
+        private ``_kyber_cache_pin: True`` flag; we convert that into a
+        proper Anthropic ``cache_control`` content block here.
+        """
+        if not self.enable_prompt_cache or not self._routes_to_anthropic(model):
+            # Strip the private flag either way so it never reaches the wire.
+            return [_without_private_flags(m) for m in messages]
+
+        out: list[dict[str, Any]] = []
+        pinned_indices = [
+            i for i, m in enumerate(messages)
+            if m.get("_kyber_cache_pin") and m.get("role") == "system"
+        ]
+        # Only the last pin gets the breakpoint — Anthropic's cache works by
+        # walking backwards from the newest cache_control mark.
+        last_pin = pinned_indices[-1] if pinned_indices else -1
+
+        for i, m in enumerate(messages):
+            clean = _without_private_flags(m)
+            if i == last_pin and isinstance(clean.get("content"), str):
+                # Convert plain string content into a single content block
+                # carrying the Anthropic cache hint. Anthropic's OpenAI-compat
+                # endpoint accepts this array form on system messages.
+                clean["content"] = [
+                    {
+                        "type": "text",
+                        "text": clean["content"],
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            out.append(clean)
+        return out
+
+    def _prepare_tools_for_caching(
+        self,
+        tools: list[dict[str, Any]] | None,
+        model: str,
+    ) -> list[dict[str, Any]] | None:
+        """Mark the last tool definition as a cache breakpoint.
+
+        Tool schemas are the second-biggest chunk of a typical request
+        prefix after the system prompt. Pinning them with cache_control
+        lets Anthropic cache the ``system + tools`` prefix once and reuse
+        it across every iteration of the agent loop.
+        """
+        if not tools:
+            return tools
+        if not self.enable_prompt_cache or not self._routes_to_anthropic(model):
+            return tools
+
+        # Don't mutate the caller's list — it's cached in the registry.
+        out = [dict(t) for t in tools]
+        out[-1] = {**out[-1], "cache_control": {"type": "ephemeral"}}
+        return out
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse an OpenAI chat completion response into LLMResponse."""

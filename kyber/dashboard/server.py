@@ -47,8 +47,64 @@ PROVIDER_BASES: dict[str, str] = {
 }
 
 
+def _kill_stray_gateway_processes() -> None:
+    """Terminate any running ``kyber gateway`` processes — including orphans
+    that aren't under the service manager's control.
+
+    Called right before the dashboard tells the service manager to restart
+    the gateway, so an orphan can't keep the port held while systemd /
+    launchd tries to start a fresh copy.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "kyber gateway"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode not in (0, 1):
+        return
+    for line in (result.stdout or "").splitlines():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, 15)
+        except (ProcessLookupError, PermissionError):
+            pass
+    # Short wait then SIGKILL anything still alive.
+    import time as _time
+    _time.sleep(1.0)
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "kyber gateway"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    for line in (result.stdout or "").splitlines():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 def _restart_gateway_service() -> tuple[bool, str]:
-    """Restart the gateway service via the platform's service manager."""
+    """Restart the gateway service via the platform's service manager.
+
+    Kills any stray/orphaned ``kyber gateway`` processes first so the new
+    copy can bind the port immediately instead of crash-looping.
+    """
+    _kill_stray_gateway_processes()
     system = platform.system()
     try:
         if system == "Darwin":
@@ -221,21 +277,35 @@ async def fetch_provider_models(provider: str, api_key: str, api_base: str | Non
     return await _fetch_models_openai_compat(base, api_key)
 
 
-def _chatgpt_subscription_models() -> list[str]:
-    """Return OpenHands-supported ChatGPT subscription models."""
+async def _chatgpt_subscription_models() -> list[str]:
+    """Return the Codex models available for the current ChatGPT login.
+
+    Fetched live from chatgpt.com/backend-api using the tokens at
+    ~/.codex/auth.json. Falls back to the hardcoded FALLBACK_MODELS when
+    the user isn't logged in or the catalog is unreachable.
+    """
     try:
-        from openhands.sdk.llm.auth.openai import OPENAI_CODEX_MODELS
-        return sorted(str(m) for m in OPENAI_CODEX_MODELS)
+        from kyber.providers.codex_provider import fetch_available_models
+
+        return await fetch_available_models()
+    except Exception as e:
+        logger.warning(f"Could not fetch Codex model catalog: {e}")
+        from kyber.providers.codex_provider import FALLBACK_MODELS
+
+        return list(FALLBACK_MODELS)
+
+
+def _chatgpt_subscription_email() -> str | None:
+    """Best-effort email extraction from the stored id_token, for UI display."""
+    try:
+        from kyber.providers.codex_auth import _decode_jwt_claims, load_tokens
+
+        tokens = load_tokens()
+        claims = _decode_jwt_claims(tokens.id_token)
+        email = claims.get("email")
+        return email if isinstance(email, str) and email else None
     except Exception:
-        # Safe fallback based on OpenHands docs.
-        return sorted(
-            [
-                "gpt-5.1-codex-max",
-                "gpt-5.1-codex-mini",
-                "gpt-5.2",
-                "gpt-5.2-codex",
-            ]
-        )
+        return None
 
 
 async def _run_chatgpt_subscription_login_task(_model: str, force_login: bool) -> None:
@@ -421,8 +491,24 @@ def _ensure_auth_token(config: Config) -> str:
 
 
 def _build_allowed_hosts(config: Config) -> list[str]:
-    allowed = sorted(LOCAL_HOSTS | set(config.dashboard.allowed_hosts))
-    return allowed
+    """Decide which Host headers the dashboard will accept.
+
+    * Bound to loopback only → keep strict (127.0.0.1, localhost, ::1, plus
+      whatever the user explicitly allowed). TrustedHostMiddleware is a DNS
+      rebinding guard and is valuable when the bind is local-only.
+    * Bound to a non-loopback address (``0.0.0.0``, ``::``, an explicit
+      LAN/Tailscale IP) → the user is clearly trying to accept traffic from
+      other machines. Add ``"*"`` so any Host header passes. Auth is still
+      enforced by the bearer token on every endpoint, so this doesn't
+      broaden access; it just stops the middleware from 400'ing requests
+      that come in via a Tailscale / LAN IP.
+    """
+    host = (config.dashboard.host or "").strip().lower()
+    extra = set(config.dashboard.allowed_hosts or [])
+    non_loopback = host not in LOCAL_HOSTS and host not in {"", "localhost"}
+    if non_loopback:
+        extra.add("*")
+    return sorted(LOCAL_HOSTS | extra)
 
 
 def create_dashboard_app(config: Config) -> FastAPI:
@@ -490,6 +576,80 @@ def create_dashboard_app(config: Config) -> FastAPI:
         except Exception:
             data = {"error": resp.text}
         return JSONResponse(data, status_code=resp.status_code)
+
+    # ── Kyber Network proxy ──
+    # The pairing-code registry and WebSocket server live in the gateway
+    # process. Dashboard users act through the gateway's admin endpoints.
+
+    @app.get("/api/network/peers", dependencies=[Depends(_require_token)])
+    async def network_peers(request: Request) -> JSONResponse:
+        return await _proxy_gateway(request, "GET", "/network/peers")
+
+    @app.post("/api/network/pair-code", dependencies=[Depends(_require_token)])
+    async def network_pair_code(request: Request, body: dict[str, Any] | None = None) -> JSONResponse:
+        return await _proxy_gateway(
+            request, "POST", "/network/pair-code", json_body=body or {}
+        )
+
+    @app.post("/api/network/unpair", dependencies=[Depends(_require_token)])
+    async def network_unpair(request: Request, body: dict[str, Any]) -> JSONResponse:
+        return await _proxy_gateway(
+            request, "POST", "/network/peers/unpair", json_body=body
+        )
+
+    @app.post("/api/network/role", dependencies=[Depends(_require_token)])
+    async def network_set_role(request: Request, body: dict[str, Any]) -> JSONResponse:
+        return await _proxy_gateway(
+            request, "POST", "/network/role", json_body=body
+        )
+
+    @app.post("/api/network/self", dependencies=[Depends(_require_token)])
+    async def network_set_self(request: Request, body: dict[str, Any]) -> JSONResponse:
+        return await _proxy_gateway(
+            request, "POST", "/network/self", json_body=body
+        )
+
+    # ── Notebook proxies ─────────────────────────────────────
+    # All four forward straight to the gateway, which routes locally (host)
+    # or via RPC (spoke). Using POST everywhere keeps params in the body
+    # so the UI can send the same JSON agents would.
+
+    @app.post("/api/network/notebook/list", dependencies=[Depends(_require_token)])
+    async def notebook_list(request: Request, body: dict[str, Any] | None = None) -> JSONResponse:
+        return await _proxy_gateway(
+            request, "POST", "/network/notebook/list", json_body=body or {}, timeout=20.0
+        )
+
+    @app.post("/api/network/notebook/search", dependencies=[Depends(_require_token)])
+    async def notebook_search(request: Request, body: dict[str, Any]) -> JSONResponse:
+        return await _proxy_gateway(
+            request, "POST", "/network/notebook/search", json_body=body, timeout=20.0
+        )
+
+    @app.post("/api/network/notebook/read", dependencies=[Depends(_require_token)])
+    async def notebook_read(request: Request, body: dict[str, Any]) -> JSONResponse:
+        return await _proxy_gateway(
+            request, "POST", "/network/notebook/read", json_body=body, timeout=20.0
+        )
+
+    @app.post("/api/network/notebook/write", dependencies=[Depends(_require_token)])
+    async def notebook_write(request: Request, body: dict[str, Any]) -> JSONResponse:
+        return await _proxy_gateway(
+            request, "POST", "/network/notebook/write", json_body=body, timeout=20.0
+        )
+
+    @app.post("/api/network/notebook/delete", dependencies=[Depends(_require_token)])
+    async def notebook_delete(request: Request, body: dict[str, Any]) -> JSONResponse:
+        return await _proxy_gateway(
+            request, "POST", "/network/notebook/delete", json_body=body
+        )
+
+    @app.post("/api/network/join", dependencies=[Depends(_require_token)])
+    async def network_join(request: Request, body: dict[str, Any]) -> JSONResponse:
+        # Pairing with a remote host can take a few seconds on a slow link.
+        return await _proxy_gateway(
+            request, "POST", "/network/join", json_body=body, timeout=25.0
+        )
 
     @app.get("/api/tasks", dependencies=[Depends(_require_token)])
     async def get_tasks(request: Request) -> JSONResponse:
@@ -695,107 +855,108 @@ def create_dashboard_app(config: Config) -> FastAPI:
     @app.get("/api/providers/chatgpt-subscription/status", dependencies=[Depends(_require_token)])
     @app.get("/api/providers/chatgpt_subscription/status", dependencies=[Depends(_require_token)])
     async def chatgpt_subscription_status() -> JSONResponse:
-        """Return OAuth auth state for ChatGPT Plus/Pro subscription login."""
-        try:
-            from openhands.sdk.llm.auth.openai import OpenAISubscriptionAuth
+        """Return OAuth auth state for ChatGPT Plus/Pro subscription login.
 
-            auth = OpenAISubscriptionAuth()
-            creds = await auth.refresh_if_needed()
-            authenticated = bool(creds is not None and not creds.is_expired())
-            login_state = await _get_chatgpt_subscription_login_state()
-            return JSONResponse(
-                {
-                    "authenticated": authenticated,
-                    "models": _chatgpt_subscription_models(),
-                    "loginInProgress": login_state["in_progress"],
-                    "loginError": login_state["error"],
-                    "authUrl": login_state.get("authUrl"),
-                }
-            )
-        except Exception as e:
-            logger.warning(f"Failed to read ChatGPT subscription status: {e}")
-            return JSONResponse(
-                {
-                    "authenticated": False,
-                    "models": _chatgpt_subscription_models(),
-                    "loginInProgress": False,
-                    "loginError": str(e),
-                    "authUrl": None,
-                }
-            )
+        Authentication lives in ~/.codex/auth.json, managed by the Codex CLI.
+        Kyber does not run its own OAuth callback — the user runs
+        ``codex login`` from their terminal and we pick up the tokens.
+        """
+        from kyber.providers.codex_auth import find_codex_auth
+
+        authenticated = find_codex_auth() is not None
+        email = _chatgpt_subscription_email() if authenticated else None
+        models = await _chatgpt_subscription_models()
+        return JSONResponse(
+            {
+                "authenticated": authenticated,
+                "email": email,
+                "models": models,
+                "loginInProgress": False,
+                "loginError": None,
+                "authUrl": None,
+                # Hint for the UI: auth happens via the codex CLI in the user's terminal.
+                "loginMethod": "cli",
+                "loginInstruction": "Run `codex login` in your terminal, then refresh.",
+            }
+        )
 
     @app.post("/api/providers/chatgpt-subscription/login", dependencies=[Depends(_require_token)])
     @app.post("/api/providers/chatgpt_subscription/login", dependencies=[Depends(_require_token)])
     async def chatgpt_subscription_login(body: dict[str, Any] | None = None) -> JSONResponse:
-        """Run OpenHands OAuth login for ChatGPT Plus/Pro subscription access."""
-        body = body or {}
-        model = str(body.get("model", "") or "gpt-5.2-codex").strip()
-        force_login = bool(body.get("forceLogin", False))
-        allowed = set(_chatgpt_subscription_models())
-        if model not in allowed:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported subscription model: {model}",
-            )
+        """ChatGPT subscription login happens via the Codex CLI, not in-browser.
 
-        try:
-            started = await _start_chatgpt_subscription_login_task(
-                model=model, force_login=force_login
-            )
-            if not started:
-                login_state = await _get_chatgpt_subscription_login_state()
-                return JSONResponse(
-                    {
-                        "authenticated": False,
-                        "models": sorted(allowed),
-                        "loginInProgress": True,
-                        "loginError": login_state["error"],
-                        "authUrl": login_state.get("authUrl"),
-                        "message": "ChatGPT login is already in progress.",
-                    },
-                    status_code=409,
-                )
+        The dashboard can't run the OAuth flow because it needs to bind to
+        localhost:1455 in the user's browser session. We tell the UI to
+        direct the user to ``codex login`` in their terminal.
+        """
+        from kyber.providers.codex_auth import find_codex_auth
 
-            status = await _get_chatgpt_subscription_login_state()
-            return JSONResponse(
-                {
-                    "authenticated": False,
-                    "model": model,
-                    "models": sorted(allowed),
-                    "loginInProgress": status["in_progress"],
-                    "loginError": status["error"],
-                    "authUrl": status.get("authUrl"),
-                    "message": "ChatGPT login started. Complete authorization in your browser.",
-                },
-                status_code=202,
-            )
-        except Exception as e:
-            logger.warning(f"ChatGPT subscription login failed: {e}")
-            return JSONResponse(
-                {
-                    "authenticated": False,
-                    "error": str(e),
-                    "models": sorted(allowed),
-                    "loginInProgress": False,
-                    "loginError": str(e),
-                    "authUrl": None,
-                },
-                status_code=500,
-            )
+        authenticated = find_codex_auth() is not None
+        models = await _chatgpt_subscription_models()
+        return JSONResponse(
+            {
+                "authenticated": authenticated,
+                "email": _chatgpt_subscription_email() if authenticated else None,
+                "models": models,
+                "loginInProgress": False,
+                "loginError": None,
+                "authUrl": None,
+                "loginMethod": "cli",
+                "loginInstruction": "Run `codex login` in your terminal, then refresh.",
+                "message": (
+                    "Already authenticated." if authenticated
+                    else "Run `codex login` in your terminal to sign in with ChatGPT."
+                ),
+            },
+            status_code=200 if authenticated else 202,
+        )
 
     @app.post("/api/providers/chatgpt-subscription/logout", dependencies=[Depends(_require_token)])
     @app.post("/api/providers/chatgpt_subscription/logout", dependencies=[Depends(_require_token)])
     async def chatgpt_subscription_logout() -> JSONResponse:
         """Remove cached OAuth credentials for ChatGPT subscription login."""
         try:
-            from openhands.sdk.llm.auth.openai import OpenAISubscriptionAuth
+            from kyber.providers.codex_auth import CODEX_AUTH_PATH
 
-            auth = OpenAISubscriptionAuth()
-            removed = bool(auth.logout())
+            removed = False
+            if CODEX_AUTH_PATH.is_file():
+                CODEX_AUTH_PATH.unlink()
+                removed = True
             return JSONResponse({"ok": True, "removed": removed})
         except Exception as e:
             logger.warning(f"Failed to clear ChatGPT subscription credentials: {e}")
             return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    # The Claude Pro/Max subscription provider was removed in 2026.4.21.53.
+    # Reusing Claude Code's OAuth token from third-party clients has been
+    # getting accounts banned, so Kyber no longer ships that code path.
+    # Older UIs may still call /api/providers/claude-subscription/status —
+    # we respond with a deprecated payload so they can show a notice
+    # instead of dying on a 404.
+
+    @app.get("/api/providers/claude-subscription/status", dependencies=[Depends(_require_token)])
+    @app.get("/api/providers/claude_subscription/status", dependencies=[Depends(_require_token)])
+    async def claude_subscription_status() -> JSONResponse:
+        return JSONResponse(
+            {
+                "authenticated": False,
+                "deprecated": True,
+                "reason": (
+                    "Removed for safety — Anthropic bans accounts that reuse "
+                    "Claude Code's OAuth token from non-CLI clients."
+                ),
+                "models": [],
+                "loginInProgress": False,
+                "loginError": None,
+                "authUrl": None,
+                "loginMethod": "removed",
+                "loginInstruction": (
+                    "Use ChatGPT/Codex, an OpenRouter key, or a direct "
+                    "Anthropic API key instead."
+                ),
+            },
+            status_code=410,
+        )
 
     @app.get("/api/providers/{provider_name}/models", dependencies=[Depends(_require_token)])
     async def get_provider_models(
@@ -806,7 +967,10 @@ def create_dashboard_app(config: Config) -> FastAPI:
         """Fetch available models for a provider."""
         try:
             if provider_name.strip().lower() in {"chatgpt-subscription", "chatgpt_subscription"}:
-                return JSONResponse({"models": _chatgpt_subscription_models()})
+                return JSONResponse({"models": await _chatgpt_subscription_models()})
+            if provider_name.strip().lower() in {"claude-subscription", "claude_subscription"}:
+                # Deprecated — provider was removed in 2026.4.21.53.
+                return JSONResponse({"models": [], "deprecated": True}, status_code=410)
             if not (api_key or "").strip():
                 raise ValueError("apiKey is required")
             # Normalize empty string to None
@@ -842,6 +1006,66 @@ def create_dashboard_app(config: Config) -> FastAPI:
                 {"error": str(e), "models": [], "modelListingUnsupported": False},
                 status_code=502,
             )
+
+    # ── System Service API ──
+    #
+    # Lets the dashboard toggle launchd (macOS) / systemd --user (Linux)
+    # services for the gateway + dashboard. The heavy lifting lives in
+    # kyber.service.manager; we just expose thin JSON wrappers. Runs in a
+    # thread pool because the manager calls launchctl/systemctl subprocesses.
+
+    def _service_info_to_dict(info) -> dict[str, Any]:
+        def unit_dict(u) -> dict[str, Any]:
+            return {
+                "name": u.name,
+                "installed": u.installed,
+                "active": u.active,
+                "identifier": u.identifier,
+                "filePath": str(u.file_path),
+            }
+
+        return {
+            "backend": info.backend,
+            "gateway": unit_dict(info.gateway),
+            "dashboard": unit_dict(info.dashboard),
+            "enabled": info.gateway.installed and info.dashboard.installed,
+        }
+
+    async def _run_service_action(fn):
+        from kyber.service import UnsupportedPlatformError
+
+        try:
+            info = await asyncio.to_thread(fn)
+        except UnsupportedPlatformError as e:
+            return JSONResponse(
+                {"error": str(e), "supported": False},
+                status_code=400,
+            )
+        return JSONResponse(_service_info_to_dict(info))
+
+    @app.get("/api/service/status", dependencies=[Depends(_require_token)])
+    async def service_status_endpoint() -> JSONResponse:
+        from kyber.service import service_status
+
+        return await _run_service_action(service_status)
+
+    @app.post("/api/service/install", dependencies=[Depends(_require_token)])
+    async def service_install_endpoint() -> JSONResponse:
+        from kyber.service import install_services
+
+        return await _run_service_action(install_services)
+
+    @app.post("/api/service/uninstall", dependencies=[Depends(_require_token)])
+    async def service_uninstall_endpoint() -> JSONResponse:
+        from kyber.service import uninstall_services
+
+        return await _run_service_action(uninstall_services)
+
+    @app.post("/api/service/restart", dependencies=[Depends(_require_token)])
+    async def service_restart_endpoint() -> JSONResponse:
+        from kyber.service import restart_services
+
+        return await _run_service_action(restart_services)
 
     # ── Cron Jobs API ──
 

@@ -157,28 +157,11 @@ class DelegateTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Spawn one or more subagents to work on tasks in isolated contexts. "
-            "Each subagent gets its own conversation, terminal session, and toolset. "
-            "Only the final summary is returned -- intermediate tool results "
-            "never enter your context window.\n\n"
-            "TWO MODES (one of 'goal' or 'tasks' is required):\n"
-            "1. Single task: provide 'goal' (+ optional context, toolsets)\n"
-            "2. Batch (parallel): provide 'tasks' array with up to 3 items. "
-            "All run concurrently and results are returned together.\n\n"
-            "WHEN TO USE delegate_task:\n"
-            "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
-            "- Tasks that would flood your context with intermediate data\n"
-            "- Parallel independent workstreams (research A and B simultaneously)\n\n"
-            "WHEN NOT TO USE (use these instead):\n"
-            "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
-            "- Single tool call -> just call the tool directly\n"
-            "- Tasks needing user interaction -> subagents cannot use clarify\n\n"
-            "IMPORTANT:\n"
-            "- Subagents have NO memory of your conversation. Pass all relevant "
-            "info (file paths, error messages, constraints) via the 'context' field.\n"
-            "- Subagents CANNOT call: delegate_task, clarify, memory, send_message.\n"
-            "- Each subagent gets its own terminal session (separate working directory and state).\n"
-            "- Results are always returned as an array, one entry per task."
+            "Spawn isolated subagents; only their final summary enters your "
+            "context. Use for reasoning-heavy subtasks or parallel research. "
+            "Pass `goal` (single) or `tasks` (≤3, parallel). Subagents can't "
+            "call delegate_task, clarify, memory, or send_message and don't "
+            "see your history — pass everything via `context`."
         )
 
     @property
@@ -188,66 +171,38 @@ class DelegateTool(Tool):
             "properties": {
                 "goal": {
                     "type": "string",
-                    "description": (
-                        "What the subagent should accomplish. Be specific and "
-                        "self-contained -- the subagent knows nothing about your "
-                        "conversation history."
-                    ),
+                    "description": "Self-contained task for a single subagent.",
                 },
                 "context": {
                     "type": "string",
-                    "description": (
-                        "Background information the subagent needs: file paths, "
-                        "error messages, project structure, constraints. The more "
-                        "specific you are, the better the subagent performs."
-                    ),
+                    "description": "Background the subagent needs (paths, errors, constraints).",
                 },
                 "toolsets": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": (
-                        "Toolsets to enable for this subagent. "
-                        "Default: ['terminal', 'file', 'web']. "
-                        "Common patterns: ['terminal', 'file'] for code work, "
-                        "['web'] for research, ['terminal', 'file', 'web'] for "
-                        "full-stack tasks."
-                    ),
+                    "description": "Allowed toolsets. Default ['terminal','file','web'].",
                 },
                 "tasks": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "goal": {"type": "string", "description": "Task goal"},
-                            "context": {"type": "string", "description": "Task-specific context"},
-                            "toolsets": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Toolsets for this specific task",
-                            },
+                            "goal": {"type": "string"},
+                            "context": {"type": "string"},
+                            "toolsets": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["goal"],
                     },
                     "maxItems": 3,
-                    "description": (
-                        "Batch mode: up to 3 tasks to run in parallel. Each gets "
-                        "its own subagent with isolated context and terminal session. "
-                        "When provided, top-level goal/context/toolsets are ignored."
-                    ),
+                    "description": "Up to 3 parallel tasks; overrides top-level goal.",
                 },
                 "model": {
                     "type": "string",
-                    "description": (
-                        "Model override for the subagent(s). Omit to use your "
-                        "same model. Use a cheaper/faster model for simple subtasks."
-                    ),
+                    "description": "Optional model override (else inherits parent's).",
                 },
                 "max_iterations": {
                     "type": "integer",
-                    "description": (
-                        "Max tool-calling turns per subagent (default: 0 = unlimited). "
-                        "Use a positive value to enforce a hard cap."
-                    ),
+                    "description": "Tool-turn cap per subagent. 0 = unlimited (default).",
                 },
             },
             "required": [],

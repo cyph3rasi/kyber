@@ -178,6 +178,8 @@ class ToolRegistry:
             "kyber.agent.tools.session_search",
             "kyber.agent.tools.delegate",
             "kyber.agent.tools.mcp",
+            "kyber.agent.tools.notebook",
+            "kyber.agent.tools.remote",
         ]
         
         for mod_name in _TOOL_MODULES:

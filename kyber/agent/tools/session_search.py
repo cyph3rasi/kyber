@@ -181,7 +181,6 @@ async def _summarize_with_provider(
                 tools=None,
                 model=model,
                 max_tokens=600,
-                temperature=0.2,
             ),
             timeout=45.0,
         )

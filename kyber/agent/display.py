@@ -546,5 +546,47 @@ def get_cute_tool_message(
             return _wrap(f"┊ 🔀 delegate  {len(tasks)} parallel tasks")
         return _wrap(f"┊ 🔀 delegate  {_trunc(args.get('goal', ''), 35)}")
 
+    # ── Kyber Network (remote tool invocation across paired machines) ──
+    # The generic fallback would show things like "remote_in" and no
+    # useful detail. These handlers show the target peer + what's
+    # actually being done there so the tool stream reads naturally.
+    if tool_name == "list_network_peers":
+        return _wrap("┊ 🌐 peers     list paired machines")
+    if tool_name == "exec_on":
+        peer = args.get("peer_name", "?")
+        cmd = args.get("command", "")
+        emoji, _verb, detail = _shell_style(cmd)
+        return _wrap(f"┊ {emoji} on {peer}: {_trunc(detail, 36 - len(str(peer)))}")
+    if tool_name == "read_file_on":
+        peer = args.get("peer_name", "?")
+        return _wrap(f"┊ 📖 on {peer}: read {_path(args.get('path', ''), 30)}")
+    if tool_name == "list_dir_on":
+        peer = args.get("peer_name", "?")
+        return _wrap(f"┊ 📂 on {peer}: ls {_path(args.get('path', ''), 30)}")
+    if tool_name == "write_file_on":
+        peer = args.get("peer_name", "?")
+        return _wrap(f"┊ ✍️  on {peer}: write {_path(args.get('path', ''), 28)}")
+    if tool_name == "edit_file_on":
+        peer = args.get("peer_name", "?")
+        return _wrap(f"┊ 🔧 on {peer}: edit {_path(args.get('path', ''), 28)}")
+    if tool_name == "remote_invoke":
+        peer = args.get("peer_name", "?")
+        inner = args.get("tool_name", "?")
+        return _wrap(f"┊ 🌐 on {peer}: {_trunc(inner, 36 - len(str(peer)))}")
+
+    # ── Shared notebook (cross-machine key/value store) ──
+    if tool_name == "notebook_write":
+        return _wrap(f"┊ 📝 note      write {_trunc(args.get('key', ''), 32)}")
+    if tool_name == "notebook_read":
+        return _wrap(f"┊ 📖 note      read {_trunc(args.get('key', ''), 32)}")
+    if tool_name == "notebook_list":
+        tag = args.get("tag")
+        return _wrap(f"┊ 📒 note      list" + (f" #{tag}" if tag else ""))
+    if tool_name == "notebook_search":
+        return _wrap(f"┊ 🔎 note      search {_trunc(args.get('query', ''), 30)}")
+
     preview = build_tool_preview(tool_name, args) or ""
-    return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}")
+    # Widen the tool-name column from 9 to 14 chars — long names like
+    # ``list_network_peers`` and ``remote_invoke`` were getting truncated
+    # to unreadable stubs like ``list_netw``.
+    return _wrap(f"┊ ⚡ {_trunc(tool_name, 14):14} {_trunc(preview, 30)}")

@@ -43,13 +43,22 @@ def test_build_messages_includes_recent_tool_context_block() -> None:
         session.add_message("tool", "README.md src tests", tool_name="list_dir", tool_call_id="t1")
         session.add_message("assistant", "Found files.")
 
-        messages = core._build_messages("system prompt", session)
+        messages = core._build_messages("system prompt", "channel ctx", session)
 
+        # Layout now: [static system (pinned), dynamic system, ..., tool ctx, history].
         assert messages[0]["role"] == "system"
         assert messages[0]["content"] == "system prompt"
+        assert messages[0].get("_kyber_cache_pin") is True
         assert messages[1]["role"] == "system"
-        assert "Recent tool outputs from this chat" in messages[1]["content"]
-        assert "[list_dir]" in messages[1]["content"]
+        assert messages[1]["content"] == "channel ctx"
+
+        tool_ctx_msgs = [
+            m for m in messages
+            if m["role"] == "system"
+            and "Recent tool outputs from this chat" in str(m.get("content") or "")
+        ]
+        assert tool_ctx_msgs, "expected a recent-tool-context system block"
+        assert "[list_dir]" in tool_ctx_msgs[0]["content"]
         assert any(m["role"] == "user" for m in messages)
         assert any(m["role"] == "assistant" for m in messages)
 

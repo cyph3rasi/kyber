@@ -41,6 +41,37 @@ SESSION_TOOL_CONTEXT_MAX_EVENTS = 20
 SESSION_TOOL_CONTEXT_MAX_TOTAL_CHARS = 24000
 
 
+# ── Current-agent registry ────────────────────────────────────────────
+# A weakref to the most recently-constructed AgentCore. Use
+# :func:`get_current_agent` from anywhere inside the gateway process
+# (slash commands, cron jobs, heartbeat tasks) to reach the live agent
+# without having to plumb a reference through each channel/API layer.
+# Weakref so we don't pin the instance in memory if it's deliberately
+# torn down (e.g. tests that spin up multiple agents).
+
+import weakref as _weakref
+
+_CURRENT_AGENT_REF: "_weakref.ReferenceType[AgentCore] | None" = None
+
+
+def _set_current_agent(agent: "AgentCore") -> None:
+    global _CURRENT_AGENT_REF
+    _CURRENT_AGENT_REF = _weakref.ref(agent)
+
+
+def get_current_agent() -> "AgentCore | None":
+    """Return the most recently-constructed AgentCore in this process.
+
+    Returns ``None`` if nothing has instantiated one yet (e.g. we're in
+    a ``kyber chat`` REPL that only talks to the gateway over HTTP) or
+    the instance was garbage-collected.
+    """
+    ref = _CURRENT_AGENT_REF
+    if ref is None:
+        return None
+    return ref()
+
+
 class AgentCore:
     """Direct tool-calling agent.
     
@@ -78,6 +109,12 @@ class AgentCore:
         timezone: str | None = None,
         task_history_path: Path | None = None,
         progress_callback: Callable[[str, str, str, str], Awaitable[None]] | None = None,
+        *,
+        tool_result_max_chars: int = 20_000,
+        tool_result_keep_recent: int = 3,
+        history_summary_trigger: int = 30,
+        history_summary_keep_recent: int = 12,
+        per_channel_tool_policy: dict[str, dict[str, list[str]]] | None = None,
     ):
         self.bus = bus
         self.provider = provider
@@ -87,6 +124,13 @@ class AgentCore:
         self.max_history = max_history
         self.persona_prompt = persona_prompt
         self.progress_callback = progress_callback
+
+        # Token-saving knobs — see kyber.config.schema.AgentDefaults.
+        self.tool_result_max_chars = max(1024, int(tool_result_max_chars))
+        self.tool_result_keep_recent = max(0, int(tool_result_keep_recent))
+        self.history_summary_trigger = max(0, int(history_summary_trigger))
+        self.history_summary_keep_recent = max(2, int(history_summary_keep_recent))
+        self.per_channel_tool_policy = per_channel_tool_policy or {}
         
         # Core components
         self.context = ContextBuilder(workspace, timezone=timezone)
@@ -96,7 +140,17 @@ class AgentCore:
         # Discover and register all tools
         registry.discover()
         self._configure_tool_callbacks()
-        
+
+        # Expose this instance as the process-level "current agent" so
+        # slash commands (/usage, /cancel) and anything else that fires
+        # outside the agent's direct call graph can find it without
+        # needing a reference plumbed through each channel. Channels
+        # still get their own ``agent`` attribute via
+        # ChannelManager.attach_agent, but this is the belt-and-suspenders
+        # fallback when that attachment missed — e.g. a channel wired up
+        # after the manager ran.
+        _set_current_agent(self)
+
         # State
         self._running = False
         self._active_tasks: dict[int, asyncio.Task] = {}
@@ -196,7 +250,13 @@ class AgentCore:
                     TaskStatus.FAILED,
                     TaskStatus.CANCELLED,
                 ):
-                    self.registry.mark_cancelled(task_id, "Cancelled by user")
+                    # Reached here only when the explicit cancel path (user
+                    # action or API) did NOT mark the task first — that
+                    # means the CancelledError was raised from outside
+                    # (service restart, process shutdown, parent cancel).
+                    self.registry.mark_cancelled(
+                        task_id, "Interrupted (service restart or shutdown)"
+                    )
             raise
         except Exception as e:
             task_id = task_tracker.get("id")
@@ -219,6 +279,71 @@ class AgentCore:
         msg_tool = registry.get("message")
         if msg_tool and hasattr(msg_tool, "set_send_callback"):
             msg_tool.set_send_callback(self._publish_tool_message)
+
+    def reset_session(self, session_key: str) -> None:
+        """Clear a session and bump its ``started_at`` boundary.
+
+        Called by ``/new`` (``cmd_new``). Before this existed the command
+        dispatcher silently did nothing on Discord because ``AgentCore``
+        had no ``reset_session`` and no ``session_store`` — a channel's
+        session_key is sticky per channel_id, so usage numbers for "This
+        session" kept climbing across every claimed reset.
+        """
+        if not session_key:
+            return
+        try:
+            self.sessions.clear(session_key)
+        except Exception:
+            logger.warning("reset_session failed for %s", session_key, exc_info=True)
+
+    def _get_tools_for_channel(self, channel: str) -> list[dict[str, Any]]:
+        """Return tool schemas for this channel, honoring per-channel policy.
+
+        Most of the per-request token budget on short messages is the tool
+        catalog. Channels that never need (say) ``exec`` can drop it here
+        instead of re-uploading the schema every loop iteration.
+        """
+        all_defs = registry.get_definitions()
+        policy = self.per_channel_tool_policy.get((channel or "").strip().lower())
+        if not policy:
+            return all_defs
+
+        allow = policy.get("allow") or []
+        deny = set(policy.get("deny") or [])
+        allow_all = (not allow) or ("*" in allow)
+        allowed_set = set(allow) if not allow_all else None
+
+        filtered: list[dict[str, Any]] = []
+        for schema in all_defs:
+            name = schema.get("function", {}).get("name") or schema.get("name", "")
+            if name in deny:
+                continue
+            if allowed_set is not None and name not in allowed_set:
+                continue
+            filtered.append(schema)
+        return filtered
+
+    def _compact_older_tool_results(self, messages: list[dict[str, Any]]) -> None:
+        """Replace the body of old tool messages with a short summary in place.
+
+        Run after each LLM iteration. The model already consumed those
+        results; re-sending every byte on subsequent iterations is wasted
+        context. We keep the ``tool_result_keep_recent`` most recent results
+        verbatim and compress the rest.
+        """
+        if self.tool_result_keep_recent <= 0:
+            return
+        tool_indices = [
+            i for i, m in enumerate(messages) if m.get("role") == "tool"
+        ]
+        if len(tool_indices) <= self.tool_result_keep_recent:
+            return
+        to_compact = tool_indices[: -self.tool_result_keep_recent]
+        for i in to_compact:
+            body = str(messages[i].get("content") or "")
+            if len(body) <= 400:
+                continue  # already short; leave alone
+            messages[i]["content"] = _one_line(body, 400)
 
     async def _publish_tool_message(self, outbound: OutboundMessage) -> None:
         """Publish outbound tool messages back through the message bus."""
@@ -274,7 +399,13 @@ class AgentCore:
             if task_id:
                 tracked = self.registry.get(task_id)
                 if tracked and tracked.status != TaskStatus.CANCELLED:
-                    self.registry.mark_cancelled(task_id, "Cancelled by user")
+                    # Reached here only when the explicit cancel path (user
+                    # action or API) did NOT mark the task first — that
+                    # means the CancelledError was raised from outside
+                    # (service restart, process shutdown, parent cancel).
+                    self.registry.mark_cancelled(
+                        task_id, "Interrupted (service restart or shutdown)"
+                    )
             raise
         except asyncio.TimeoutError:
             task_id = task_tracker.get("id")
@@ -322,24 +453,24 @@ class AgentCore:
     ) -> str:
         """Core message processing: build context, run tool loop, return response."""
 
-        # Build system prompt
-        system_prompt = self._build_system_prompt(msg)
+        # Build system prompt (split for stable prefix caching)
+        static_system, dynamic_system = self._build_system_prompts(msg)
 
-        # Get tool definitions
-        tool_defs = registry.get_definitions()
+        # Get tool definitions — filtered by per-channel policy if set.
+        tool_defs = self._get_tools_for_channel(msg.channel)
 
         # Build messages from a short critical section on shared session history.
         if session_lock_held:
             session = self.sessions.get_or_create(session_key)
             session.add_message("user", msg.content)
-            messages = self._build_messages(system_prompt, session)
+            messages = self._build_messages(static_system, dynamic_system, session)
             run_session = session
         else:
             session_lock = self._get_session_lock(session_key)
             async with session_lock:
                 session = self.sessions.get_or_create(session_key)
                 session.add_message("user", msg.content)
-                messages = self._build_messages(system_prompt, session)
+                messages = self._build_messages(static_system, dynamic_system, session)
                 self.sessions.save(session)
             # Per-turn scratch session: tool messages stay isolated while turn runs.
             run_session = Session(key=session_key)
@@ -405,7 +536,11 @@ class AgentCore:
                     tracked_task_id=task.id,
                 )
             except asyncio.CancelledError:
-                self.registry.mark_cancelled(task.id, "Cancelled by user")
+                tracked = self.registry.get(task.id)
+                if tracked and tracked.status != TaskStatus.CANCELLED:
+                    self.registry.mark_cancelled(
+                        task.id, "Interrupted (service restart or shutdown)"
+                    )
                 raise
             except Exception as exc:  # pragma: no cover
                 logger.exception("Background task failed: %s", task.id)
@@ -476,8 +611,28 @@ class AgentCore:
         max_loop_seconds = AGENT_LOOP_TIMEOUT_SECONDS
         max_single_llm_seconds = AGENT_SINGLE_LLM_TIMEOUT_SECONDS
         max_single_tool_seconds = AGENT_SINGLE_TOOL_TIMEOUT_SECONDS
-        
+
         status_started = False
+
+        # Eagerly create the tracked task BEFORE the first LLM call so
+        # every round-trip (including the first, and single-turn replies
+        # that never produce tool calls) can record its token usage.
+        # Previously the task was created mid-loop on the first tool-
+        # calling response, so /usage reported 0 for quick chats.
+        if not tracked_task_id:
+            task = self.registry.create(
+                description=tracked_task_description or "chat turn",
+                label=tracked_task_label or "Chat",
+                origin_channel=context_channel or "cli",
+                origin_chat_id=context_chat_id or "direct",
+            )
+            tracked_task_id = task.id
+            self.registry.mark_started(task.id)
+            cur = asyncio.current_task()
+            if cur is not None:
+                self._running_tasks_by_task_id[task.id] = cur
+            if task_tracker is not None:
+                task_tracker["id"] = task.id
 
         try:
             while True:
@@ -515,7 +670,22 @@ class AgentCore:
                 except Exception as e:
                     logger.error(f"LLM call failed (iteration {iteration}): {e}")
                     return f"I had trouble reaching the AI model: {str(e)}"
-                
+
+                # Accumulate token usage on the tracked task so /usage
+                # and /cost can see real numbers. Providers that don't
+                # return usage (some local shims) pass an empty dict and
+                # add_usage no-ops.
+                if tracked_task_id:
+                    try:
+                        self.registry.add_usage(
+                            tracked_task_id,
+                            getattr(response, "usage", None),
+                            provider=type(self.provider).__name__,
+                            model=self.model,
+                        )
+                    except Exception:  # pragma: no cover — accounting is best-effort
+                        logger.debug("Couldn't record usage on task", exc_info=True)
+
                 # If the LLM returned tool calls — execute them
                 if response.has_tool_calls:
                     if self.progress_callback and not status_started:
@@ -622,6 +792,10 @@ class AgentCore:
                                 action_completed=action_line,
                             )
 
+                    # Compact older tool outputs before the next LLM call —
+                    # the model already consumed them on this iteration.
+                    self._compact_older_tool_results(messages)
+
                     # Loop back to call LLM again with tool results
                     continue
                 
@@ -691,10 +865,15 @@ class AgentCore:
                 agent_core=self,
             )
             
-            # Truncate very long results
-            if len(result) > 100_000:
-                result = result[:100_000] + f"\n... (truncated, {len(result) - 100_000} more chars)"
-            
+            # Truncate very long results. The cap is configurable via
+            # ``AgentDefaults.tool_result_max_chars`` and defaults to 20KB,
+            # down from the old 100KB which was big enough to blow out a
+            # context window on a single ``read_file`` of a minified JS
+            # bundle.
+            cap = self.tool_result_max_chars
+            if len(result) > cap:
+                result = result[:cap] + f"\n... (truncated, {len(result) - cap} more chars)"
+
             return result
             
         except Exception as e:
@@ -757,48 +936,144 @@ class AgentCore:
             + "\n".join(kept)
         )
     
-    def _build_system_prompt(self, msg: InboundMessage) -> str:
-        """Build the system prompt, optionally with persona overlay."""
-        # Start with the context builder's prompt
+    def _build_system_prompts(self, msg: InboundMessage) -> tuple[str, str]:
+        """Return ``(static_prefix, dynamic_suffix)``.
+
+        Prompt caching only works when the prefix is byte-identical call to
+        call. Channel/chat/user fields obviously differ per chat, so we keep
+        them in a separate second system message that comes AFTER the pinned
+        prefix. On Anthropic endpoints the static half carries a
+        ``cache_control: ephemeral`` marker via
+        ``OpenAIProvider._prepare_messages_for_caching``.
+        """
         base_prompt = self.context.build_system_prompt()
-        
-        parts = []
-        
-        # If we have a custom persona (from SOUL.md etc), use it
+
+        static_parts: list[str] = []
         if self.persona_prompt:
-            parts.append(self.persona_prompt)
-        
-        parts.append(base_prompt)
-        
-        # Add channel context
-        parts.append(
-            f"\n## Current Context\n"
+            static_parts.append(self.persona_prompt)
+        static_parts.append(base_prompt)
+
+        dynamic_prompt = (
+            "## Current Context\n"
             f"Channel: {msg.channel}\n"
             f"Chat ID: {msg.chat_id}\n"
             f"User: {msg.sender_id}"
         )
-        
-        return "\n\n".join(parts)
-    
+
+        return "\n\n".join(static_parts), dynamic_prompt
+
     def _build_messages(
         self,
-        system_prompt: str,
+        static_system: str,
+        dynamic_system: str,
         session: Session,
     ) -> list[dict[str, Any]]:
-        """Build the messages list for the LLM call."""
-        messages = [{"role": "system", "content": system_prompt}]
+        """Assemble the messages list for an LLM call.
 
-        history = session.messages[-self.max_history:] if len(session.messages) > self.max_history else session.messages
+        Layout (ordered so the cached prefix is as long as possible):
+
+        1. Static system prompt — carries the ``_kyber_cache_pin`` flag that
+           ``OpenAIProvider`` translates into an Anthropic cache breakpoint.
+        2. Dynamic system prompt — channel/chat/user context.
+        3. (Optional) rolled-up summary of turns older than
+           ``history_summary_trigger``.
+        4. (Optional) recent tool-output context block.
+        5. The last ``max_history`` user/assistant turns verbatim.
+        """
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": static_system,
+                # Private flag picked up by OpenAIProvider and stripped
+                # before the request leaves the machine.
+                "_kyber_cache_pin": True,
+            },
+            {"role": "system", "content": dynamic_system},
+        ]
+
+        all_msgs = session.messages
+        summary_block, recent_history = self._split_history_for_summary(all_msgs)
+        if summary_block:
+            messages.append({"role": "system", "content": summary_block})
+
+        # Trim the recent window to max_history so it never grows unbounded
+        # even with summarization disabled.
+        history = (
+            recent_history[-self.max_history:]
+            if len(recent_history) > self.max_history
+            else recent_history
+        )
+
         tool_context = self._build_recent_tool_context_block(history)
         if tool_context:
             messages.append({"role": "system", "content": tool_context})
 
-        for msg in history:
-            role = msg.get("role")
+        for m in history:
+            role = m.get("role")
             if role in ("user", "assistant"):
-                messages.append({"role": role, "content": str(msg.get("content") or "")})
-        
+                messages.append({"role": role, "content": str(m.get("content") or "")})
+
         return messages
+
+    def _split_history_for_summary(
+        self,
+        all_msgs: list[dict[str, Any]],
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """Heuristic history rollup with zero extra API calls.
+
+        When the session has more than ``history_summary_trigger`` messages,
+        everything older than ``history_summary_keep_recent`` gets compressed
+        into a small "Earlier in this conversation" block listing the user
+        prompts (truncated) and a hint at each assistant reply. Deterministic
+        output means the cached prefix stays stable across turns until new
+        messages roll into the summary.
+        """
+        trigger = self.history_summary_trigger
+        if trigger <= 0 or len(all_msgs) <= trigger:
+            return None, all_msgs
+
+        keep = self.history_summary_keep_recent
+        older = all_msgs[:-keep] if keep > 0 else list(all_msgs)
+        recent = all_msgs[-keep:] if keep > 0 else []
+        if not older:
+            return None, all_msgs
+
+        lines: list[str] = []
+        pending_user: str | None = None
+        for m in older:
+            role = m.get("role")
+            content = str(m.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "user":
+                pending_user = _one_line(content, 140)
+            elif role == "assistant":
+                assistant_hint = _one_line(content, 100)
+                if pending_user:
+                    lines.append(f"- user: {pending_user} → assistant: {assistant_hint}")
+                    pending_user = None
+                else:
+                    lines.append(f"- assistant: {assistant_hint}")
+        if pending_user:
+            lines.append(f"- user: {pending_user} (no reply yet)")
+
+        if not lines:
+            return None, all_msgs
+
+        # Cap the summary itself so a runaway session doesn't bloat the prefix.
+        max_lines = 40
+        if len(lines) > max_lines:
+            dropped = len(lines) - max_lines
+            lines = [f"- (…{dropped} earlier turns elided…)"] + lines[-max_lines:]
+
+        block = (
+            "## Earlier in this conversation\n"
+            "Summary of turns that happened before the most recent "
+            f"{len(recent)} messages. Use this for continuity; don't treat "
+            "it as verbatim history.\n"
+            + "\n".join(lines)
+        )
+        return block, recent
     
     def _build_tool_call_message(self, response: LLMResponse) -> dict[str, Any]:
         """Build an assistant message dict with tool calls (OpenAI format)."""
@@ -825,6 +1100,14 @@ class AgentCore:
             msg["content"] = None
         
         return msg
+
+def _one_line(text: str, limit: int = 120) -> str:
+    """Collapse whitespace and truncate to ``limit`` chars."""
+    flat = " ".join((text or "").strip().split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: max(0, limit - 1)].rstrip() + "…"
+
 
 def _summarize_args(args: dict[str, Any], max_len: int = 80) -> str:
     """Summarize tool arguments for logging."""

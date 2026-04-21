@@ -63,9 +63,19 @@ if [[ "${KYBER_SKIP_PUBLISH:-0}" == "1" ]]; then
   exit 0
 fi
 
+# Twine authenticates via (in priority order): TWINE_USERNAME/TWINE_PASSWORD
+# env vars → ~/.pypirc → keyring. Only bail out when NONE of those are
+# available — otherwise let twine's own auth resolution take over. The
+# old guard here only checked env vars, which made this script silently
+# skip uploads for anyone who keeps their token in ~/.pypirc (the normal
+# place for it).
+PYPIRC="${PYPIRC:-$HOME/.pypirc}"
 if [[ -z "${TWINE_USERNAME:-}" || -z "${TWINE_PASSWORD:-}" ]]; then
-  echo "Skipping publish: TWINE_USERNAME/TWINE_PASSWORD not set"
-  exit 0
+  if [[ ! -f "$PYPIRC" ]]; then
+    echo "Skipping publish: no TWINE_USERNAME/TWINE_PASSWORD and no $PYPIRC"
+    exit 0
+  fi
+  echo "Using credentials from $PYPIRC"
 fi
 
 echo "Building distribution..."
